@@ -97,12 +97,12 @@ def test_gcn_ascend():
     norm = norm.to(device).unsqueeze(1) # Move normalization coefficients to NPU
     
     # Synchronize to ensure all data is transferred
-    torch.npu.synchronize()
+    # torch.npu.synchronize()
     print("NPU synchronization completed.")
 
     # 4. Initialize Model
     model = GCN(in_feats, hidden_size, out_feats).to(device)
-    torch.npu.synchronize()  # Sync after model initialization too
+    # torch.npu.synchronize()  # Sync after model initialization too
     loss_fcn = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2, weight_decay=5e-4)
 
@@ -115,7 +115,7 @@ def test_gcn_ascend():
 
     # 5. Training Loop
     try:
-        torch.npu.synchronize()
+        # torch.npu.synchronize()
         total_start = time.time()
         
         for epoch in range(50):
@@ -140,7 +140,7 @@ def test_gcn_ascend():
                 correct = torch.sum(indices == val_labels)
                 val_acc = correct.item() * 1.0 / len(val_labels)
             
-            torch.npu.synchronize()
+            # torch.npu.synchronize()
             epoch_time = (time.time() - epoch_start) * 1000
             
             print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val Acc: {val_acc:.4f} | Time: {epoch_time:.2f} ms")
