@@ -60,6 +60,44 @@
 #endif  // DGL_USE_CUDA
 
 /**
+ * Dispatch including Ascend support.
+ */
+#if defined(DGL_USE_CUDA) && defined(DGL_USE_ASCEND)
+#define ATEN_XPU_SWITCH_CUDA_ASCEND(val, XPU, op, ...)                   \
+  do {                                                                   \
+    if ((val) == kDGLCPU) {                                              \
+      constexpr auto XPU = kDGLCPU;                                      \
+      { __VA_ARGS__ }                                                    \
+    } else if ((val) == kDGLCUDA) {                                      \
+      constexpr auto XPU = kDGLCUDA;                                     \
+      { __VA_ARGS__ }                                                    \
+    } else if ((val) == kDGLAscend) {                                    \
+      constexpr auto XPU = kDGLAscend;                                   \
+      { __VA_ARGS__ }                                                    \
+    } else {                                                             \
+      LOG(FATAL) << "Operator " << (op) << " does not support "          \
+                 << dgl::runtime::DeviceTypeCode2Str(val) << " device."; \
+    }                                                                    \
+  } while (0)
+#elif defined(DGL_USE_ASCEND)
+#define ATEN_XPU_SWITCH_CUDA_ASCEND(val, XPU, op, ...)                   \
+  do {                                                                   \
+    if ((val) == kDGLCPU) {                                              \
+      constexpr auto XPU = kDGLCPU;                                      \
+      { __VA_ARGS__ }                                                    \
+    } else if ((val) == kDGLAscend) {                                    \
+      constexpr auto XPU = kDGLAscend;                                   \
+      { __VA_ARGS__ }                                                    \
+    } else {                                                             \
+      LOG(FATAL) << "Operator " << (op) << " does not support "          \
+                 << dgl::runtime::DeviceTypeCode2Str(val) << " device."; \
+    }                                                                    \
+  } while (0)
+#else
+#define ATEN_XPU_SWITCH_CUDA_ASCEND ATEN_XPU_SWITCH_CUDA
+#endif
+
+/**
  * Dispatch according to integral type (either int32 or int64):
  *
  * ATEN_ID_TYPE_SWITCH(array->dtype, IdType, {

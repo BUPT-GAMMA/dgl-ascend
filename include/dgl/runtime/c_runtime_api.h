@@ -57,7 +57,7 @@ typedef enum {
   /** @brief CUDA GPU device */
   kDGLCUDA = 2,
   /** @brief Huawei Ascend NPU device */
-  kDGLAscend = 13,
+  kDGLAscend = 12,
   // add more devices once supported
 } DGLDeviceType;
 

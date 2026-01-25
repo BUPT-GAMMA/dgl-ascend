@@ -153,6 +153,7 @@ class AscendDeviceAPI final : public DeviceAPI {
       if (ctx_from.device_id == ctx_to.device_id) {
         ASCEND_CALL(aclrtMemcpyAsync(
             to, size, from, size, ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+        ASCEND_CALL(aclrtSynchronizeStream(stream));
       } else {
         // Cross device copy - need to go through host
         void* temp = malloc(size);
@@ -172,6 +173,7 @@ class AscendDeviceAPI final : public DeviceAPI {
       ASCEND_CALL(aclrtSetDevice(ctx_to.device_id));
       ASCEND_CALL(aclrtMemcpyAsync(
           to, size, from, size, ACL_MEMCPY_HOST_TO_DEVICE, stream));
+      ASCEND_CALL(aclrtSynchronizeStream(stream));
     } else {
       LOG(FATAL) << "Expect copy from/to Ascend or between Ascend devices";
     }

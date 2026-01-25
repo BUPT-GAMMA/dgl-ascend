@@ -244,6 +244,11 @@ file(GLOB_RECURSE DGL_SRC_1
 
 list(APPEND DGL_SRC ${DGL_SRC_1})
 
+if(USE_ASCEND)
+  file(GLOB ASCEND_SRC src/array/ascend/*.cc)
+  list(APPEND DGL_SRC ${ASCEND_SRC})
+endif(USE_ASCEND)
+
 if (NOT MSVC)
   file(GLOB_RECURSE DGL_RPC_SRC src/rpc/*.cc)
 else()

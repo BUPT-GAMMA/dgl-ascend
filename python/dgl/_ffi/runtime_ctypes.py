@@ -126,7 +126,7 @@ class DGLContext(ctypes.Structure):
         10: "rocm",
         11: "opengl",
         12: "ext_dev",
-        13: "npu",
+        12: "npu",
     }
     STR2MASK = {
         "llvm": 1,
@@ -146,8 +146,8 @@ class DGLContext(ctypes.Structure):
         "rocm": 10,
         "opengl": 11,
         "ext_dev": 12,
-        "npu": 13,
-        "ascend": 13,
+        "npu": 12,
+        "ascend": 12,
     }
     _cache = {}
 

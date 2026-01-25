@@ -132,7 +132,7 @@ def to_backend_ctx(dglctx):
         return th.device("cpu")
     elif dev_type == 2:
         return th.device("cuda", dglctx.device_id)
-    elif dev_type == 13:
+    elif dev_type == 12:
         return th.device("npu", dglctx.device_id)
     else:
         raise ValueError("Unsupported DGL device context:", dglctx)
