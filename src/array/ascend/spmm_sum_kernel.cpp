@@ -123,8 +123,8 @@ private:
         uint32_t k = tcBlockCount * CUBE_BLOCK_LENGTH;
         AscendC::Nd2NzParams nd2nzA1Params;
         nd2nzA1Params.ndNum = 1;
-        nd2nzA1Params.nValue = CUBE_BLOCK_LENGTH;
-        nd2nzA1Params.dValue = k;
+        nd2nzA1Params.nValue = k;
+        nd2nzA1Params.dValue = CUBE_BLOCK_LENGTH;
         nd2nzA1Params.srcNdMatrixStride = 0;
         nd2nzA1Params.srcDValue = k;
         nd2nzA1Params.dstNzC0Stride = CeilCubeBlock(CUBE_BLOCK_LENGTH) * CUBE_BLOCK_LENGTH;
@@ -285,6 +285,7 @@ public:
         GM_ADDR featureData, GM_ADDR outputData, GM_ADDR indptrData, GM_ADDR indicesData, GM_ADDR vectorWindowIdsData, GM_ADDR vectorWinSplitData, uint32_t numDstRows, uint32_t numSrcRows,
         uint32_t featureDim, uint32_t nonZeroCount, uint32_t vectorWindowCount, AscendC::TPipe *pipe)
     {
+        KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
         this->M = numDstRows;
         this->K = numSrcRows;
         this->N = featureDim;
@@ -466,3 +467,4 @@ extern "C" __global__ __aicore__ void spmm_sum(
         cubeProcessor.Process();
     }
 }
+
