@@ -554,8 +554,8 @@ endif(LIBCXX_ENABLE_PARALLEL_ALGORITHMS)
 
 target_include_directories(dgl PRIVATE ${Python3_INCLUDE_DIRS})
 
-find_library(GFORTRAN_LIB NAMES gfortran PATHS /home/ma-user/anaconda3/envs/PyTorch-2.7.1/lib REQUIRED)
-find_library(GOMP_LIB NAMES gomp PATHS /home/ma-user/anaconda3/envs/PyTorch-2.7.1/lib REQUIRED)
+find_library(GFORTRAN_LIB NAMES gfortran REQUIRED)
+find_library(GOMP_LIB NAMES gomp REQUIRED)
 
 message(STATUS "Found gfortran: ${GFORTRAN_LIB}")
 message(STATUS "Found gomp: ${GOMP_LIB}")
