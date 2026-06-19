@@ -36,13 +36,19 @@ void CheckRandomWalkInputs(
   // CHECK_SAME_CONTEXT(seeds, metapath);
 
   if (hg->IsPinned()) {
-    CHECK_EQ(seeds->ctx.device_type, kDGLCUDA)
+    CHECK(seeds->ctx.device_type == kDGLCUDA || seeds->ctx.device_type == kDGLAscend)
         << "Expected seeds (" << seeds->ctx << ")"
-        << " to be on the GPU when the graph is pinned.";
+        << " to be on accelerator when the graph is pinned.";
   } else if (hg->Context() != seeds->ctx) {
-    LOG(FATAL) << "Expected seeds (" << seeds->ctx << ")"
-               << " to have the same "
-               << "context as graph (" << hg->Context() << ").";
+    // Ascend path keeps graph CSR on host and only requires seeds on NPU.
+    const bool ascend_cpu_graph_npu_seeds =
+        (seeds->ctx.device_type == kDGLAscend &&
+         hg->Context().device_type == kDGLCPU);
+    if (!ascend_cpu_graph_npu_seeds) {
+      LOG(FATAL) << "Expected seeds (" << seeds->ctx << ")"
+                 << " to have the same "
+                 << "context as graph (" << hg->Context() << ").";
+    }
   }
   for (uint64_t i = 0; i < prob.size(); ++i) {
     FloatArray p = prob[i];
@@ -68,7 +74,7 @@ std::tuple<IdArray, IdArray, TypeArray> RandomWalk(
 
   TypeArray vtypes;
   std::pair<IdArray, IdArray> result;
-  ATEN_XPU_SWITCH_CUDA(seeds->ctx.device_type, XPU, "RandomWalk", {
+  ATEN_XPU_SWITCH_CPU_NPU(seeds->ctx.device_type, XPU, "RandomWalk", {
     ATEN_ID_TYPE_SWITCH(seeds->dtype, IdxType, {
       vtypes = impl::GetNodeTypesFromMetapath<XPU, IdxType>(hg, metapath);
       result = impl::RandomWalk<XPU, IdxType>(hg, seeds, metapath, prob);
@@ -87,7 +93,7 @@ std::tuple<IdArray, IdArray, TypeArray> RandomWalkWithRestart(
 
   TypeArray vtypes;
   std::pair<IdArray, IdArray> result;
-  ATEN_XPU_SWITCH_CUDA(seeds->ctx.device_type, XPU, "RandomWalkWithRestart", {
+  ATEN_XPU_SWITCH_CPU_NPU(seeds->ctx.device_type, XPU, "RandomWalkWithRestart", {
     ATEN_ID_TYPE_SWITCH(seeds->dtype, IdxType, {
       vtypes = impl::GetNodeTypesFromMetapath<XPU, IdxType>(hg, metapath);
       result = impl::RandomWalkWithRestart<XPU, IdxType>(
@@ -106,7 +112,7 @@ std::tuple<IdArray, IdArray, TypeArray> RandomWalkWithStepwiseRestart(
 
   TypeArray vtypes;
   std::pair<IdArray, IdArray> result;
-  ATEN_XPU_SWITCH_CUDA(
+  ATEN_XPU_SWITCH_CPU_NPU(
       seeds->ctx.device_type, XPU, "RandomWalkWithStepwiseRestart", {
         ATEN_ID_TYPE_SWITCH(seeds->dtype, IdxType, {
           vtypes = impl::GetNodeTypesFromMetapath<XPU, IdxType>(hg, metapath);
@@ -127,7 +133,7 @@ std::tuple<IdArray, IdArray, IdArray> SelectPinSageNeighbors(
       (src->shape[0] == dst->shape[0]));
   std::tuple<IdArray, IdArray, IdArray> result;
 
-  ATEN_XPU_SWITCH_CUDA((src->ctx).device_type, XPU, "SelectPinSageNeighbors", {
+  ATEN_XPU_SWITCH_CPU_NPU((src->ctx).device_type, XPU, "SelectPinSageNeighbors", {
     ATEN_ID_TYPE_SWITCH(src->dtype, IdxType, {
       result = impl::SelectPinSageNeighbors<XPU, IdxType>(
           src, dst, num_samples_per_node, k);

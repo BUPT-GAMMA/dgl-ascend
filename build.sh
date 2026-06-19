@@ -1,4 +1,4 @@
-rm -rf /home/zqm1/dgl-ascend/build
+rm -rf ~/dgl-ascend/build
 bash script/build_dgl_ascend.sh
 cd python
 pip install -e .

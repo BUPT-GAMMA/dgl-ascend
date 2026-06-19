@@ -38,10 +38,15 @@ def prepare_tensor(g, data, name):
                 f"But got {F.dtype(data)}."
             )
         if F.context(data) != g.device and not g.is_pinned():
-            raise DGLError(
-                f'Expect argument "{name}" to have device {g.device}. '
-                f"But got {F.context(data)}."
+            ascend_cpu_graph_npu_seeds = (
+                F.device_type(g.device) == "cpu"
+                and F.device_type(F.context(data)) == "npu"
             )
+            if not ascend_cpu_graph_npu_seeds:
+                raise DGLError(
+                    f'Expect argument "{name}" to have device {g.device}. '
+                    f"But got {F.context(data)}."
+                )
         ret = data
     else:
         data = F.tensor(data)

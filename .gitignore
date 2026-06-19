@@ -12,6 +12,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+build_out/
 dataset/
 datasets/
 develop-eggs/
@@ -73,6 +74,29 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+
+# CMake / CPack generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+_CPack_Packages/
+
+# Ascend custom operator generated files
+third_party/ascend/**/build_out/
+third_party/ascend/**/host_native_tiling/
+third_party/ascend/**/autogen/
+third_party/ascend/**/binary/
+third_party/ascend/**/*.run
+third_party/ascend/**/*.run.json
+third_party/ascend/**/*.o
+third_party/ascend/**/*.so
+third_party/ascend/**/*.a
+third_party/**/cmake/
+third_party/ascend/randomwalk_gen/framework/
+third_party/**/scripts/
 
 # PyBuilder
 target/
@@ -142,6 +166,14 @@ examples/pytorch/generative_graph/*.p
 
 # data directory
 _download
+
+# Example datasets and generated artifacts
+examples/pytorch/lightgcn/gowalla.zip
+examples/pytorch/lightgcn/gowalla/
+examples/pytorch/lightgcn/load_yelp2018.sh
+examples/pytorch/ogb/deepwalk/*.txt
+examples/pytorch/ogb/deepwalk/*.txt.npy
+examples/pytorch/ogb/deepwalk/*.pickle
 
 # CTags & CScope
 tags

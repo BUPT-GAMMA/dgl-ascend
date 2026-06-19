@@ -10,6 +10,7 @@
 #include <dgl/runtime/device_api.h>
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -26,10 +27,32 @@ namespace sampling {
 
 namespace impl {
 
+namespace {
+
+class ScopedCpuTimer {
+ public:
+  explicit ScopedCpuTimer(const char* name)
+      : name_(name), start_(std::chrono::steady_clock::now()) {}
+
+  ~ScopedCpuTimer() {
+    const auto end = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(end - start_).count();
+    LOG(INFO) << "[RandomWalk CPU][TIME] " << name_ << ": " << ms << " ms";
+  }
+
+ private:
+  const char* name_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+}  // namespace
+
 template <DGLDeviceType XPU, typename IdxType>
 std::pair<IdArray, IdArray> RandomWalk(
     const HeteroGraphPtr hg, const IdArray seeds, const TypeArray metapath,
     const std::vector<FloatArray> &prob) {
+  ScopedCpuTimer timer("random walk cpu total");
   TerminatePredicate<IdxType> terminate = [](IdxType *data, dgl_id_t curr,
                                              int64_t len) { return false; };
 

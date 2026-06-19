@@ -21,6 +21,8 @@ message(STATUS "Build for ${BUILD_TYPE}")
 
 dgl_option(USE_CUDA "Build with CUDA" OFF)
 dgl_option(USE_ASCEND "Build with Huawei Ascend NPU" OFF)
+option(BUILD_ASCENDC_KERNELS
+  "Build standalone AscendC kernels under src/array/ascend" ON)
 dgl_option(TORCH_PYTHON_INTERPS "Python interpreter for building sub-components" python3)
 
 # Conda build related options.
@@ -156,8 +158,14 @@ endif(NOT MSVC)
 if(USE_ASCEND)
   message(STATUS "Build with Huawei Ascend NPU support")
   # Find CANN (Ascend) toolkit
-  if(DEFINED ENV{ASCEND_TOOLKIT_HOME})
+  if(ASCEND_TOOLKIT_HOME)
+    set(ASCEND_PATH "${ASCEND_TOOLKIT_HOME}")
+  elseif(DEFINED ENV{ASCEND_TOOLKIT_HOME})
     set(ASCEND_PATH $ENV{ASCEND_TOOLKIT_HOME})
+  elseif(ASCEND_PATH)
+    # use explicit cmake option
+  elseif(DEFINED ENV{DDK_PATH})
+    set(ASCEND_PATH $ENV{DDK_PATH})
   elseif(DEFINED ENV{ASCEND_HOME})
     set(ASCEND_PATH $ENV{ASCEND_HOME})
   else()
@@ -169,6 +177,32 @@ if(USE_ASCEND)
     include_directories("${ASCEND_PATH}/include")
     link_directories("${ASCEND_PATH}/lib64")
     add_definitions(-DDGL_USE_ASCEND)
+
+    set(RANDOMWALK_CUSTOM_OP_DIR "${CMAKE_SOURCE_DIR}/third_party/ascend/randomwalk_gen")
+    if(NOT EXISTS "${RANDOMWALK_CUSTOM_OP_DIR}/build.sh")
+      message(FATAL_ERROR
+        "Bundled RandomWalkCustom OPP project not found at "
+        "${RANDOMWALK_CUSTOM_OP_DIR}.")
+    endif()
+    set(ASCEND_CUST_OPAPI "${ASCEND_PATH}/opp/vendors/customize/op_api")
+    include_directories("${ASCEND_CUST_OPAPI}/include")
+    link_directories("${ASCEND_CUST_OPAPI}/lib")
+    list(APPEND DGL_LINKER_LIBS cust_opapi)
+
+    if(BUILD_TYPE STREQUAL "dev")
+      set(RANDOMWALK_CUSTOM_OP_BUILD_TYPE "Debug")
+    else()
+      set(RANDOMWALK_CUSTOM_OP_BUILD_TYPE "Release")
+    endif()
+    add_custom_target(dgl_randomwalk_custom_op
+      COMMAND bash "${CMAKE_SOURCE_DIR}/third_party/ascend/build_randomwalk_custom_op.sh"
+        "${RANDOMWALK_CUSTOM_OP_DIR}"
+        "${ASCEND_PATH}"
+        "${RANDOMWALK_CUSTOM_OP_BUILD_TYPE}"
+      WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+      COMMENT "Building and installing bundled RandomWalkCustom Ascend OPP package")
+    message(STATUS "RandomWalkCustom op API will be built from: ${RANDOMWALK_CUSTOM_OP_DIR}")
+
     # Find and link Ascend runtime library
     find_library(ASCENDCL_LIB ascendcl HINTS "${ASCEND_PATH}/lib64" "${ASCEND_PATH}/acllib/lib64")
     if(ASCENDCL_LIB)
@@ -190,7 +224,7 @@ if(USE_ASCEND)
       set(ASCENDC_CMAKE_DIR "")
     endif()
     
-    if(ASCENDC_CMAKE_DIR)
+    if(ASCENDC_CMAKE_DIR AND BUILD_ASCENDC_KERNELS)
       # Set ASCEND_CANN_PACKAGE_PATH for AscendC kernel compilation
       # This is required by ascendc.cmake
       if(NOT DEFINED ASCEND_CANN_PACKAGE_PATH)
@@ -221,8 +255,51 @@ if(USE_ASCEND)
         message(STATUS "CMAKE_BUILD_TYPE not set, mapping BUILD_TYPE=${BUILD_TYPE} to CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
       endif()
       message(STATUS "Using CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE} for AscendC kernels")
+
+      # CANN 9 beta can emit AICore ELF objects that the legacy merge_obj_text.sh
+      # tries to relink and rejects as "unknown file type".  Patch a build-local
+      # copy so DGL can still use the legacy ascendc_library host-stub flow.
+      set(DGL_ASCENDC_CMAKE_DIR "${CMAKE_BINARY_DIR}/dgl_ascendc_kernel_cmake")
+      file(COPY "${ASCENDC_CMAKE_DIR}/" DESTINATION "${DGL_ASCENDC_CMAKE_DIR}")
+      set(DGL_ASCENDC_MERGE_SCRIPT
+        "${DGL_ASCENDC_CMAKE_DIR}/legacy_modules/util/merge_obj_text.sh")
+      if(EXISTS "${DGL_ASCENDC_MERGE_SCRIPT}")
+        file(WRITE "${DGL_ASCENDC_MERGE_SCRIPT}" [=[#!/bin/bash
+set -e
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -l | --linker)
+        linker=$2
+        shift 2
+        ;;
+    *)
+        break
+        ;;
+    esac
+done
+
+for arg in "$@"
+do
+    tmp="${arg}.merge"
+    err="${arg}.merge.err"
+    echo -n "${linker} -m aicorelinux -Ttext=0 ${arg} -o ${arg}"
+    if ${linker} -m aicorelinux -Ttext=0 "${arg}" -o "${tmp}" 2>"${err}"; then
+        mv "${tmp}" "${arg}"
+        rm -f "${err}"
+    elif grep -q "unknown file type" "${err}"; then
+        echo " (skipped: object already emitted in final AICore ELF format)"
+        rm -f "${tmp}" "${err}"
+    else
+        cat "${err}" >&2
+        rm -f "${tmp}" "${err}"
+        exit 1
+    fi
+done
+]=])
+      endif()
       
-      include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
+      include(${DGL_ASCENDC_CMAKE_DIR}/ascendc.cmake)
       
       # Automatically discover all AscendC kernel files (*_kernel.cpp pattern)
       # This allows easy addition of new operators by simply adding new kernel files
@@ -250,6 +327,8 @@ if(USE_ASCEND)
       else()
         message(STATUS "No AscendC kernel files found (looking for *_kernel.cpp in src/array/ascend/)")
       endif()
+    elseif(ASCENDC_CMAKE_DIR)
+      message(STATUS "Skipping standalone AscendC kernel build (BUILD_ASCENDC_KERNELS=OFF)")
     endif()
   else()
     message(WARNING "Ascend toolkit not found at ${ASCEND_PATH}, building without ACL support")
@@ -320,6 +399,7 @@ list(APPEND DGL_SRC ${DGL_SRC_1})
 if(USE_ASCEND)
   file(GLOB ASCEND_SRC src/array/ascend/*.cc)
   list(APPEND DGL_SRC ${ASCEND_SRC})
+  list(APPEND DGL_SRC src/graph/sampling/randomwalks/randomwalk_npu.cc)
 endif(USE_ASCEND)
 
 if (NOT MSVC)
@@ -357,6 +437,9 @@ if(USE_CUDA)
 else(USE_CUDA)
   add_library(dgl SHARED ${DGL_SRC})
 endif(USE_CUDA)
+if(TARGET dgl_randomwalk_custom_op)
+  add_dependencies(dgl dgl_randomwalk_custom_op)
+endif()
 
 if ((NOT MSVC) AND USE_EPOLL)
   INCLUDE(CheckIncludeFile)

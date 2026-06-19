@@ -10,6 +10,7 @@ import utils
 import numpy as np
 from config import args
 from model import *
+import tqdm
 
 def train_lightgcn(dataset):
     g = dataset.graph
@@ -29,9 +30,12 @@ def train_lightgcn(dataset):
         total_batch = n_edges // args.batch + 1
         # Epoch start
         epoch_start = time.time()
-
-        for batch_idx, (batch_user, batch_pos, batch_neg) in enumerate(train_loader):
-            batch_start = time.time()  
+        last_batch_time = epoch_start
+        for (batch,) in tqdm.tqdm(train_loader):
+            batch_start = time.time()
+            batch_user = batch[:, 0]
+            batch_pos = batch[:, 1]
+            batch_neg = batch[:, 2]
             # Batch start
             all_emb = model(g)
             user_emb = all_emb[batch_user]
@@ -39,7 +43,6 @@ def train_lightgcn(dataset):
             neg_emb = all_emb[batch_neg + n_users]
 
             loss, reg_loss = model.bprLoss(user_emb, pos_emb, neg_emb, batch_user, batch_pos, batch_neg)
-            batch_stage1 = time.time()
             reg_loss = reg_loss*args.decay
             loss=loss + reg_loss
             optimizer.zero_grad()
@@ -50,7 +53,8 @@ def train_lightgcn(dataset):
 
             # Batch end
             batch_time = time.time()
-            # print(f"Epoch {epoch+1}, Batch {batch_idx+1}/{len(train_loader)}, stage1 time: {batch_stage1 - batch_start:.4f}s, stage2 time: {batch_time - batch_stage1:.4f}s, Batch time: {batch_time - batch_start:.4f}s, Loss: {loss.item():.4f}")
+            # print(f"Epoch {epoch+1}, , extra time: {batch_start-last_batch_time:.4f}s, Batch time: {batch_time - batch_start:.4f}s, Loss: {loss.item():.4f}")
+            last_batch_time = batch_time
 
         # Epoch end
         epoch_time = time.time() - epoch_start
