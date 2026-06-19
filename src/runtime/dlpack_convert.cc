@@ -26,7 +26,13 @@ void NDArrayDLPackDeleter(DLManagedTensor* tensor) {
 
 inline DGLContext ToDGLContext(const DLDevice& device) {
   DGLContext ctx;
-  ctx.device_type = static_cast<DGLDeviceType>(device.device_type);
+  // PyTorch Ascend tensors are usually exported as kDLExtDev (PrivateUse1).
+  if (device.device_type == kDLExtDev ||
+      device.device_type == static_cast<DLDeviceType>(kDGLAscend)) {
+    ctx.device_type = kDGLAscend;
+  } else {
+    ctx.device_type = static_cast<DGLDeviceType>(device.device_type);
+  }
   ctx.device_id = device.device_id;
   return ctx;
 }
@@ -41,7 +47,11 @@ inline DGLDataType ToDGLDataType(const DLDataType& src) {
 
 inline DLDevice ToDLDevice(const DGLContext& ctx) {
   DLDevice device;
-  device.device_type = static_cast<DLDeviceType>(ctx.device_type);
+  if (ctx.device_type == kDGLAscend) {
+    device.device_type = kDLExtDev;
+  } else {
+    device.device_type = static_cast<DLDeviceType>(ctx.device_type);
+  }
   device.device_id = ctx.device_id;
   return device;
 }

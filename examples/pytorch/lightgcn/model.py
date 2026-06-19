@@ -61,4 +61,4 @@ class LightGCN(nn.Module):
         reg_loss = (1/2)*(userEmb0.norm(2).pow(2) + 
                          posEmb0.norm(2).pow(2)  +
                          negEmb0.norm(2).pow(2))/float(len(batch_user))
-        return loss.cpu(), reg_loss.cpu()
+        return loss, reg_loss

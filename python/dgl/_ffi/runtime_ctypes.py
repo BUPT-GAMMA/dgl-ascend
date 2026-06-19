@@ -125,7 +125,6 @@ class DGLContext(ctypes.Structure):
         9: "vpi",
         10: "rocm",
         11: "opengl",
-        12: "ext_dev",
         12: "npu",
     }
     STR2MASK = {

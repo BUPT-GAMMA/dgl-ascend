@@ -1,0 +1,81 @@
+[
+    {
+        "op": "RandomWalkCustom",
+        "input_desc": [
+            {
+                "name": "seeds_data",
+                "param_type": "required",
+                "format": [
+                    "ND",
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            },
+            {
+                "name": "row_ptr",
+                "param_type": "required",
+                "format": [
+                    "ND",
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            },
+            {
+                "name": "col_ind",
+                "param_type": "required",
+                "format": [
+                    "ND",
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            },
+            {
+                "name": "metapath_data",
+                "param_type": "required",
+                "format": [
+                    "ND",
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            },
+            {
+                "name": "randomNumber_data",
+                "param_type": "required",
+                "format": [
+                    "ND",
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "output",
+                "param_type": "required",
+                "format": [
+                    "ND",
+                    "ND"
+                ],
+                "type": [
+                    "int32",
+                    "int64"
+                ]
+            }
+        ]
+    }
+]

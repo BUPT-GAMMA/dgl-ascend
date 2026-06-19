@@ -26,7 +26,7 @@ parser.add_argument('--topks', nargs='?',default=[20],
                     help="@k test list")
 parser.add_argument('--load', type=int,default=0)
 parser.add_argument('--epochs', type=int,default=100)
-parser.add_argument('--device', type=str,default='cpu')
+parser.add_argument('--device', type=str,default='npu')
 parser.add_argument('--seed', type=int, default=2020, help='random seed')
 
 args = parser.parse_args()
