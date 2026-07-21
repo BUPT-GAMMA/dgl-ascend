@@ -47,12 +47,11 @@ namespace {
 std::vector<uint32_t> BuildSegmentSplit(
     const uint32_t* offsets_ptr, int64_t num_segments, uint32_t block_dim,
     aclrtStream stream) {
+  // Use synchronous copy to ensure data is ready
   std::vector<uint32_t> host_offsets(num_segments + 1, 0);
-  ASCEND_CALL(aclrtMemcpyAsync(
+  ASCEND_CALL(aclrtMemcpy(
       host_offsets.data(), sizeof(uint32_t) * host_offsets.size(), offsets_ptr,
-      sizeof(uint32_t) * host_offsets.size(), ACL_MEMCPY_DEVICE_TO_HOST,
-      stream));
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
+      sizeof(uint32_t) * host_offsets.size(), ACL_MEMCPY_DEVICE_TO_HOST));
 
   std::vector<uint32_t> segment_split(block_dim + 1, 0);
   segment_split[block_dim] = static_cast<uint32_t>(num_segments);
@@ -81,9 +80,9 @@ void LaunchSegmentReduceKernel(
   void* segment_split_device = nullptr;
   ASCEND_CALL(aclrtMalloc(
       &segment_split_device, segment_split_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-  ASCEND_CALL(aclrtMemcpyAsync(
+  ASCEND_CALL(aclrtMemcpy(
       segment_split_device, segment_split_bytes, segment_split.data(),
-      segment_split_bytes, ACL_MEMCPY_HOST_TO_DEVICE, stream));
+      segment_split_bytes, ACL_MEMCPY_HOST_TO_DEVICE));
 
   SegmentReduceTilingData tiling = {
       static_cast<uint32_t>(num_items), static_cast<uint32_t>(num_segments),
@@ -94,9 +93,9 @@ void LaunchSegmentReduceKernel(
       &tiling_device, sizeof(SegmentReduceTilingData),
       ACL_MEM_MALLOC_HUGE_FIRST));
 
-  ASCEND_CALL(aclrtMemcpyAsync(
+  ASCEND_CALL(aclrtMemcpy(
       tiling_device, sizeof(SegmentReduceTilingData), &tiling,
-      sizeof(SegmentReduceTilingData), ACL_MEMCPY_HOST_TO_DEVICE, stream));
+      sizeof(SegmentReduceTilingData), ACL_MEMCPY_HOST_TO_DEVICE));
 
   aclError launch_err = launch_fn(
       block_dim, stream, const_cast<void*>(static_cast<const void*>(offsets_ptr)),
@@ -123,6 +122,7 @@ void SegmentReduceAscend(
     NDArray arg) {
 #ifdef DGL_USE_ASCEND
   DGLContext ctx = feat->ctx;
+  ASCEND_CALL(aclrtSynchronizeDevice());  // Ensure PyTorch NPU ops complete before reading offsets
   ASCEND_CALL(aclrtSetDevice(ctx.device_id));
 
   if (op == "sum" || op == "max" || op == "min") {
@@ -131,11 +131,8 @@ void SegmentReduceAscend(
     int64_t feat_dim = 1;
     for (int i = 1; i < feat->ndim; ++i) feat_dim *= feat->shape[i];
 
-    static aclrtStream segment_reduce_stream = nullptr;
-    if (segment_reduce_stream == nullptr) {
-      ASCEND_CALL(aclrtCreateStream(&segment_reduce_stream));
-    }
-    aclrtStream stream = segment_reduce_stream;
+    // Use default stream (nullptr) to align with PyTorch NPU default stream
+    aclrtStream stream = nullptr;
 
     const uint32_t* offsets_ptr =
         static_cast<const uint32_t*>(static_cast<const void*>(offsets->data));
