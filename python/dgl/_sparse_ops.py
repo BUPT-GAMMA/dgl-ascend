@@ -680,6 +680,12 @@ def _segment_reduce(op, feat, offsets):
     if op in ["min", "max"]:
         arg = F.zeros(out_shp, idtype, ctx)
     arg_nd = to_dgl_nd_for_write(arg)
+    # Sync PyTorch NPU stream before DGL kernel to prevent data races
+    try:
+        import torch
+        torch.npu.synchronize()
+    except Exception:
+        pass
     _CAPI_DGLKernelSegmentReduce(
         op,
         to_dgl_nd(feat),
