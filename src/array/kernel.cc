@@ -228,7 +228,7 @@ void SDDMM(
   SparseFormat format = graph->SelectFormat(0, COO_CODE);
   const auto& bcast = CalcBcastOff(op, lhs, rhs);
 
-  ATEN_XPU_SWITCH_CUDA(graph->Context().device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA_ASCEND(graph->Context().device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         if (format == SparseFormat::kCSR) {
@@ -276,7 +276,7 @@ void SDDMMHetero(
   }
   const auto& bcast = CalcBcastOff(op, lhs[lhs_eid[0]], rhs[rhs_eid[0]]);
 
-  ATEN_XPU_SWITCH_CUDA(graph->Context().device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA_ASCEND(graph->Context().device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(
           out[rhs_eid[0]]->dtype, Dtype, XPU, "Feature data", {
