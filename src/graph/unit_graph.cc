@@ -965,6 +965,14 @@ EdgeArray UnitGraph::FindEdges(dgl_type_t etype, IdArray eids) const {
 }
 
 EdgeArray UnitGraph::InEdges(dgl_type_t etype, dgl_id_t vid) const {
+#ifdef DGL_USE_ASCEND
+  // Prefer COO for Ascend to avoid CSR kernel stream sync issues
+  auto created = GetCreatedFormats();
+  if (created & COO_CODE) {
+    const auto ptr = GetFormat(SparseFormat::kCOO);
+    return ptr->InEdges(etype, vid);
+  }
+#endif
   const SparseFormat fmt = SelectFormat(CSC_CODE);
   const auto ptr = GetFormat(fmt);
   if (fmt == SparseFormat::kCSC) {
@@ -976,6 +984,14 @@ EdgeArray UnitGraph::InEdges(dgl_type_t etype, dgl_id_t vid) const {
 }
 
 EdgeArray UnitGraph::InEdges(dgl_type_t etype, IdArray vids) const {
+#ifdef DGL_USE_ASCEND
+  // Prefer COO for Ascend to avoid CSR kernel stream sync issues
+  auto created = GetCreatedFormats();
+  if (created & COO_CODE) {
+    const auto ptr = GetFormat(SparseFormat::kCOO);
+    return ptr->InEdges(etype, vids);
+  }
+#endif
   const SparseFormat fmt = SelectFormat(CSC_CODE);
   const auto ptr = GetFormat(fmt);
   if (fmt == SparseFormat::kCSC) {
