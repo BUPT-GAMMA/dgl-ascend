@@ -308,24 +308,42 @@ void SDDMMCooNPUFallback(const std::string& op, const BcastOff& bcast,
     ASCEND_CALL(aclrtSynchronizeStream(stream));
     ASCEND_CALL(aclrtFree(tilingDev));
   } else {
-    // add/sub/mul/div: use CPU fallback (rare, only for non-copy ops)
+    // add/sub/mul/div: CPU fallback (gather + element-wise on CPU)
+    aclrtSynchronizeDevice();
     DGLContext cpu_ctx{kDGLCPU, 0};
-    COOMatrix coo_cpu = coo.CopyTo(cpu_ctx);
+    // Use CopyTo with explicit sync for reliable NPU->CPU transfer
+    COOMatrix coo_cpu;
+    coo_cpu.num_rows = coo.num_rows;
+    coo_cpu.num_cols = coo.num_cols;
+    coo_cpu.row = coo.row.CopyTo(cpu_ctx);
+    aclrtSynchronizeDevice();
+    coo_cpu.col = coo.col.CopyTo(cpu_ctx);
+    aclrtSynchronizeDevice();
+    coo_cpu.data = IsNullArray(coo.data) ? coo.data : coo.data.CopyTo(cpu_ctx);
+    aclrtSynchronizeDevice();
+    coo_cpu.row_sorted = coo.row_sorted;
+    coo_cpu.col_sorted = coo.col_sorted;
     NDArray lhs_cpu = lhs.CopyTo(cpu_ctx);
+    aclrtSynchronizeDevice();
     NDArray rhs_cpu = IsNullArray(rhs) ? rhs : rhs.CopyTo(cpu_ctx);
-    NDArray out_cpu = out.CopyTo(cpu_ctx);
-    // FP32: use CPU fallback; FP16: not supported (CPU has no uint16_t SDDMMCoo)
+    aclrtSynchronizeDevice();
+    std::vector<int64_t> out_shape(out->shape, out->shape + out->ndim);
+    NDArray out_cpu = NDArray::Empty(out_shape, out->dtype, cpu_ctx);
     if (std::is_same<DType, float>::value || std::is_same<DType, double>::value) {
       SDDMMCoo<kDGLCPU, IdType, DType>(op, bcast, coo_cpu, lhs_cpu, rhs_cpu,
                                         out_cpu, lhs_target, rhs_target);
-      out_cpu.CopyTo(out);
+      aclrtSynchronizeDevice();
+      ASCEND_CALL(aclrtMemcpy(out->data, out.GetSize(),
+                               out_cpu->data, out_cpu.GetSize(),
+                               ACL_MEMCPY_HOST_TO_DEVICE));
+      aclrtSynchronizeDevice();
     } else {
       LOG(FATAL) << "Non-copy SDDMM op (" << op << ") not supported for FP16 on Ascend";
     }
   }
 }
-
 template <typename IdType, typename DType>
+
 void SDDMMCsrNPUFallback(const std::string& op, const BcastOff& bcast,
                          const CSRMatrix& csr, NDArray lhs, NDArray rhs,
                          NDArray out, int lhs_target, int rhs_target) {

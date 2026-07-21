@@ -551,6 +551,12 @@ def _gsddmm(gidx, op, lhs, rhs, lhs_target="u", rhs_target="v"):
     )
     out = F.empty(out_shp, dtype, ctx)
     if gidx.num_edges(0) > 0:
+        # Sync PyTorch NPU stream before DGL kernel to prevent data races
+        try:
+            import torch
+            torch.npu.synchronize()
+        except Exception:
+            pass
         _CAPI_DGLKernelSDDMM(
             gidx,
             op,
