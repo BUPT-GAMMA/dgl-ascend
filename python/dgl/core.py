@@ -142,7 +142,7 @@ def invoke_udf_reduce(graph, func, msgdata, *, orig_nid=None):
 
         # order the incoming edges per node by edge ID
         eid_bkt = F.zerocopy_to_numpy(graph.in_edges(node_bkt, form="eid"))
-        assert len(eid_bkt) == deg * len(node_bkt)
+        assert len(eid_bkt) == int(deg) * len(node_bkt)
         eid_bkt = np.sort(eid_bkt.reshape((len(node_bkt), deg)), 1)
         eid_bkt = F.zerocopy_from_numpy(eid_bkt.flatten())
 
