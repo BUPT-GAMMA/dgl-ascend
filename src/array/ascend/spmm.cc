@@ -15,9 +15,11 @@
 #include <cstdlib>
 
 #ifdef DGL_USE_ASCEND
+#include <Python.h>
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
 #include <acl/acl_op.h>
+#include "spmm_tiling.h"
 #define ASCEND_CALL(func)                                                \
   {                                                                      \
     aclError e = (func);                                                 \
@@ -54,6 +56,12 @@ static bool use_aiv_only_sum() {
 #ifndef ACLRT_LAUNCH_KERNEL
 #define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
 #endif
+
+// New unified SPMM kernel (supports FP32/FP16, sum/max/min)
+extern "C" uint32_t aclrtlaunch_spmm_kernel(
+    uint32_t blockDim, aclrtStream stream,
+    void* ufeat, void* indptr, void* indices,
+    void* out, void* tiling);
 
 extern "C" uint32_t aclrtlaunch_spmm_sum(
     uint32_t blockDim, aclrtStream stream, void* denseBlockData,
@@ -311,20 +319,7 @@ void SpMMCsrAscend(
   const IdType* indptr_ptr = static_cast<const IdType*>(csr.indptr->data);
   const IdType* indices_ptr = static_cast<const IdType*>(csr.indices->data);
   
-  aclrtStream stream;
-#ifdef DGL_USE_PYTORCH_NPU_STREAM
-  if (use_pytorch_stream()) {
-    stream = c10::npu::getCurrentNPUStream(ctx.device_id).stream();
-  } else
-#endif
-  {
-    static aclrtStream spmm_stream = nullptr;
-    if (spmm_stream == nullptr) {
-      ASCEND_CALL(aclrtCreateStream(&spmm_stream));
-    }
-    stream = spmm_stream;
-    ASCEND_CALL(aclrtSynchronizeDevice());
-  }
+  aclrtStream stream = nullptr;  // Use default stream
 
   uint32_t num_rows_u32 = static_cast<uint32_t>(num_rows);
   uint32_t num_cols_u32 = static_cast<uint32_t>(num_cols);
@@ -630,13 +625,188 @@ void SpMMCsrAscend(
 #endif
 }
 
+
+// Helper: cast int64 CSR to int32
+static CSRMatrix CastCSRToInt32SpMM(const CSRMatrix& csr) {
+  DGLContext cpu_ctx{kDGLCPU, 0};
+  DGLDataType int32_type{kDGLInt, 32, 1};
+  auto indptr_cpu = csr.indptr.CopyTo(cpu_ctx);
+  auto indices_cpu = csr.indices.CopyTo(cpu_ctx);
+  int64_t nnz = csr.indices->shape[0];
+  int64_t nrows = csr.num_rows;
+  NDArray indptr32_cpu = NDArray::Empty({nrows + 1}, int32_type, cpu_ctx);
+  NDArray indices32_cpu = NDArray::Empty({nnz}, int32_type, cpu_ctx);
+  const int64_t* ip = static_cast<const int64_t*>(indptr_cpu->data);
+  const int64_t* idx = static_cast<const int64_t*>(indices_cpu->data);
+  int32_t* ip32 = static_cast<int32_t*>(indptr32_cpu->data);
+  int32_t* idx32 = static_cast<int32_t*>(indices32_cpu->data);
+  for (int64_t i = 0; i <= nrows; ++i) ip32[i] = static_cast<int32_t>(ip[i]);
+  for (int64_t i = 0; i < nnz; ++i) idx32[i] = static_cast<int32_t>(idx[i]);
+  NDArray data32 = csr.data;
+  if (!IsNullArray(csr.data)) {
+    auto data_cpu = csr.data.CopyTo(cpu_ctx);
+    data32 = NDArray::Empty({nnz}, int32_type, cpu_ctx);
+    const int64_t* d = static_cast<const int64_t*>(data_cpu->data);
+    int32_t* d32 = static_cast<int32_t*>(data32->data);
+    for (int64_t i = 0; i < nnz; ++i) d32[i] = static_cast<int32_t>(d[i]);
+    data32 = data32.CopyTo(csr.indptr->ctx);
+  }
+  return CSRMatrix(nrows, csr.num_cols,
+                    indptr32_cpu.CopyTo(csr.indptr->ctx),
+                    indices32_cpu.CopyTo(csr.indptr->ctx),
+                    data32, csr.sorted);
+}
+
+// SpMM float32 NPU-native implementation using new unified kernel
+static void SpMMCSRNpuF32(const std::string& op, const std::string& reduce,
+                           const BcastOff& bcast, const CSRMatrix& csr,
+                           NDArray ufeat, NDArray efeat, NDArray out,
+                           std::vector<NDArray> out_aux) {
+  // Support copy_lhs + sum/max/min on NPU; other ops use CPU fallback
+  if (op != "copy_lhs" || (reduce != "sum" && reduce != "max" && reduce != "min")) {
+    // CPU fallback for unsupported ops (mul+sum, add+sum, copy_rhs, etc.)
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    CSRMatrix csr_cpu = csr.CopyTo(cpu_ctx);
+    NDArray ufeat_cpu = IsNullArray(ufeat) ? ufeat : ufeat.CopyTo(cpu_ctx);
+    NDArray efeat_cpu = IsNullArray(efeat) ? efeat : efeat.CopyTo(cpu_ctx);
+    NDArray out_cpu = out.CopyTo(cpu_ctx);
+    std::vector<NDArray> out_aux_cpu;
+    for (auto& a : out_aux) out_aux_cpu.push_back(IsNullArray(a) ? a : a.CopyTo(cpu_ctx));
+    SpMMCsr<kDGLCPU, int32_t, float>(op, reduce, bcast, csr_cpu,
+                                      ufeat_cpu, efeat_cpu, out_cpu, out_aux_cpu);
+    out_cpu.CopyTo(out);
+    for (size_t i = 0; i < out_aux.size(); ++i) {
+      if (!IsNullArray(out_aux[i]) && !IsNullArray(out_aux_cpu[i]))
+        out_aux_cpu[i].CopyTo(out_aux[i]);
+    }
+    return;
+  }
+
+  // DGL passes CSC (in-CSR) to SpMMCsr: row=dst, col=src
+  // Our kernel does: out[row] = reduce(feat[col])
+  // copy_lhs: out[dst] = reduce(ufeat[src]) — use CSC as-is, feat=ufeat
+  // copy_rhs: not supported (would need edge-indexed gather, not node-indexed)
+  //   GSDDMM backward uses copy_lhs on reversed graph, so copy_rhs is rarely needed
+
+  if (op == "copy_rhs") {
+    // Fallback to CPU for copy_rhs (edge feature gather)
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    CSRMatrix csr_cpu = csr.CopyTo(cpu_ctx);
+    NDArray ufeat_cpu = IsNullArray(ufeat) ? ufeat : ufeat.CopyTo(cpu_ctx);
+    NDArray efeat_cpu = IsNullArray(efeat) ? efeat : efeat.CopyTo(cpu_ctx);
+    NDArray out_cpu = out.CopyTo(cpu_ctx);
+    std::vector<NDArray> out_aux_cpu;
+    for (auto& a : out_aux) out_aux_cpu.push_back(IsNullArray(a) ? a : a.CopyTo(cpu_ctx));
+    SpMMCsr<kDGLCPU, int32_t, float>(op, reduce, bcast, csr_cpu,
+                                      ufeat_cpu, efeat_cpu, out_cpu, out_aux_cpu);
+    out_cpu.CopyTo(out);
+    for (size_t i = 0; i < out_aux.size(); ++i) {
+      if (!IsNullArray(out_aux[i]) && !IsNullArray(out_aux_cpu[i]))
+        out_aux_cpu[i].CopyTo(out_aux[i]);
+    }
+    return;
+  }
+
+  DGLContext ctx = out->ctx;
+  CHECK(ctx.device_type == kDGLAscend) << "Expected Ascend device context";
+  ASCEND_CALL(aclrtSetDevice(ctx.device_id));
+
+  CSRMatrix csr_used = csr;
+  NDArray feat = ufeat;
+  int64_t num_dst = csr_used.num_rows;
+  int64_t num_src = csr_used.num_cols;
+  int64_t nnz = csr_used.indices->shape[0];
+  int64_t feat_dim = (feat->ndim > 1) ? feat->shape[1] : 1;
+
+  if (num_dst == 0 || nnz == 0) {
+    ASCEND_CALL(aclrtMemsetAsync(out->data, out.GetSize(), 0, out.GetSize(), 0));
+    return;
+  }
+
+  // Get stream
+  aclrtStream stream = nullptr;  // Use default stream
+
+  // Get vector core count
+  int64_t coreNum = 0;
+  aclrtGetDeviceInfo(ctx.device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &coreNum);
+  if (coreNum <= 0) coreNum = 40;
+
+  // Build tiling
+  SpmmTilingData tiling;
+  uint32_t reduceOp;
+  if (reduce == "sum") reduceOp = REDUCE_SUM;
+  else if (reduce == "max") reduceOp = REDUCE_MAX;
+  else reduceOp = REDUCE_MIN;
+
+  // Inline tiling computation (from operators/spmm/op_host/spmm.cpp)
+  uint32_t ubSize = 192 * 1024;  // Ascend 910B3
+  tiling.numDstNodes = static_cast<uint32_t>(num_dst);
+  tiling.numSrcNodes = static_cast<uint32_t>(num_src);
+  tiling.nnz = static_cast<uint32_t>(nnz);
+  tiling.featDim = static_cast<uint32_t>(feat_dim);
+  tiling.dtype = DTYPE_FP32;
+  tiling.reduceOp = reduceOp;
+  tiling.ubSize = ubSize;
+
+  uint32_t coreNumU32 = static_cast<uint32_t>(coreNum);
+  tiling.blockDim = (tiling.numDstNodes < coreNumU32) ? tiling.numDstNodes : coreNumU32;
+  if (tiling.blockDim == 0) {
+    tiling.rowsPerCore = 0;
+  } else {
+    tiling.rowsPerCore = (tiling.numDstNodes + tiling.blockDim - 1) / tiling.blockDim;
+  }
+
+  tiling.featDimAlignedF = (tiling.featDim * sizeof(float) + ALIGN_BYTES - 1) / ALIGN_BYTES * ALIGN_BYTES / sizeof(float);
+  if (tiling.featDimAlignedF == 0) tiling.featDimAlignedF = ALIGN_BYTES / sizeof(float);
+  tiling.featDimAlignedH = (tiling.featDim * HALF_SIZE + ALIGN_BYTES - 1) / ALIGN_BYTES * ALIGN_BYTES / HALF_SIZE;
+  if (tiling.featDimAlignedH == 0) tiling.featDimAlignedH = ALIGN_BYTES / HALF_SIZE;
+
+  uint32_t ubAvailable = ubSize - UB_RESERVED;
+  uint32_t fixedCost = (tiling.rowsPerCore + 1) * sizeof(int32_t);
+  fixedCost += 2 * tiling.featDimAlignedF * sizeof(float);  // featQueue double buffer
+  fixedCost += tiling.featDimAlignedF * sizeof(float);       // outQueue
+  if (fixedCost >= ubAvailable) {
+    tiling.batchSize = 1;
+  } else {
+    uint32_t remaining = ubAvailable - fixedCost;
+    uint32_t batch = remaining / sizeof(int32_t);
+    if (batch == 0) batch = 1;
+    tiling.batchSize = (batch < MAX_BATCH) ? batch : MAX_BATCH;
+  }
+
+  // Allocate tiling on device
+  void* tilingDev = nullptr;
+  ASCEND_CALL(aclrtMalloc(&tilingDev, sizeof(SpmmTilingData), ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(aclrtMemcpy(tilingDev, sizeof(SpmmTilingData), &tiling,
+                           sizeof(SpmmTilingData), ACL_MEMCPY_HOST_TO_DEVICE));
+
+  // Zero output
+  ASCEND_CALL(aclrtMemsetAsync(out->data, out.GetSize(), 0, out.GetSize(), stream));
+
+  // Launch kernel
+  uint32_t blockDim = tiling.blockDim;
+  aclError launch_err = ACLRT_LAUNCH_KERNEL(spmm_kernel)(
+      blockDim, stream,
+      feat->data,
+      const_cast<void*>(static_cast<const void*>(csr_used.indptr->data)),
+      const_cast<void*>(static_cast<const void*>(csr_used.indices->data)),
+      out->data, tilingDev);
+
+  if (launch_err != ACL_SUCCESS) {
+    LOG(FATAL) << "spmm_kernel launch failed, error code: " << launch_err;
+  }
+
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  ASCEND_CALL(aclrtFree(tilingDev));
+}
+
 // Template specializations for CSR SpMM
 template <>
 void SpMMCsr<kDGLAscend, int32_t, float>(
     const std::string& op, const std::string& reduce, const BcastOff& bcast,
     const CSRMatrix& csr, NDArray ufeat, NDArray efeat, NDArray out,
     std::vector<NDArray> out_aux) {
-  LOG(FATAL) << "Float precision not fully supported on Ascend yet.";
+  SpMMCSRNpuF32(op, reduce, bcast, csr, ufeat, efeat, out, out_aux);
 }
 
 template <>
@@ -652,7 +822,8 @@ void SpMMCsr<kDGLAscend, int64_t, uint16_t>(
     const std::string& op, const std::string& reduce, const BcastOff& bcast,
     const CSRMatrix& csr, NDArray ufeat, NDArray efeat, NDArray out,
     std::vector<NDArray> out_aux) {
-  LOG(FATAL) << "Int64 precision not fully supported on Ascend yet.";
+  CSRMatrix csr32 = CastCSRToInt32SpMM(csr);
+  SpMMCsrAscend<int32_t, uint16_t>(op, reduce, bcast, csr32, ufeat, efeat, out, out_aux);
 }
 
 template <>
@@ -660,7 +831,8 @@ void SpMMCsr<kDGLAscend, int64_t, float>(
     const std::string& op, const std::string& reduce, const BcastOff& bcast,
     const CSRMatrix& csr, NDArray ufeat, NDArray efeat, NDArray out,
     std::vector<NDArray> out_aux) {
-  LOG(FATAL) << "Int64 precision not fully supported on Ascend yet.";
+  CSRMatrix csr32 = CastCSRToInt32SpMM(csr);
+  SpMMCSRNpuF32(op, reduce, bcast, csr32, ufeat, efeat, out, out_aux);
 }
 
 template <>
