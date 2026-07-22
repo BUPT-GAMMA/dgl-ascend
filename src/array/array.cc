@@ -666,6 +666,14 @@ std::vector<NDArray> CSRGetDataAndIndices(
 
 CSRMatrix CSRTranspose(CSRMatrix csr) {
   CSRMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (csr.indptr->ctx.device_type == kDGLAscend) {
+    ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
+      ret = impl::CSRTranspose<kDGLAscend, IdType>(csr);
+    });
+    return ret;
+  }
+#endif
   ATEN_XPU_SWITCH_CUDA(csr.indptr->ctx.device_type, XPU, "CSRTranspose", {
     ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
       ret = impl::CSRTranspose<XPU, IdType>(csr);
