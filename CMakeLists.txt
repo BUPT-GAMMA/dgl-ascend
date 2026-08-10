@@ -282,7 +282,11 @@ if(USE_ASCEND)
   execute_process(COMMAND python3 -c "import sys; print(sys.prefix)"
                   OUTPUT_VARIABLE Python3_ROOT_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-  find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+  # Development.Module (not Development/Embed): libdgl.so is loaded by the Python
+  # interpreter via ctypes, so it must NOT link libpython (symbols come from the
+  # interpreter at runtime). manylinux cpython ships no libpython.{so,a}, so
+  # Development.Embed would fail there; Module works everywhere.
+  find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 
   find_package(Torch REQUIRED PATHS ${LIBTORCH_PATH})
 
