@@ -27,19 +27,8 @@
 #include <acl/acl_rt.h>
 #include <Python.h>
 #include <torch/extension.h>
-#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include "sddmm_copy_lhs_tiling.h"
 
-#ifdef DGL_USE_PYTORCH_NPU_STREAM
-static bool use_pytorch_stream() {
-    static bool val = []() {
-        const char* env = std::getenv("DGL_SDDMM_USE_PYTORCH_STREAM");
-        if (!env) return false;
-        return env[0] == '1' && env[1] == '\0';
-    }();
-    return val;
-}
-#endif
 
 #ifndef ACLRT_LAUNCH_KERNEL
 #define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
@@ -149,14 +138,6 @@ static void ComputeSddmmTiling(SddmmTilingData& tiling, uint32_t numEdges,
   }
 }
 
-// ============================================================================
-// Stream management (follows spmm.cc pattern)
-// ============================================================================
-static aclrtStream GetOrCreateStream(DGLContext ctx) {
-  // Use default stream (nullptr) to align with PyTorch NPU default stream
-  return nullptr;
-}
-
 namespace dgl {
 namespace aten {
 
@@ -235,7 +216,7 @@ void SDDMMCooNPUFallback(const std::string& op, const BcastOff& bcast,
   ASCEND_CALL(aclrtSetDevice(ctx.device_id));
 
   // Get stream (use DGL stream, not PyTorch stream)
-  aclrtStream stream = GetOrCreateStream(ctx);
+  aclrtStream stream = nullptr;
 
   // For copy_lhs/copy_rhs: use NPU-native gather kernel
   if (op == "copy_lhs" || op == "copy_rhs") {
@@ -296,7 +277,7 @@ void SDDMMCooNPUFallback(const std::string& op, const BcastOff& bcast,
                              sizeof(SddmmCopyLhsTilingData), ACL_MEMCPY_HOST_TO_DEVICE));
 
     // Launch kernel
-    aclrtStream stream = GetOrCreateStream(ctx);
+    aclrtStream stream = nullptr;
     uint32_t blockDim = tiling.blockDim;
     aclError launch_err = ACLRT_LAUNCH_KERNEL(sddmm_copy_lhs_kernel)(
         blockDim, stream, feat->data, idx->data, out->data, tilingDev);
@@ -389,7 +370,7 @@ void SDDMMCooAscend(const BcastOff& bcast, const COOMatrix& coo,
   ASCEND_CALL(aclrtSetDevice(ctx.device_id));
 
   // Get stream
-  aclrtStream stream = GetOrCreateStream(ctx);
+  aclrtStream stream = nullptr;
 
   // Get vector core count
   int64_t coreNum = 0;
