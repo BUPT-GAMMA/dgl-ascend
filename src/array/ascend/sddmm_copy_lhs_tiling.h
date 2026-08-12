@@ -25,31 +25,22 @@
 //     参考 Ascend C 内部 dav_c220/kernel_operator_sync_impl.h 的 immediate Set/Wait 模式。
 //     关键发现：跨迭代分离的 Set/Wait 在 910B3 上不工作，immediate Set/Wait 零误差通过。
 // ============================================================================
-
 #pragma once
-
 #include <cstdint>
-
 // ============================================================================
 // 常量定义
 // ============================================================================
-
 // UB 预留空间（用于栈帧等系统开销）
 constexpr uint32_t UB_RESERVED = 2 * 1024;      // 预留 2 KB
-
 // 批量索引加载上限（DESIGN.md §1.5 MAX_BATCH，自设上限控制标量循环开销）
 constexpr uint32_t MAX_BATCH = 4095;
-
 // 数据类型标识
 constexpr uint32_t DTYPE_FP32 = 0;
 constexpr uint32_t DTYPE_FP16 = 1;
-
 // 32 字节对齐辅助（DESIGN.md §1.5 对齐计算）
 constexpr uint32_t ALIGN_BYTES = 32;
-
 // FP16 类型大小为 2 字节（host 侧不使用 half 类型，用 sizeof(int16_t) 替代）
 constexpr uint32_t HALF_SIZE = 2;
-
 // ============================================================================
 // Tiling 数据结构 - 向核函数传递的运行时参数
 // ============================================================================
