@@ -827,6 +827,26 @@ COOMatrix CSRRowWiseSampling(
     CSRMatrix mat, IdArray rows, int64_t num_samples, NDArray prob_or_mask,
     bool replace) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.indptr->ctx.device_type == kDGLAscend) {
+    if (IsNullArray(prob_or_mask)) {
+      ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+        ret = impl::CSRRowWiseSamplingUniform<kDGLAscend, IdType>(
+            mat, rows, num_samples, replace);
+      });
+    } else {
+      CHECK_VALID_CONTEXT(prob_or_mask, rows);
+      // The AscendC weighted kernel operates in float32 (double is forbidden
+      // in __aicore__). The launcher normalizes float64 / int8 / uint8
+      // probability or mask to float32 on the host side; the sampling itself
+      // runs natively on the NPU kernel.
+      ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+        ret = impl::CSRRowWiseSampling<kDGLAscend, IdType, float>(
+            mat, rows, num_samples, prob_or_mask, replace);
+      });
+    }
+  } else
+#endif  // DGL_USE_ASCEND
   if (IsNullArray(prob_or_mask)) {
     ATEN_CSR_SWITCH_CUDA_UVA(
         mat, rows, XPU, IdType, "CSRRowWiseSamplingUniform", {
