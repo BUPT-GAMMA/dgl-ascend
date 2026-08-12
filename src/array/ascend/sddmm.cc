@@ -74,6 +74,13 @@ extern "C" uint32_t aclrtlaunch_sddmm_copy_lhs_kernel(
     uint32_t blockDim, aclrtStream stream,
     void* feat, void* index, void* out, void* tiling);
 
+// SDDMM binary kernel (add/sub/mul/div: gather lhs + gather rhs + element-wise)
+#include "sddmm_binary_tiling.h"
+extern "C" uint32_t aclrtlaunch_sddmm_binary_kernel(
+    uint32_t blockDim, aclrtStream stream,
+    void* lhs, void* rhs, void* index_lhs, void* index_rhs,
+    void* out, void* tiling);
+
 // ============================================================================
 // UB size — 910B3 = 192 KB
 // ============================================================================
@@ -289,38 +296,91 @@ void SDDMMCooNPUFallback(const std::string& op, const BcastOff& bcast,
     ASCEND_CALL(aclrtSynchronizeStream(stream));
     ASCEND_CALL(aclrtFree(tilingDev));
   } else {
-    // add/sub/mul/div: CPU fallback (gather + element-wise on CPU)
-    aclrtSynchronizeDevice();
-    DGLContext cpu_ctx{kDGLCPU, 0};
-    // Use CopyTo with explicit sync for reliable NPU->CPU transfer
-    COOMatrix coo_cpu;
-    coo_cpu.num_rows = coo.num_rows;
-    coo_cpu.num_cols = coo.num_cols;
-    coo_cpu.row = coo.row.CopyTo(cpu_ctx);
-    aclrtSynchronizeDevice();
-    coo_cpu.col = coo.col.CopyTo(cpu_ctx);
-    aclrtSynchronizeDevice();
-    coo_cpu.data = IsNullArray(coo.data) ? coo.data : coo.data.CopyTo(cpu_ctx);
-    aclrtSynchronizeDevice();
-    coo_cpu.row_sorted = coo.row_sorted;
-    coo_cpu.col_sorted = coo.col_sorted;
-    NDArray lhs_cpu = lhs.CopyTo(cpu_ctx);
-    aclrtSynchronizeDevice();
-    NDArray rhs_cpu = IsNullArray(rhs) ? rhs : rhs.CopyTo(cpu_ctx);
-    aclrtSynchronizeDevice();
-    std::vector<int64_t> out_shape(out->shape, out->shape + out->ndim);
-    NDArray out_cpu = NDArray::Empty(out_shape, out->dtype, cpu_ctx);
-    if (std::is_same<DType, float>::value || std::is_same<DType, double>::value) {
-      SDDMMCoo<kDGLCPU, IdType, DType>(op, bcast, coo_cpu, lhs_cpu, rhs_cpu,
-                                        out_cpu, lhs_target, rhs_target);
-      aclrtSynchronizeDevice();
-      ASCEND_CALL(aclrtMemcpy(out->data, out.GetSize(),
-                               out_cpu->data, out_cpu.GetSize(),
-                               ACL_MEMCPY_HOST_TO_DEVICE));
-      aclrtSynchronizeDevice();
-    } else {
-      LOG(FATAL) << "Non-copy SDDMM op (" << op << ") not supported for FP16 on Ascend";
+    // add/sub/mul/div: NPU binary kernel (gather lhs + gather rhs + element-wise)
+    uint32_t binaryOp;
+    if (op == "add") binaryOp = 0;
+    else if (op == "sub") binaryOp = 1;
+    else if (op == "mul") binaryOp = 2;
+    else if (op == "div") binaryOp = 3;
+    else LOG(FATAL) << "Unsupported op: " << op;
+
+    // Get index arrays for lhs and rhs targets
+    NDArray idx_lhs, idx_rhs;
+    DGLContext ctx = out->ctx;
+    if (lhs_target == 0) idx_lhs = coo.row;
+    else if (lhs_target == 2) idx_lhs = coo.col;
+    else idx_lhs = aten::Range(0, num_edges, coo.row->dtype.bits, ctx);
+    if (rhs_target == 0) idx_rhs = coo.row;
+    else if (rhs_target == 2) idx_rhs = coo.col;
+    else idx_rhs = aten::Range(0, num_edges, coo.row->dtype.bits, ctx);
+
+    // Cast indices to int32 if needed
+    if (idx_lhs->dtype.bits != 32) {
+      DGLContext cpu_ctx{kDGLCPU, 0};
+      NDArray idx_cpu = idx_lhs.CopyTo(cpu_ctx);
+      idx_lhs = aten::AsNumBits(idx_cpu, 32).CopyTo(ctx);
     }
+    if (idx_rhs->dtype.bits != 32) {
+      DGLContext cpu_ctx{kDGLCPU, 0};
+      NDArray idx_cpu = idx_rhs.CopyTo(cpu_ctx);
+      idx_rhs = aten::AsNumBits(idx_cpu, 32).CopyTo(ctx);
+    }
+
+    int64_t num_nodes_lhs = lhs->shape[0];
+    int64_t num_nodes_rhs = IsNullArray(rhs) ? 0 : rhs->shape[0];
+    int64_t feat_dim = (lhs->ndim > 1) ? lhs->shape[1] : 1;
+    uint32_t dtype_flag = (sizeof(DType) == 4) ? 0 : 1;
+
+    int64_t coreNum = 0;
+    aclrtGetDeviceInfo(ctx.device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &coreNum);
+    if (coreNum <= 0) coreNum = 40;
+
+    SddmmBinaryTilingData tiling;
+    tiling.nnz = static_cast<uint32_t>(num_edges);
+    tiling.featDim = static_cast<uint32_t>(feat_dim);
+    tiling.op = binaryOp;
+    tiling.dtype = dtype_flag;
+    tiling.numNodesLhs = static_cast<uint32_t>(num_nodes_lhs);
+    tiling.numNodesRhs = static_cast<uint32_t>(num_nodes_rhs);
+    tiling.ubSize = 192 * 1024;
+
+    uint32_t coreNumU32 = static_cast<uint32_t>(coreNum);
+    tiling.blockDim = (tiling.nnz < coreNumU32) ? tiling.nnz : coreNumU32;
+    if (tiling.blockDim == 0) tiling.blockDim = 1;
+    tiling.edgesPerCore = (tiling.nnz + tiling.blockDim - 1) / tiling.blockDim;
+
+    uint32_t alignBytes = 32;
+    uint32_t elemSize = (dtype_flag == 0) ? 4 : 2;
+    tiling.featDimAligned = (tiling.featDim * elemSize + alignBytes - 1) / alignBytes * alignBytes / elemSize;
+    if (tiling.featDimAligned == 0) tiling.featDimAligned = alignBytes / elemSize;
+    tiling.featDimAlignedF32 = (tiling.featDim * sizeof(float) + alignBytes - 1) / alignBytes * alignBytes / sizeof(float);
+    if (tiling.featDimAlignedF32 == 0) tiling.featDimAlignedF32 = alignBytes / sizeof(float);
+
+    uint32_t ubAvailable = tiling.ubSize - 2 * 1024;
+    uint32_t bufSize = tiling.featDimAligned * elemSize;
+    if (dtype_flag == 1) bufSize = tiling.featDimAlignedF32 * sizeof(float);
+    uint32_t batchSize = ubAvailable / (bufSize * 2);  // lhs + rhs buffers
+    if (batchSize == 0) batchSize = 1;
+    if (batchSize > 4095) batchSize = 4095;
+    tiling.batchSize = batchSize;
+
+    void* tilingDev = nullptr;
+    ASCEND_CALL(aclrtMalloc(&tilingDev, sizeof(SddmmBinaryTilingData), ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMemcpy(tilingDev, sizeof(SddmmBinaryTilingData), &tiling,
+                             sizeof(SddmmBinaryTilingData), ACL_MEMCPY_HOST_TO_DEVICE));
+
+    aclrtStream stream = nullptr;
+    uint32_t blockDim = tiling.blockDim;
+    aclError launch_err = ACLRT_LAUNCH_KERNEL(sddmm_binary_kernel)(
+        blockDim, stream, lhs->data, rhs->data,
+        idx_lhs->data, idx_rhs->data,
+        out->data, tilingDev);
+
+    if (launch_err != ACL_SUCCESS) {
+      LOG(FATAL) << "sddmm_binary_kernel launch failed, error code: " << launch_err;
+    }
+    ASCEND_CALL(aclrtSynchronizeStream(stream));
+    ASCEND_CALL(aclrtFree(tilingDev));
   }
 }
 template <typename IdType, typename DType>
@@ -536,7 +596,7 @@ void SDDMMCoo<kDGLAscend, int32_t, uint16_t>(
     const std::string& op, const BcastOff& bcast, const COOMatrix& coo,
     NDArray lhs, NDArray rhs, NDArray out, int lhs_target, int rhs_target) {
   if (op != "dot") {
-    if (op == "copy_lhs" || op == "copy_rhs") { SDDMMCooNPUFallback<int32_t, uint16_t>(op, bcast, coo, lhs, rhs, out, lhs_target, rhs_target); } else { LOG(FATAL) << "FP16 SDDMM non-copy op not supported on Ascend"; }
+    SDDMMCooNPUFallback<int32_t, uint16_t>(op, bcast, coo, lhs, rhs, out, lhs_target, rhs_target);
     return;
   }
   SDDMMCooAscend<int32_t, uint16_t>(bcast, coo, lhs, rhs, out, lhs_target, rhs_target);
@@ -560,7 +620,7 @@ void SDDMMCoo<kDGLAscend, int64_t, uint16_t>(
     const std::string& op, const BcastOff& bcast, const COOMatrix& coo,
     NDArray lhs, NDArray rhs, NDArray out, int lhs_target, int rhs_target) {
   if (op != "dot") {
-    if (op == "copy_lhs" || op == "copy_rhs") { SDDMMCooNPUFallback<int64_t, uint16_t>(op, bcast, coo, lhs, rhs, out, lhs_target, rhs_target); } else { LOG(FATAL) << "FP16 SDDMM non-copy op not supported on Ascend"; }
+    SDDMMCooNPUFallback<int64_t, uint16_t>(op, bcast, coo, lhs, rhs, out, lhs_target, rhs_target);
     return;
   }
   COOMatrix coo32 = CastCOOToInt32(coo);
