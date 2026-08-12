@@ -1,3 +1,7 @@
+#ifdef DGL_USE_ASCEND
+#include <acl/acl.h>
+#include <acl/acl_rt.h>
+#endif
 /**
  *  Copyright (c) 2019-2022 by Contributors
  * @file array/array.cc
@@ -1010,26 +1014,75 @@ bool COOHasDuplicate(COOMatrix coo) {
 
 int64_t COOGetRowNNZ(COOMatrix coo, int64_t row) {
   int64_t ret = 0;
-  ATEN_COO_SWITCH_CUDA(coo, XPU, IdType, "COOGetRowNNZ", {
-    ret = impl::COOGetRowNNZ<XPU, IdType>(coo, row);
-  });
+  if (coo.row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    auto coo_row = coo.row.CopyTo(cpu_ctx);
+    auto coo_col = coo.col.CopyTo(cpu_ctx);
+    auto coo_data = coo.data.CopyTo(cpu_ctx);
+    COOMatrix coo_cpu{coo.num_rows, coo.num_cols, coo_row, coo_col, coo_data,
+                       coo.row_sorted, coo.col_sorted};
+    ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
+      ret = impl::COOGetRowNNZ<kDGLCPU, IdType>(coo_cpu, row);
+    });
+  } else {
+    ATEN_COO_SWITCH_CUDA(coo, XPU, IdType, "COOGetRowNNZ", {
+      ret = impl::COOGetRowNNZ<XPU, IdType>(coo, row);
+    });
+  }
   return ret;
 }
 
 NDArray COOGetRowNNZ(COOMatrix coo, NDArray row) {
   NDArray ret;
-  ATEN_COO_SWITCH_CUDA(coo, XPU, IdType, "COOGetRowNNZ", {
-    ret = impl::COOGetRowNNZ<XPU, IdType>(coo, row);
-  });
+  if (coo.row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    auto coo_row = coo.row.CopyTo(cpu_ctx);
+    auto coo_col = coo.col.CopyTo(cpu_ctx);
+    auto coo_data = coo.data.CopyTo(cpu_ctx);
+    auto row_cpu = row.CopyTo(cpu_ctx);
+    COOMatrix coo_cpu{coo.num_rows, coo.num_cols, coo_row, coo_col, coo_data,
+                       coo.row_sorted, coo.col_sorted};
+    ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
+      ret = impl::COOGetRowNNZ<kDGLCPU, IdType>(coo_cpu, row_cpu);
+    });
+    ret = ret.CopyTo(row->ctx);
+  } else {
+    ATEN_COO_SWITCH_CUDA(coo, XPU, IdType, "COOGetRowNNZ", {
+      ret = impl::COOGetRowNNZ<XPU, IdType>(coo, row);
+    });
+  }
   return ret;
 }
 
 std::pair<NDArray, NDArray> COOGetRowDataAndIndices(
     COOMatrix coo, int64_t row) {
   std::pair<NDArray, NDArray> ret;
-  ATEN_COO_SWITCH(coo, XPU, IdType, "COOGetRowDataAndIndices", {
-    ret = impl::COOGetRowDataAndIndices<XPU, IdType>(coo, row);
-  });
+  if (coo.row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    auto coo_row = coo.row.CopyTo(cpu_ctx);
+    auto coo_col = coo.col.CopyTo(cpu_ctx);
+    auto coo_data = coo.data.CopyTo(cpu_ctx);
+    COOMatrix coo_cpu{coo.num_rows, coo.num_cols, coo_row, coo_col, coo_data,
+                       coo.row_sorted, coo.col_sorted};
+    ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
+      ret = impl::COOGetRowDataAndIndices<kDGLCPU, IdType>(coo_cpu, row);
+    });
+    ret.first = ret.first.CopyTo(coo.row->ctx);
+    ret.second = ret.second.CopyTo(coo.row->ctx);
+  } else {
+    ATEN_COO_SWITCH(coo, XPU, IdType, "COOGetRowDataAndIndices", {
+      ret = impl::COOGetRowDataAndIndices<XPU, IdType>(coo, row);
+    });
+  }
   return ret;
 }
 
@@ -1037,6 +1090,9 @@ std::vector<NDArray> COOGetDataAndIndices(
     COOMatrix coo, NDArray rows, NDArray cols) {
   std::vector<NDArray> ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1063,6 +1119,9 @@ std::vector<NDArray> COOGetDataAndIndices(
 NDArray COOGetData(COOMatrix coo, NDArray rows, NDArray cols) {
   NDArray ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1113,9 +1172,28 @@ COOMatrix COOSliceRows(COOMatrix coo, int64_t start, int64_t end) {
 
 COOMatrix COOSliceRows(COOMatrix coo, NDArray rows) {
   COOMatrix ret;
-  ATEN_COO_SWITCH(coo, XPU, IdType, "COOSliceRows", {
-    ret = impl::COOSliceRows<XPU, IdType>(coo, rows);
-  });
+  if (coo.row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    auto coo_row = coo.row.CopyTo(cpu_ctx);
+    auto coo_col = coo.col.CopyTo(cpu_ctx);
+    auto coo_data = coo.data.CopyTo(cpu_ctx);
+    auto rows_cpu = rows.CopyTo(cpu_ctx);
+    COOMatrix coo_cpu{coo.num_rows, coo.num_cols, coo_row, coo_col, coo_data,
+                       coo.row_sorted, coo.col_sorted};
+    ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
+      ret = impl::COOSliceRows<kDGLCPU, IdType>(coo_cpu, rows_cpu);
+    });
+    ret.row = ret.row.CopyTo(coo.row->ctx);
+    ret.col = ret.col.CopyTo(coo.row->ctx);
+    ret.data = ret.data.CopyTo(coo.row->ctx);
+  } else {
+    ATEN_COO_SWITCH(coo, XPU, IdType, "COOSliceRows", {
+      ret = impl::COOSliceRows<XPU, IdType>(coo, rows);
+    });
+  }
   return ret;
 }
 
@@ -1129,11 +1207,31 @@ COOMatrix COOSliceMatrix(COOMatrix coo, NDArray rows, NDArray cols) {
 
 void COOSort_(COOMatrix* mat, bool sort_column) {
   if ((mat->row_sorted && !sort_column) || mat->col_sorted) return;
-  ATEN_XPU_SWITCH_CUDA(mat->row->ctx.device_type, XPU, "COOSort_", {
+  if (mat->row->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    auto row_cpu = mat->row.CopyTo(cpu_ctx);
+    auto col_cpu = mat->col.CopyTo(cpu_ctx);
+    auto data_cpu = mat->data.CopyTo(cpu_ctx);
+    COOMatrix mat_cpu{mat->num_rows, mat->num_cols, row_cpu, col_cpu, data_cpu,
+                       mat->row_sorted, mat->col_sorted};
     ATEN_ID_TYPE_SWITCH(mat->row->dtype, IdType, {
-      impl::COOSort_<XPU, IdType>(mat, sort_column);
+      impl::COOSort_<kDGLCPU, IdType>(&mat_cpu, sort_column);
     });
-  });
+    mat->row = mat_cpu.row.CopyTo(mat->row->ctx);
+    mat->col = mat_cpu.col.CopyTo(mat->row->ctx);
+    mat->data = mat_cpu.data.CopyTo(mat->row->ctx);
+    mat->row_sorted = mat_cpu.row_sorted;
+    mat->col_sorted = mat_cpu.col_sorted;
+  } else {
+    ATEN_XPU_SWITCH_CUDA(mat->row->ctx.device_type, XPU, "COOSort_", {
+      ATEN_ID_TYPE_SWITCH(mat->row->dtype, IdType, {
+        impl::COOSort_<XPU, IdType>(mat, sort_column);
+      });
+    });
+  }
 }
 
 std::pair<bool, bool> COOIsSorted(COOMatrix coo) {
@@ -1464,7 +1562,7 @@ void CSRSDDMM(
     NDArray out, int lhs_target, int rhs_target) {
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
 
-  ATEN_XPU_SWITCH_CUDA(csr.indptr->ctx.device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA_ASCEND(csr.indptr->ctx.device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         SDDMMCsr<XPU, IdType, Dtype>(
@@ -1508,7 +1606,7 @@ void COOSDDMM(
     NDArray out, int lhs_target, int rhs_target) {
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
 
-  ATEN_XPU_SWITCH_CUDA(coo.row->ctx.device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA_ASCEND(coo.row->ctx.device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         SDDMMCoo<XPU, IdType, Dtype>(
