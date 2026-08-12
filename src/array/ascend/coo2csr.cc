@@ -170,8 +170,16 @@ CSRMatrix COOToCSRWithKernel(COOMatrix coo) {
         npu_sorted_data = NDArray::Empty({nnz}, coo.data->dtype, ctx);
         launch_gather(gather_stream, npu_sorted_data, coo.data, perm_npu);
       } else {
+        // No explicit edge IDs: synthesize [0, nnz) and gather by perm so the
+        // data array aligns with the reordered rows/cols (matches CPU's
+        // Bx[index] = i semantics, where i is the original COO position).
+        // Without this gather, data would be identity [0..nnz) while rows/cols
+        // are reordered, corrupting the position-to-eid mapping (breaks CSC
+        // data and thus weighted in-edge sampling).
         IdArray cpu_data = aten::Range(0, nnz, coo.row->dtype.bits, cpu_ctx);
-        npu_sorted_data = cpu_data.CopyTo(ctx);
+        NDArray npu_range_data = cpu_data.CopyTo(ctx);
+        npu_sorted_data = NDArray::Empty({nnz}, coo.row->dtype, ctx);
+        launch_gather(gather_stream, npu_sorted_data, npu_range_data, perm_npu);
       }
       ASCEND_CALL(aclrtDestroyStream(gather_stream));
     }
