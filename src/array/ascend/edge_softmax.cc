@@ -32,6 +32,22 @@
 #include <torch/extension.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include "edge_softmax_tiling.h"
+// NPU gather kernel (from sddmm_copy_lhs) — replaces CPU IndexSelectND
+// Forward-declare kernel and tiling struct (avoid include conflict with edge_softmax_tiling.h)
+struct SddmmCopyLhsTilingData {
+    uint32_t numNodes;
+    uint32_t nnz;
+    uint32_t featDim;
+    uint32_t blockDim;
+    uint32_t edgesPerCore;
+    uint32_t batchSize;
+    uint32_t dtype;
+    uint32_t featDimAligned;
+    uint32_t ubSize;
+};
+extern "C" uint32_t aclrtlaunch_sddmm_copy_lhs_kernel(
+    uint32_t blockDim, aclrtStream stream,
+    void* feat, void* index, void* out, void* tiling);
 
 #ifndef ACLRT_LAUNCH_KERNEL
 #define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
@@ -57,100 +73,83 @@ static at::Tensor NDArrayToTorch(NDArray arr) {
 }
 
 static NDArray IndexSelectND(NDArray src, NDArray index, DGLContext ctx) {
-  // Gather src by index: result[i] = src[index[i]]
-  // NPU torch index_select unreliable on DGL blob tensors.
-  // Use D2H → CPU gather → H2D for correctness.
-  DGLContext cpu_ctx{kDGLCPU, 0};
-  NDArray src_cpu = src.CopyTo(cpu_ctx);
-  NDArray index_cpu = index.CopyTo(cpu_ctx);
-  int64_t n = index_cpu->shape[0];
-  int64_t stride = (src_cpu->ndim > 1) ? src_cpu->shape[1] : 1;
-  NDArray ret_cpu = NDArray::Empty({n, stride}, src->dtype, cpu_ctx);
+  int64_t n = index->shape[0];
+  int64_t feat_dim = (src->ndim > 1) ? src->shape[1] : 1;
+  int64_t num_nodes = src->shape[0];
+  uint32_t dtype_flag = (src->dtype.bits == 32) ? 0 : 1;
 
-  if (index_cpu->dtype.bits == 32) {
-    const int32_t* idx = static_cast<const int32_t*>(index_cpu->data);
-    if (src_cpu->dtype.bits == 32) {
-      const float* s = static_cast<const float*>(src_cpu->data);
-      float* d = static_cast<float*>(ret_cpu->data);
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + i * stride, s + idx[i] * stride, stride * sizeof(float));
-      }
-    } else if (src_cpu->dtype.bits == 16) {
-      const uint16_t* s = static_cast<const uint16_t*>(src_cpu->data);
-      uint16_t* d = static_cast<uint16_t*>(ret_cpu->data);
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + i * stride, s + idx[i] * stride, stride * sizeof(uint16_t));
-      }
-    }
-  } else if (index_cpu->dtype.bits == 64) {
-    const int64_t* idx = static_cast<const int64_t*>(index_cpu->data);
-    if (src_cpu->dtype.bits == 32) {
-      const float* s = static_cast<const float*>(src_cpu->data);
-      float* d = static_cast<float*>(ret_cpu->data);
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + i * stride, s + idx[i] * stride, stride * sizeof(float));
-      }
-    } else if (src_cpu->dtype.bits == 16) {
-      const uint16_t* s = static_cast<const uint16_t*>(src_cpu->data);
-      uint16_t* d = static_cast<uint16_t*>(ret_cpu->data);
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + i * stride, s + idx[i] * stride, stride * sizeof(uint16_t));
-      }
-    }
+  NDArray idx32 = index;
+  if (idx32->dtype.bits != 32) {
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    NDArray idx_cpu = idx32.CopyTo(cpu_ctx);
+    idx32 = dgl::aten::AsNumBits(idx_cpu, 32).CopyTo(ctx);
   }
-  return ret_cpu.CopyTo(ctx);
-}
 
+  std::vector<int64_t> out_shape = {n, feat_dim};
+  NDArray ret = NDArray::Empty(out_shape, src->dtype, ctx);
+
+  int64_t coreNum = 0;
+  aclrtGetDeviceInfo(ctx.device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &coreNum);
+  if (coreNum <= 0) coreNum = 40;
+
+  SddmmCopyLhsTilingData tiling;
+  tiling.numNodes = static_cast<uint32_t>(num_nodes);
+  tiling.nnz = static_cast<uint32_t>(n);
+  tiling.featDim = static_cast<uint32_t>(feat_dim);
+  tiling.dtype = dtype_flag;
+  tiling.ubSize = 192 * 1024;
+  uint32_t coreNumU32 = static_cast<uint32_t>(coreNum);
+  tiling.blockDim = (tiling.nnz < coreNumU32) ? tiling.nnz : coreNumU32;
+  if (tiling.blockDim == 0) tiling.blockDim = 1;
+  tiling.edgesPerCore = (tiling.nnz + tiling.blockDim - 1) / tiling.blockDim;
+  uint32_t elemSize = (dtype_flag == 0) ? 4 : 2;
+  tiling.featDimAligned = (tiling.featDim * elemSize + 31) / 32 * 32 / elemSize;
+  if (tiling.featDimAligned == 0) tiling.featDimAligned = 32 / elemSize;
+  uint32_t ubAvailable = tiling.ubSize - 2 * 1024;
+  uint32_t batchSize = ubAvailable / (tiling.featDimAligned * elemSize);
+  if (batchSize == 0) batchSize = 1;
+  if (batchSize > 4095) batchSize = 4095;
+  tiling.batchSize = batchSize;
+
+  void* tilingDev = nullptr;
+  ASCEND_CALL(aclrtMalloc(&tilingDev, sizeof(SddmmCopyLhsTilingData), ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(aclrtMemcpy(tilingDev, sizeof(SddmmCopyLhsTilingData), &tiling,
+                           sizeof(SddmmCopyLhsTilingData), ACL_MEMCPY_HOST_TO_DEVICE));
+  aclrtStream stream = nullptr;
+  aclError err = ACLRT_LAUNCH_KERNEL(sddmm_copy_lhs_kernel)(
+      tiling.blockDim, stream, src->data, idx32->data, ret->data, tilingDev);
+  if (err != ACL_SUCCESS) LOG(FATAL) << "IndexSelectND gather kernel failed: " << err;
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  ASCEND_CALL(aclrtFree(tilingDev));
+  return ret;
+}
 static void ScatterBackND(NDArray dst, NDArray index, NDArray src, DGLContext ctx) {
-  // dst[index[i]] = src[i]
-  // NPU torch index_put/scatter_ unreliable on DGL blob tensors.
-  // Use D2H → CPU scatter → H2D for correctness.
+  int64_t n = index->shape[0];
+  int64_t stride = (src->ndim > 1) ? src->shape[1] : 1;
+  uint32_t elemSize = (src->dtype.bits == 32) ? 4 : 2;
+  uint32_t rowBytes = stride * elemSize;
   DGLContext cpu_ctx{kDGLCPU, 0};
-  NDArray dst_cpu = dst.CopyTo(cpu_ctx);
   NDArray index_cpu = index.CopyTo(cpu_ctx);
-  NDArray src_cpu = src.CopyTo(cpu_ctx);
-
+  aclrtStream stream = nullptr;
   if (index_cpu->dtype.bits == 32) {
     const int32_t* idx = static_cast<const int32_t*>(index_cpu->data);
-    int64_t n = index_cpu->shape[0];
-    if (dst_cpu->dtype.bits == 32) {
-      float* d = static_cast<float*>(dst_cpu->data);
-      const float* s = static_cast<const float*>(src_cpu->data);
-      int64_t stride = (dst_cpu->ndim > 1) ? dst_cpu->shape[1] : 1;
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + idx[i] * stride, s + i * stride, stride * sizeof(float));
-      }
-    } else if (dst_cpu->dtype.bits == 16) {
-      // FP16: treat as uint16_t
-      uint16_t* d = static_cast<uint16_t*>(dst_cpu->data);
-      const uint16_t* s = static_cast<const uint16_t*>(src_cpu->data);
-      int64_t stride = (dst_cpu->ndim > 1) ? dst_cpu->shape[1] : 1;
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + idx[i] * stride, s + i * stride, stride * sizeof(uint16_t));
-      }
+    for (int64_t i = 0; i < n; ++i) {
+      ASCEND_CALL(aclrtMemcpyAsync(
+          static_cast<char*>(dst->data) + static_cast<int64_t>(idx[i]) * rowBytes, rowBytes,
+          static_cast<const char*>(src->data) + i * rowBytes, rowBytes,
+          ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
     }
-  } else if (index_cpu->dtype.bits == 64) {
+  } else {
     const int64_t* idx = static_cast<const int64_t*>(index_cpu->data);
-    int64_t n = index_cpu->shape[0];
-    if (dst_cpu->dtype.bits == 32) {
-      float* d = static_cast<float*>(dst_cpu->data);
-      const float* s = static_cast<const float*>(src_cpu->data);
-      int64_t stride = (dst_cpu->ndim > 1) ? dst_cpu->shape[1] : 1;
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + idx[i] * stride, s + i * stride, stride * sizeof(float));
-      }
-    } else if (dst_cpu->dtype.bits == 16) {
-      uint16_t* d = static_cast<uint16_t*>(dst_cpu->data);
-      const uint16_t* s = static_cast<const uint16_t*>(src_cpu->data);
-      int64_t stride = (dst_cpu->ndim > 1) ? dst_cpu->shape[1] : 1;
-      for (int64_t i = 0; i < n; ++i) {
-        std::memcpy(d + idx[i] * stride, s + i * stride, stride * sizeof(uint16_t));
-      }
+    for (int64_t i = 0; i < n; ++i) {
+      ASCEND_CALL(aclrtMemcpyAsync(
+          static_cast<char*>(dst->data) + idx[i] * rowBytes, rowBytes,
+          static_cast<const char*>(src->data) + i * rowBytes, rowBytes,
+          ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
     }
   }
-  dst_cpu.CopyTo(dst);
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
 }
-
 extern "C" uint32_t aclrtlaunch_edge_softmax_kernel(
     uint32_t blockDim, aclrtStream stream,
     void* efeat, void* indptr, void* out, void* gradOut, void* gradEfeat, void* tiling);
@@ -342,7 +341,15 @@ static void EdgeSoftmaxAscendImpl(
       }
       need_remap = !seq;
     } else {
-      need_remap = true;  // int64, assume remapping needed
+      // int64: cast to int32 and check
+      NDArray data_cpu = csr_used.data.CopyTo(DGLContext{kDGLCPU, 0});
+      int64_t num_edges_check = data_cpu->shape[0];
+      const int64_t* ids64 = static_cast<const int64_t*>(data_cpu->data);
+      bool seq = true;
+      for (int64_t i = 0; i < num_edges_check; ++i) {
+        if (ids64[i] != i) { seq = false; break; }
+      }
+      need_remap = !seq;
     }
   }
   NDArray edge_ids = csr_used.data;
