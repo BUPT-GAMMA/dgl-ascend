@@ -29,8 +29,6 @@
 #ifdef DGL_USE_ASCEND
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
-#include <torch/extension.h>
-#include <torch_npu/csrc/core/npu/NPUStream.h>
 #include "edge_softmax_tiling.h"
 // NPU gather kernel (from sddmm_copy_lhs) — replaces CPU IndexSelectND
 // Forward-declare kernel and tiling struct (avoid include conflict with edge_softmax_tiling.h)
@@ -58,19 +56,6 @@ extern "C" uint32_t aclrtlaunch_sddmm_copy_lhs_kernel(
     aclError e = (func);                                                 \
     CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e; \
   }
-
-static at::Tensor NDArrayToTorch(NDArray arr) {
-  auto torch_device = c10::Device(c10::DeviceType::PrivateUse1, arr->ctx.device_id);
-  c10::ScalarType dtype;
-  if (arr->dtype.code == kDGLFloat && arr->dtype.bits == 32) dtype = torch::kFloat32;
-  else if (arr->dtype.code == kDGLFloat && arr->dtype.bits == 16) dtype = torch::kHalf;
-  else if (arr->dtype.code == kDGLInt && arr->dtype.bits == 32) dtype = torch::kInt32;
-  else if (arr->dtype.code == kDGLInt && arr->dtype.bits == 64) dtype = torch::kInt64;
-  else LOG(FATAL) << "Unsupported dtype: code=" << arr->dtype.code << " bits=" << arr->dtype.bits;
-  std::vector<int64_t> shape(arr->shape, arr->shape + arr->ndim);
-  auto options = torch::TensorOptions().dtype(dtype).device(torch_device);
-  return torch::from_blob(arr->data, shape, options);
-}
 
 static NDArray IndexSelectND(NDArray src, NDArray index, DGLContext ctx) {
   int64_t n = index->shape[0];
