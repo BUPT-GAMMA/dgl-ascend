@@ -315,36 +315,68 @@ void SDDMMHetero(
 void Edge_softmax_forward(
     const std::string& op, HeteroGraphPtr graph, NDArray ufeat, NDArray efeat,
     NDArray out) {
-  // TODO(zhejiang): add gpu op for edge_softmax
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
+  // Dispatch by output tensor device (graph may stay on CPU while data is on NPU)
+  int dev_type = efeat->ctx.device_type;
 
-  ATEN_XPU_SWITCH(graph->Context().device_type, XPU, "edge_softmax", {
+  if (dev_type == kDGLCPU) {
     ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(
-          out->dtype, Dtype, XPU, "edge_softmax out data", {
-            Edge_softmax_csr_forward<XPU, IdType, Dtype>(
+          out->dtype, Dtype, kDGLCPU, "edge_softmax out data", {
+            Edge_softmax_csr_forward<kDGLCPU, IdType, Dtype>(
                 op, bcast, graph->GetCSCMatrix(0), ufeat, efeat, out);
           });
     });
-  });
+  } else if (dev_type == kDGLAscend) {
+    ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
+      if (out->dtype.code == kDGLFloat && out->dtype.bits == 32) {
+        Edge_softmax_csr_forward<kDGLAscend, IdType, float>(
+            op, bcast, graph->GetCSCMatrix(0), ufeat, efeat, out);
+      } else if (out->dtype.code == kDGLFloat && out->dtype.bits == 16) {
+        Edge_softmax_csr_forward<kDGLAscend, IdType, uint16_t>(
+            op, bcast, graph->GetCSCMatrix(0), ufeat, efeat, out);
+      } else {
+        LOG(FATAL) << "edge_softmax forward: unsupported dtype on Ascend: code="
+                   << out->dtype.code << " bits=" << out->dtype.bits;
+      }
+    });
+  } else {
+    LOG(FATAL) << "edge_softmax forward: unsupported device type: " << dev_type;
+  }
 }
 
 /** @brief Generalized Edge_softmax op for backward */
 void Edge_softmax_backward(
     const std::string& op, HeteroGraphPtr graph, NDArray out, NDArray sds,
     NDArray back_out, NDArray ufeat) {
-  // TODO(zhejiang): add gpu op for edge_softmax
   const auto& bcast = CalcBcastOff(op, ufeat, sds);
+  // Dispatch by output tensor device (graph may stay on CPU while data is on NPU)
+  int dev_type = out->ctx.device_type;
 
-  ATEN_XPU_SWITCH(graph->Context().device_type, XPU, "edge_softmax_back", {
+  if (dev_type == kDGLCPU) {
     ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(
-          out->dtype, Dtype, XPU, "edge_softmax out data_back", {
-            Edge_softmax_csr_backward<XPU, IdType, Dtype>(
+          out->dtype, Dtype, kDGLCPU, "edge_softmax out data_back", {
+            Edge_softmax_csr_backward<kDGLCPU, IdType, Dtype>(
                 op, bcast, graph->GetCSCMatrix(0), out, sds, back_out);
           });
     });
-  });
+  } else if (dev_type == kDGLAscend) {
+    ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
+      if (out->dtype.code == kDGLFloat && out->dtype.bits == 32) {
+        Edge_softmax_csr_backward<kDGLAscend, IdType, float>(
+            op, bcast, graph->GetCSCMatrix(0), out, sds, back_out);
+      } else if (out->dtype.code == kDGLFloat && out->dtype.bits == 16) {
+        Edge_softmax_csr_backward<kDGLAscend, IdType, uint16_t>(
+            op, bcast, graph->GetCSCMatrix(0), out, sds, back_out);
+      } else {
+        LOG(FATAL) << "edge_softmax backward: unsupported dtype on Ascend: code="
+                   << out->dtype.code << " bits=" << out->dtype.bits;
+      }
+    });
+  } else {
+    LOG(FATAL) << "edge_softmax backward: unsupported device type: " << dev_type;
+  }
 }
 
 NDArray GetEdgeMapping(HeteroGraphRef graph) {
@@ -371,6 +403,19 @@ void SegmentReduceDispatch(
 
 /** @brief Scatter Add (on first dimension) dispatch function. */
 void ScatterAddDispatch(NDArray feat, NDArray idx, NDArray out) {
+  if (feat->ctx.device_type == kDGLAscend) {
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    NDArray feat_cpu = feat.CopyTo(cpu_ctx);
+    NDArray idx_cpu = idx.CopyTo(cpu_ctx);
+    NDArray out_cpu = out.CopyTo(cpu_ctx);
+    ATEN_ID_TYPE_SWITCH(idx_cpu->dtype, IdType, {
+      ATEN_FLOAT_TYPE_SWITCH_16BITS(feat_cpu->dtype, Dtype, kDGLCPU, "Feature data", {
+        ScatterAdd<kDGLCPU, IdType, Dtype>(feat_cpu, idx_cpu, out_cpu);
+      });
+    });
+    out_cpu.CopyTo(out);
+    return;
+  }
   ATEN_XPU_SWITCH_CUDA(feat->ctx.device_type, XPU, "ScatterAdd", {
     ATEN_ID_TYPE_SWITCH(idx->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(feat->dtype, Dtype, XPU, "Feature data", {
