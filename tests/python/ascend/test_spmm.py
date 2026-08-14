@@ -1,19 +1,16 @@
 """
-SPMM unified kernel correctness tests on Ascend NPU.
+SPMM operator tests on Ascend NPU.
 
 Tests cover:
-- copy_lhs + sum/max/min × FP32/FP16 × int32/int64
-- gspmm direct call vs CPU reference
+- gspmm copy_lhs + sum/max/min × FP32/FP16 × int32/int64
 - update_all(copy_u, sum/max/min) fused path
-- 2D and 3D (BSpMM) feature shapes
 - Backward (autograd)
-- Zero-degree nodes
-- Large graph
-- Edge cases (empty graph, single node)
-
-Run:
-    cd /root/dgl-ascend
-    PYTHONPATH=tests python -m pytest tests/ascend/test_spmm_unified.py -v
+- Various feat_dims, large graph, zero-degree, empty graph, bipartite
+- FP32 bit-exact precision, FP32 vs FP16 consistency
+- Stream sync: in_edges/in_degrees after update_all/gsddmm
+- Repeated calls stability
+- segment_reduce (mean_nodes)
+- End-to-end: GCN forward/backward, multi-layer, training loop
 """
 import pytest
 import torch
@@ -21,21 +18,25 @@ import torch_npu
 import numpy as np
 import dgl
 import dgl.function as fn
-from dgl.ops import gspmm
+from dgl.ops import gsddmm, gspmm
 
 dev = torch.device("npu:0")
 torch.npu.set_device(dev)
 
 
 def make_graph(num_src=10, num_dst=10, num_edges=30, idtype=torch.int64):
+    torch.npu.synchronize()
     np.random.seed(42)
     src = np.random.randint(0, num_src, num_edges)
     dst = np.random.randint(0, num_dst, num_edges)
     return dgl.graph((src.tolist(), dst.tolist()), idtype=idtype).to(dev)
 
 
-class TestSPMMUnified:
-    """SPMM unified kernel correctness tests."""
+class TestSPMM:
+    """SPMM operator tests."""
+
+    def setup_method(self):
+        torch.npu.synchronize()
 
     @pytest.mark.parametrize("reducer", ["sum", "max", "min"])
     @pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
@@ -67,7 +68,6 @@ class TestSPMMUnified:
             v_npu = dgl.backend.replace_inf_with_zero(v_npu)
             v_cpu = dgl.backend.replace_inf_with_zero(v_cpu)
         diff = (v_npu.float().cpu() - v_cpu).abs().max().item()
-        # sum accumulates FP16 error; max/min are exact
         tol = 5.0 if reducer == "sum" else 5e-2
         assert diff < tol, f"{reducer} FP16 diff={diff}"
 
@@ -108,7 +108,6 @@ class TestSPMMUnified:
         v = gspmm(g, "copy_lhs", "sum", ufeat, None)
         loss = v.sum()
         loss.backward()
-        # backward uses copy_rhs on reversed graph (CPU fallback)
         assert ufeat.grad is not None
 
     def test_backward_fp16(self):
@@ -116,8 +115,7 @@ class TestSPMMUnified:
         g = make_graph()
         ufeat = torch.rand(g.num_src_nodes(), 4, device=dev, requires_grad=True)
         v = gspmm(g, "copy_lhs", "sum", ufeat.half(), None)
-        loss = v.sum()
-        loss.backward()
+        v.sum().backward()
         assert ufeat.grad is not None
 
     @pytest.mark.parametrize("feat_dim", [1, 4, 13, 64, 128, 256])
@@ -153,7 +151,7 @@ class TestSPMMUnified:
         v_cpu = gspmm(g_cpu, "copy_lhs", "sum", ufeat.cpu(), None)
         diff = (v_npu.cpu() - v_cpu).abs().max().item()
         assert diff < 1e-4
-        assert v_npu[0].abs().max() == 0, "Zero-degree node should be zero"
+        assert v_npu[0].abs().max() == 0
 
     def test_empty_graph(self):
         """Graph with 0 edges."""
@@ -172,7 +170,7 @@ class TestSPMMUnified:
         v_npu = gspmm(g, "copy_lhs", "sum", ufeat, None)
         v_cpu = gspmm(g_cpu, "copy_lhs", "sum", ufeat.cpu(), None)
         diff = (v_npu.cpu() - v_cpu).abs().max().item()
-        assert diff < 1e-4, f"int64 diff={diff}"
+        assert diff < 1e-4
 
     def test_bipartite(self):
         """Bipartite graph."""
@@ -187,11 +185,11 @@ class TestSPMMUnified:
         v_npu = gspmm(g, "copy_lhs", "sum", ufeat, None)
         v_cpu = gspmm(g_cpu, "copy_lhs", "sum", ufeat.cpu(), None)
         diff = (v_npu.cpu() - v_cpu).abs().max().item()
-        assert diff < 1e-4, f"bipartite diff={diff}"
+        assert diff < 1e-4
 
     @pytest.mark.parametrize("reducer", ["sum", "max", "min"])
     def test_repeated_calls(self, reducer):
-        """Repeated calls on same graph (stream stability)."""
+        """Repeated calls on same graph (stability)."""
         g = make_graph()
         ufeat = torch.rand(g.num_src_nodes(), 4, device=dev)
         results = []
@@ -202,25 +200,8 @@ class TestSPMMUnified:
             diff = (results[i] - results[0]).abs().max().item()
             assert diff == 0, f"Call {i} differs from call 0 by {diff}"
 
-    def test_training_loop(self):
-        """Multi-step training (forward + backward + optimizer)."""
-        g = make_graph(num_src=30, num_dst=30, num_edges=100)
-        linear = torch.nn.Linear(16, 8).to(dev)
-        optimizer = torch.optim.SGD(linear.parameters(), lr=0.01)
-
-        for _ in range(5):
-            g.ndata["x"] = torch.rand(30, 16, device=dev, requires_grad=True)
-            g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
-            out = linear(g.ndata["h"])
-            loss = out.sum()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        assert g.in_degrees().sum().item() == g.num_edges()
-
     def test_fp32_precision_bit_exact(self):
-        """FP32 sum should be bit-exact (no Cast)."""
+        """FP32 sum should be bit-exact."""
         g = make_graph()
         g_cpu = g.cpu()
         ufeat = torch.rand(g.num_src_nodes(), 4, device=dev)
@@ -243,3 +224,121 @@ class TestSPMMUnified:
         diff = (v_fp32.cpu() - v_fp16.float().cpu()).abs().max().item()
         tol = 5.0 if reducer == "sum" else 0.1
         assert diff < tol, f"FP32 vs FP16 {reducer} diff={diff}"
+
+
+class TestStreamSync:
+    """Stream synchronization and UDF reduce tests."""
+
+    def setup_method(self):
+        torch.npu.synchronize()
+
+    def test_udf_reduce_forward(self):
+        """UDF reduce with degree bucketing."""
+        g = make_graph(idtype=torch.int64)
+        g_cpu = g.cpu()
+        g.ndata["x"] = torch.rand(g.num_nodes(), 4, device=dev)
+        g_cpu.ndata["x"] = g.ndata["x"].cpu()
+
+        g.update_all(fn.copy_u("x", "m"),
+                      lambda n: {"h": n.mailbox["m"].sum(1)})
+        g_cpu.update_all(fn.copy_u("x", "m"),
+                          lambda n: {"h": n.mailbox["m"].sum(1)})
+        diff = (g.ndata["h"].cpu() - g_cpu.ndata["h"]).abs().max().item()
+        assert diff < 1e-4
+
+    def test_udf_reduce_backward(self):
+        """UDF reduce forward + backward."""
+        g = make_graph(idtype=torch.int64)
+        g.ndata["x"] = torch.rand(g.num_nodes(), 4, device=dev, requires_grad=True)
+        g.update_all(fn.copy_u("x", "m"),
+                      lambda n: {"h": n.mailbox["m"].sum(1)})
+        g.ndata["h"].sum().backward()
+        assert g.ndata["x"].grad is not None
+
+    def test_in_edges_after_update_all(self):
+        """in_edges correct after update_all."""
+        g = make_graph(num_src=20, num_dst=20, num_edges=100, idtype=torch.int64)
+        g.ndata["x"] = torch.rand(g.num_nodes(), 4, device=dev, requires_grad=True)
+        g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
+
+        nodes = torch.arange(g.num_nodes(), device=dev)
+        eid = g.in_edges(nodes, form="eid")
+        assert len(eid) == g.num_edges()
+        assert g.in_degrees().sum().item() == g.num_edges()
+
+    def test_in_edges_after_gsddmm(self):
+        """in_edges correct after gsddmm."""
+        g = make_graph(num_src=20, num_dst=20, num_edges=100, idtype=torch.int64)
+        lhs = torch.rand(g.num_src_nodes(), 4, device=dev, requires_grad=True)
+        rhs = torch.rand(g.num_src_nodes(), 4, device=dev, requires_grad=True)
+        gsddmm(g, "dot", lhs, rhs, lhs_target="u", rhs_target="v")
+
+        nodes = torch.arange(g.num_nodes(), device=dev)
+        eid = g.in_edges(nodes, form="eid")
+        assert len(eid) == g.num_edges()
+
+    def test_repeated_update_all(self):
+        """Multiple update_all calls (stability)."""
+        g = make_graph(num_src=20, num_dst=20, num_edges=100, idtype=torch.int64)
+        for _ in range(3):
+            g.ndata["x"] = torch.rand(g.num_nodes(), 4, device=dev, requires_grad=True)
+            g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
+            g.ndata["h"].sum().backward()
+
+        nodes = torch.arange(g.num_nodes(), device=dev)
+        eid = g.in_edges(nodes, form="eid")
+        assert len(eid) == g.num_edges()
+
+    def test_segment_reduce(self):
+        """segment_reduce forward + backward."""
+        from dgl.ops import segment_reduce
+        seglen = torch.tensor([3, 2, 1], device=dev)
+        value = torch.rand(6, 4, device=dev, requires_grad=True)
+        y = segment_reduce(seglen, value, reducer="sum")
+        assert y.shape == (3, 4)
+        y.sum().backward()
+        assert value.grad is not None
+
+
+class TestEndToEnd:
+    """End-to-end GNN model tests."""
+
+    def setup_method(self):
+        torch.npu.synchronize()
+
+    def test_gcn_forward_backward(self):
+        """GCN forward + backward."""
+        g = make_graph(num_src=30, num_dst=30, num_edges=100, idtype=torch.int64)
+        g.ndata["x"] = torch.rand(30, 16, device=dev, requires_grad=True)
+        g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
+        linear = torch.nn.Linear(16, 8).to(dev)
+        out = linear(g.ndata["h"])
+        out.sum().backward()
+        assert g.ndata["x"].grad is not None
+
+    def test_multi_layer_gcn(self):
+        """Multi-layer GCN with autograd."""
+        g = make_graph(num_src=30, num_dst=30, num_edges=100, idtype=torch.int64)
+        layers = [torch.nn.Linear(16, 16).to(dev), torch.nn.Linear(16, 8).to(dev)]
+        x = torch.rand(30, 16, device=dev, requires_grad=True)
+        for layer in layers:
+            g.ndata["x"] = x
+            g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
+            x = torch.relu(layer(g.ndata["h"]))
+        x.sum().backward()
+        assert layers[0].weight.grad is not None
+
+    def test_training_loop(self):
+        """Multi-step training."""
+        g = make_graph(num_src=30, num_dst=30, num_edges=100, idtype=torch.int64)
+        linear = torch.nn.Linear(16, 8).to(dev)
+        optimizer = torch.optim.SGD(linear.parameters(), lr=0.01)
+        for _ in range(5):
+            g.ndata["x"] = torch.rand(30, 16, device=dev, requires_grad=True)
+            g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
+            out = linear(g.ndata["h"])
+            loss = out.sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        assert g.in_degrees().sum().item() == g.num_edges()

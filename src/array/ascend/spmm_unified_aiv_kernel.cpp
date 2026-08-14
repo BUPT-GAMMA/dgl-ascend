@@ -1,9 +1,3 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the CANN Open Software License Agreement Version 2.0.
- */
-
 // ============================================================================
 // spmm_unified_aiv_kernel.cpp — sum 纯 Vector 备选 kernel (AIV only)
 // ============================================================================
