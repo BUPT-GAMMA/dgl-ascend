@@ -6,6 +6,11 @@
 #include <dgl/base_heterograph.h>
 #include <dgl/packed_func_ext.h>
 
+#ifdef DGL_USE_ASCEND
+#include <acl/acl.h>
+#include <acl/acl_rt.h>
+#endif
+
 #include "../c_api_common.h"
 #include "./check.h"
 #include "kernel_decl.h"
@@ -396,6 +401,22 @@ void UpdateGradMinMaxDispatchHetero(
 
 /** @brief Backward segment cmp dispatch function.*/
 void BackwardSegmentCmpDispatch(NDArray feat, NDArray arg, NDArray out) {
+  if (feat->ctx.device_type == kDGLAscend) {
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();
+#endif
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    NDArray feat_cpu = feat.CopyTo(cpu_ctx);
+    NDArray arg_cpu = arg.CopyTo(cpu_ctx);
+    NDArray out_cpu = out.CopyTo(cpu_ctx);
+    ATEN_ID_TYPE_SWITCH(arg_cpu->dtype, IdType, {
+      ATEN_FLOAT_TYPE_SWITCH_16BITS(feat_cpu->dtype, Dtype, kDGLCPU, "Feature data", {
+        BackwardSegmentCmp<kDGLCPU, IdType, Dtype>(feat_cpu, arg_cpu, out_cpu);
+      });
+    });
+    out_cpu.CopyTo(out);
+    return;
+  }
   ATEN_XPU_SWITCH_CUDA(feat->ctx.device_type, XPU, "BackwardSegmentCmp", {
     ATEN_ID_TYPE_SWITCH(arg->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(feat->dtype, Dtype, XPU, "Feature data", {

@@ -965,6 +965,18 @@ EdgeArray UnitGraph::FindEdges(dgl_type_t etype, IdArray eids) const {
 }
 
 EdgeArray UnitGraph::InEdges(dgl_type_t etype, dgl_id_t vid) const {
+#ifdef DGL_USE_ASCEND
+  // Workaround: prefer COO for Ascend to avoid CSR/CSC kernel stream sync
+  // issues.  COO InEdges falls back to CPU which is more reliable.
+  // TODO: fix CSC kernel stream sync at root cause and remove this bypass.
+  // NOTE: only applies when COO format is already materialized; graphs with
+  // only CSR/CSC still go through the native Ascend CSC path.
+  auto created = GetCreatedFormats();
+  if (created & COO_CODE) {
+    const auto ptr = GetFormat(SparseFormat::kCOO);
+    return ptr->InEdges(etype, vid);
+  }
+#endif
   const SparseFormat fmt = SelectFormat(CSC_CODE);
   const auto ptr = GetFormat(fmt);
   if (fmt == SparseFormat::kCSC) {
@@ -976,6 +988,16 @@ EdgeArray UnitGraph::InEdges(dgl_type_t etype, dgl_id_t vid) const {
 }
 
 EdgeArray UnitGraph::InEdges(dgl_type_t etype, IdArray vids) const {
+#ifdef DGL_USE_ASCEND
+  // Workaround: prefer COO for Ascend to avoid CSR/CSC kernel stream sync
+  // issues.  COO InEdges falls back to CPU which is more reliable.
+  // TODO: fix CSC kernel stream sync at root cause and remove this bypass.
+  auto created = GetCreatedFormats();
+  if (created & COO_CODE) {
+    const auto ptr = GetFormat(SparseFormat::kCOO);
+    return ptr->InEdges(etype, vids);
+  }
+#endif
   const SparseFormat fmt = SelectFormat(CSC_CODE);
   const auto ptr = GetFormat(fmt);
   if (fmt == SparseFormat::kCSC) {
