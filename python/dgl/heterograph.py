@@ -3415,7 +3415,9 @@ class DGLGraph(object):
         out_edges
         """
         v = utils.prepare_tensor(self, v, "v")
+        self._sync_npu()
         src, dst, eid = self._graph.in_edges(self.get_etype_id(etype), v)
+        self._sync_npu()
         if form == "all":
             return src, dst, eid
         elif form == "uv":
@@ -3588,7 +3590,9 @@ class DGLGraph(object):
         in_edges
         out_edges
         """
+        self._sync_npu()
         src, dst, eid = self._graph.edges(self.get_etype_id(etype), order)
+        self._sync_npu()
         if form == "all":
             return src, dst, eid
         elif form == "uv":
@@ -3670,7 +3674,9 @@ class DGLGraph(object):
         if is_all(v):
             v = self.dstnodes(dsttype)
         v_tensor = utils.prepare_tensor(self, v, "v")
+        self._sync_npu()
         deg = self._graph.in_degrees(etid, v_tensor)
+        self._sync_npu()
         if isinstance(v, numbers.Integral):
             return F.as_scalar(deg)
         else:
@@ -3750,7 +3756,9 @@ class DGLGraph(object):
             F.sum(self.has_nodes(u_tensor, ntype=srctype), dim=0)
         ) != len(u_tensor):
             raise DGLError("u contains invalid node IDs")
+        self._sync_npu()
         deg = self._graph.out_degrees(etid, utils.prepare_tensor(self, u, "u"))
+        self._sync_npu()
         if isinstance(u, numbers.Integral):
             return F.as_scalar(deg)
         else:
@@ -5739,7 +5747,41 @@ class DGLGraph(object):
             }
             ret._batch_num_edges = new_bne
 
+        # 3. Record the PyTorch NPU stream on the graph so DGL's memory
+        # management can track it.  DGL-Ascend runs its kernels on the default
+        # ACL stream (nullptr) which is decoupled from PyTorch's NPU stream;
+        # without explicit synchronization, DGL graph-structure queries
+        # (in_degrees, in_edges, etc.) can return corrupted values because
+        # DGL's aclrtMalloc-allocated buffers race with PyTorch ops on a
+        # different stream.  Recording the stream is necessary (but not
+        # sufficient); structure-query methods also sync via _sync_npu().
+        if F.device_type(ret.device) == "npu":
+            try:
+                import torch
+                cur_stream = torch.npu.current_stream()
+                ret.record_stream(cur_stream)
+            except Exception:
+                pass
+
         return ret
+
+    def _sync_npu(self):
+        """Synchronize PyTorch NPU stream before/after DGL graph-structure queries.
+
+        DGL-Ascend runs kernels on the default ACL stream (nullptr), decoupled
+        from PyTorch's NPU stream.  DGL also allocates NPU device memory via
+        aclrtMalloc, independent of PyTorch's caching allocator.  Without
+        synchronization, DGL structure queries (in_degrees, edges, etc.) can
+        read stale or corrupted data because the PyTorch stream may still have
+        pending ops that overwrite the same physical memory.  This is a
+        no-op on non-NPU devices.
+        """
+        if F.device_type(self.device) == "npu":
+            try:
+                import torch
+                torch.npu.synchronize()
+            except Exception:
+                pass
 
     def cpu(self):
         """Return a new copy of this graph on CPU.

@@ -153,6 +153,99 @@ def _edge_softmax_forward(gidx, e, op):
     return myout
 
 
+def _npu_gspmm_binary(gidx, op, reduce_op, u, e, v_shp, ctx, dtype):
+    r"""NPU-native replacement for SpMM with binary ops (mul/add) + sum reduce.
+
+    Ascend SpMM kernels only support copy_lhs natively. For mul/add ops, this
+    function decomposes the fused SpMM into NPU-native primitives:
+      1. Gather source node features by CSR-sorted edge order (index_select)
+      2. Compute per-edge message: ufeat[src] <op> efeat[edge] (elementwise)
+      3. Segment-reduce messages by destination node (Ascend native kernel)
+
+    This avoids the CPU fallback path in SpMMCsr<kDGLAscend> for op="mul"/"add".
+
+    Parameters
+    ----------
+    gidx : HeteroGraphIndex
+        The input graph index (single etype).
+    op : str
+        Binary op: "mul" or "add".
+    reduce_op : str
+        Reduce operator: "sum" (max/min not yet supported via this path).
+    u : tensor
+        Source node feature (already unsqueezed if scalar).
+    e : tensor
+        Edge feature (already unsqueezed if scalar).
+    v_shp : tuple
+        Expected output shape.
+    ctx : device
+        Device context.
+    dtype : dtype
+        Data type.
+
+    Returns
+    -------
+    tuple
+        (result_tensor, (None, None)) -- arg_u/arg_e are None since only sum
+        is supported (no argmax/argmin needed).
+    """
+    import torch as th
+    num_edges = gidx.num_edges(0)
+    _, dsttype = gidx.metagraph.find_edge(0)
+    num_dst = gidx.num_nodes(dsttype)
+
+    # Get edges in eid order, then reorder to CSC (dst-ascending) for segment_reduce.
+    # Use a CPU copy of the graph index to avoid NPU index_select stream conflicts
+    # with PyTorch NPU operations (graph topology is device-independent).
+    from ._ffi.runtime_ctypes import DGLContext
+    cpu_gidx = gidx.copy_to(DGLContext(1, 0))
+    eid_cpu = th.arange(num_edges, dtype=th.int64)
+    src_eid, dst_eid, _ = cpu_gidx.find_edges(0, eid_cpu)
+    _, csc_order_idx = cpu_gidx.get_csr_shuffle_order(0)
+    csc_order = csc_order_idx.tousertensor().to(ctx)
+    src_eid = src_eid.to(ctx)
+    dst_eid = dst_eid.to(ctx)
+
+    # Gather source features and edge features in CSC (dst-sorted) order
+    u_gathered = u[src_eid[csc_order]]  # (E, *u_feat_shape)
+    e_sorted = e[csc_order]             # (E, *e_feat_shape)
+
+    # Compute per-edge message with broadcasting
+    if op == "mul":
+        msg = u_gathered * e_sorted
+    else:  # add
+        msg = u_gathered + e_sorted
+
+    # Flatten feature dims for segment_reduce: (E, feat_prod)
+    msg_flat = msg.reshape(num_edges, -1)
+
+    # Segment reduce by destination (seglen = in_degrees)
+    seglen = th.zeros(num_dst, device=ctx, dtype=th.int64)
+    seglen.scatter_add_(
+        0, dst_eid[csc_order].long(), th.ones(num_edges, device=ctx, dtype=th.int64)
+    )
+
+    # cumsum -> offsets for F.segment_reduce
+    offsets = th.cumsum(
+        th.cat([th.zeros(1, device=ctx, dtype=seglen.dtype), seglen]), 0
+    )
+
+    # Sync PyTorch NPU stream before DGL kernel to prevent data races
+    # (gather/mul ran on PyTorch stream, segment_reduce runs on DGL stream)
+    try:
+        th.npu.synchronize()
+    except Exception:
+        pass
+
+    # Use the low-level F.segment_reduce which takes offsets directly
+    rst = F.segment_reduce(reduce_op, msg_flat, offsets)
+
+    # Reshape to expected output shape (handle broadcast: msg may be wider than v_shp)
+    rst = rst.reshape(v_shp)
+
+    return rst, (None, None)
+
+
 def _gspmm(gidx, op, reduce_op, u, e):
     r"""Generalized Sparse Matrix Multiplication interface. It takes the result of
     :attr:`op` on source node feature and edge feature, leads to a message on edge.
@@ -224,6 +317,27 @@ def _gspmm(gidx, op, reduce_op, u, e):
     v_shp = (gidx.num_nodes(dsttype),) + infer_broadcast_shape(
         op, u_shp[1:], e_shp[1:]
     )
+
+    # NPU-native path for binary ops (mul/add) + sum reduce.
+    # Ascend SpMM only supports copy_lhs natively; mul/add would fall back to CPU.
+    # Decompose into gather + elementwise op + segment_reduce (all NPU-native).
+    _is_npu = hasattr(F, "device_type") and F.device_type(ctx) == "npu"
+    if (
+        _is_npu
+        and op in ("mul", "add")
+        and reduce_op == "sum"
+        and use_u
+        and use_e
+        and gidx.num_edges(0) > 0
+    ):
+        v, (arg_u, arg_e) = _npu_gspmm_binary(
+            gidx, op, reduce_op, u, e, v_shp, ctx, dtype
+        )
+        # To deal with scalar node/edge features.
+        if (expand_u or not use_u) and (expand_e or not use_e):
+            v = F.squeeze(v, -1)
+        return v, (arg_u, arg_e)
+
     v = F.zeros(v_shp, dtype, ctx)
     use_cmp = reduce_op in ["max", "min"]
     arg_u, arg_e = None, None
@@ -686,6 +800,12 @@ def _segment_reduce(op, feat, offsets):
     if op in ["min", "max"]:
         arg = F.zeros(out_shp, idtype, ctx)
     arg_nd = to_dgl_nd_for_write(arg)
+    # Sync PyTorch NPU stream before DGL kernel to prevent data races
+    try:
+        import torch
+        torch.npu.synchronize()
+    except Exception:
+        pass
     _CAPI_DGLKernelSegmentReduce(
         op,
         to_dgl_nd(feat),

@@ -396,13 +396,27 @@ void UpdateGradMinMaxDispatchHetero(
 
 /** @brief Backward segment cmp dispatch function.*/
 void BackwardSegmentCmpDispatch(NDArray feat, NDArray arg, NDArray out) {
-  ATEN_XPU_SWITCH_CUDA(feat->ctx.device_type, XPU, "BackwardSegmentCmp", {
+  if (feat->ctx.device_type == kDGLAscend) {
+    // Ascend has no native BackwardSegmentCmp kernel; fall back to CPU
+    DGLContext cpu_ctx{kDGLCPU, 0};
+    auto feat_cpu = feat.CopyTo(cpu_ctx);
+    auto arg_cpu = arg.CopyTo(cpu_ctx);
+    auto out_cpu = out.CopyTo(cpu_ctx);
     ATEN_ID_TYPE_SWITCH(arg->dtype, IdType, {
-      ATEN_FLOAT_TYPE_SWITCH_16BITS(feat->dtype, Dtype, XPU, "Feature data", {
-        BackwardSegmentCmp<XPU, IdType, Dtype>(feat, arg, out);
+      ATEN_FLOAT_TYPE_SWITCH_16BITS(feat->dtype, Dtype, kDGLCPU, "Feature data", {
+        BackwardSegmentCmp<kDGLCPU, IdType, Dtype>(feat_cpu, arg_cpu, out_cpu);
       });
     });
-  });
+    out_cpu.CopyTo(out);
+  } else {
+    ATEN_XPU_SWITCH_CUDA(feat->ctx.device_type, XPU, "BackwardSegmentCmp", {
+      ATEN_ID_TYPE_SWITCH(arg->dtype, IdType, {
+        ATEN_FLOAT_TYPE_SWITCH_16BITS(feat->dtype, Dtype, XPU, "Feature data", {
+          BackwardSegmentCmp<XPU, IdType, Dtype>(feat, arg, out);
+        });
+      });
+    });
+  }
 }
 
 std::pair<CSRMatrix, NDArray> CSRMM(
