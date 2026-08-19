@@ -1,4 +1,3 @@
-#include <Python.h>
 #ifdef DGL_USE_ASCEND
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
@@ -666,6 +665,14 @@ std::vector<NDArray> CSRGetDataAndIndices(
 
 CSRMatrix CSRTranspose(CSRMatrix csr) {
   CSRMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (csr.indptr->ctx.device_type == kDGLAscend) {
+    ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
+      ret = impl::CSRTranspose<kDGLAscend, IdType>(csr);
+    });
+    return ret;
+  }
+#endif
   ATEN_XPU_SWITCH_CUDA(csr.indptr->ctx.device_type, XPU, "CSRTranspose", {
     ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
       ret = impl::CSRTranspose<XPU, IdType>(csr);
@@ -832,6 +839,26 @@ COOMatrix CSRRowWiseSampling(
     CSRMatrix mat, IdArray rows, int64_t num_samples, NDArray prob_or_mask,
     bool replace) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.indptr->ctx.device_type == kDGLAscend) {
+    if (IsNullArray(prob_or_mask)) {
+      ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+        ret = impl::CSRRowWiseSamplingUniform<kDGLAscend, IdType>(
+            mat, rows, num_samples, replace);
+      });
+    } else {
+      CHECK_VALID_CONTEXT(prob_or_mask, rows);
+      // The AscendC weighted kernel operates in float32 (double is forbidden
+      // in __aicore__). The launcher normalizes float64 / int8 / uint8
+      // probability or mask to float32 on the host side; the sampling itself
+      // runs natively on the NPU kernel.
+      ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+        ret = impl::CSRRowWiseSampling<kDGLAscend, IdType, float>(
+            mat, rows, num_samples, prob_or_mask, replace);
+      });
+    }
+  } else
+#endif  // DGL_USE_ASCEND
   if (IsNullArray(prob_or_mask)) {
     ATEN_CSR_SWITCH_CUDA_UVA(
         mat, rows, XPU, IdType, "CSRRowWiseSamplingUniform", {
@@ -1016,7 +1043,9 @@ bool COOHasDuplicate(COOMatrix coo) {
 int64_t COOGetRowNNZ(COOMatrix coo, int64_t row) {
   int64_t ret = 0;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1037,7 +1066,9 @@ int64_t COOGetRowNNZ(COOMatrix coo, int64_t row) {
 NDArray COOGetRowNNZ(COOMatrix coo, NDArray row) {
   NDArray ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1061,7 +1092,9 @@ std::pair<NDArray, NDArray> COOGetRowDataAndIndices(
     COOMatrix coo, int64_t row) {
   std::pair<NDArray, NDArray> ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1085,7 +1118,9 @@ std::vector<NDArray> COOGetDataAndIndices(
     COOMatrix coo, NDArray rows, NDArray cols) {
   std::vector<NDArray> ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1112,7 +1147,9 @@ std::vector<NDArray> COOGetDataAndIndices(
 NDArray COOGetData(COOMatrix coo, NDArray rows, NDArray cols) {
   NDArray ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1164,7 +1201,9 @@ COOMatrix COOSliceRows(COOMatrix coo, int64_t start, int64_t end) {
 COOMatrix COOSliceRows(COOMatrix coo, NDArray rows) {
   COOMatrix ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto coo_row = coo.row.CopyTo(cpu_ctx);
     auto coo_col = coo.col.CopyTo(cpu_ctx);
@@ -1197,7 +1236,9 @@ COOMatrix COOSliceMatrix(COOMatrix coo, NDArray rows, NDArray cols) {
 void COOSort_(COOMatrix* mat, bool sort_column) {
   if ((mat->row_sorted && !sort_column) || mat->col_sorted) return;
   if (mat->row->ctx.device_type == kDGLAscend) {
-    aclrtSynchronizeDevice();
+#ifdef DGL_USE_ASCEND
+    aclrtSynchronizeDevice();  // Ensure PyTorch NPU ops complete before D2H copy
+#endif
     DGLContext cpu_ctx{kDGLCPU, 0};
     auto row_cpu = mat->row.CopyTo(cpu_ctx);
     auto col_cpu = mat->col.CopyTo(cpu_ctx);
@@ -1549,7 +1590,7 @@ void CSRSDDMM(
     NDArray out, int lhs_target, int rhs_target) {
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
 
-  ATEN_XPU_SWITCH_CUDA_ASCEND(csr.indptr->ctx.device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA(csr.indptr->ctx.device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         SDDMMCsr<XPU, IdType, Dtype>(
@@ -1593,7 +1634,7 @@ void COOSDDMM(
     NDArray out, int lhs_target, int rhs_target) {
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
 
-  ATEN_XPU_SWITCH_CUDA_ASCEND(coo.row->ctx.device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA(coo.row->ctx.device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         SDDMMCoo<XPU, IdType, Dtype>(

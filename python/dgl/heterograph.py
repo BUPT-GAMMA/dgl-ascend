@@ -5750,11 +5750,10 @@ class DGLGraph(object):
         # 3. Record the PyTorch NPU stream on the graph so DGL's memory
         # management can track it.  DGL-Ascend runs its kernels on the default
         # ACL stream (nullptr) which is decoupled from PyTorch's NPU stream;
-        # without explicit synchronization, DGL graph-structure queries
-        # (in_degrees, in_edges, etc.) can return corrupted values because
-        # DGL's aclrtMalloc-allocated buffers race with PyTorch ops on a
-        # different stream.  Recording the stream is necessary (but not
-        # sufficient); structure-query methods also sync via _sync_npu().
+        # recording the stream lets DGL's caching allocator coordinate
+        # lifetimes with PyTorch.  Stream synchronization for correctness is
+        # handled in the C++ layer (aclrtSynchronizeDevice in array.cc /
+        # segment_reduce.cc), not here.
         if F.device_type(ret.device) == "npu":
             try:
                 import torch

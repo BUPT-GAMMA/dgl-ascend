@@ -131,7 +131,11 @@ void SegmentReduceAscend(
     int64_t feat_dim = 1;
     for (int i = 1; i < feat->ndim; ++i) feat_dim *= feat->shape[i];
 
-    // Use default stream (nullptr) to align with PyTorch NPU default stream
+    // Use the default ACL stream (nullptr).  Note: this is NOT the same as
+    // PyTorch NPU's default stream -- they are decoupled.  Correctness is
+    // ensured by the aclrtSynchronizeDevice() call above, not by stream
+    // alignment.  TODO: run DGL kernels on PyTorch's current NPU stream
+    // (via to_dgl_stream_handle) to avoid device-level sync.
     aclrtStream stream = nullptr;
 
     const uint32_t* offsets_ptr =
