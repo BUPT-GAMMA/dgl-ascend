@@ -41,7 +41,7 @@ def _build_graph(num_nodes, edges, device, idtype=torch.int64):
     return g.formats("coo")
 
 
-# edges for a 5-node graph (asymmetric, with a node of in/out degree 0 and 1).
+# edges for a 5-node graph (asymmetric, with a node of out-degree 1).
 EDGES_5 = [
     (0, 1), (0, 2), (0, 3),
     (1, 2), (1, 3),
@@ -49,9 +49,9 @@ EDGES_5 = [
     (3, 0), (3, 4),
     (4, 1),
 ]
-# out-degree per node for EDGES_5: node 0 has 3, node 4 has 0.
-OUT_DEG_5 = {0: 3, 1: 2, 2: 2, 3: 2, 4: 0}
-# in-degree per node for EDGES_5: node 4 has 1, none has 0.
+# out-degree per node for EDGES_5.
+OUT_DEG_5 = {0: 3, 1: 2, 2: 2, 3: 2, 4: 1}
+# in-degree per node for EDGES_5.
 IN_DEG_5 = {0: 2, 1: 2, 2: 2, 3: 3, 4: 1}
 
 
@@ -224,16 +224,18 @@ def test_uniform_fanout_zero():
     assert sg.num_edges() == 0
 
 
-def test_uniform_zero_degree_node():
-    """Node 4 has out-degree 0: must produce no edges for it, no crash."""
+def test_uniform_single_edge_node():
+    """Node 4 has out-degree 1: fanout=3 no-replace must yield exactly that
+    edge; fanout=1 must also yield it (deterministic single choice)."""
     device, cpu = _setup()
     if device is None:
         return
     g = _build_graph(5, EDGES_5, device)
     nodes = torch.tensor([4, 0], dtype=torch.int64, device=device)
     sg = dgl.sampling.sample_neighbors(g, nodes, 3, edge_dir="out")
-    u, _ = _uv(sg)
-    assert all(x != 4 for x in u.cpu().tolist()), "degree-0 node must yield no edges"
+    u, v = _uv(sg)
+    got = {(uu, vv) for uu, vv in zip(u.cpu().tolist(), v.cpu().tolist()) if uu == 4}
+    assert got == {(4, 1)}, f"degree-1 node must keep its only edge, got {got}"
 
 
 def test_uniform_unsorted_coo():
