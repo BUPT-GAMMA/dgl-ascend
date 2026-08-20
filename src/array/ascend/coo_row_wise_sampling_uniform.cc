@@ -12,6 +12,8 @@
 
 #include <dgl/array.h>
 
+#include <cstdint>
+
 #include "../array_op.h"
 
 namespace dgl {
@@ -43,6 +45,9 @@ COOMatrix COORowWiseSamplingUniform(
   // Full-graph conversion. Sorting inside COOToCSR handles unsorted input;
   // rows listed in `rows` index the full-graph indptr directly, so the
   // sampler's output rows are the real node ids.
+  CHECK(rows->dtype == mat.row->dtype)
+      << "Expected rows to have the same dtype as the graph";
+
   CSRMatrix csr = COOToCSR(mat);
 
   return CSRRowWiseSamplingUniform<kDGLAscend, IdType>(

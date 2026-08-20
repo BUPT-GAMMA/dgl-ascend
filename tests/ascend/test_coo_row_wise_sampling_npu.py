@@ -214,6 +214,29 @@ def test_uniform_empty_request():
     assert sg.num_edges() == 0
 
 
+def test_uniform_empty_graph():
+    """A graph with no edges must yield an empty subgraph without crashing."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    g = _build_graph(3, [], device)
+    nodes = torch.tensor([0, 1, 2], dtype=torch.int64, device=device)
+    sg = dgl.sampling.sample_neighbors(g, nodes, 2, edge_dir="out")
+    assert sg.num_edges() == 0
+
+
+def test_uniform_dtype_mismatch_rejected():
+    """Seed nodes whose dtype differs from the graph's must fail loudly
+    (launcher CHECK), not silently corrupt indices."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    g = _build_graph(5, EDGES_5, device, idtype=torch.int64)
+    nodes = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(Exception):
+        dgl.sampling.sample_neighbors(g, nodes, 2, edge_dir="out")
+
+
 def test_uniform_fanout_zero():
     device, cpu = _setup()
     if device is None:
