@@ -1309,6 +1309,19 @@ COOMatrix COORowWiseSampling(
     COOMatrix mat, IdArray rows, int64_t num_samples, NDArray prob_or_mask,
     bool replace) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.row->ctx.device_type == kDGLAscend) {
+    // Only the uniform path (no probability/mask) has an Ascend
+    // implementation so far; reject the weighted path explicitly.
+    CHECK(IsNullArray(prob_or_mask))
+        << "COO weighted row-wise sampling on Ascend is not supported yet";
+    ATEN_ID_TYPE_SWITCH(mat.row->dtype, IdType, {
+      ret = impl::COORowWiseSamplingUniform<kDGLAscend, IdType>(
+          mat, rows, num_samples, replace);
+    });
+    return ret;
+  }
+#endif  // DGL_USE_ASCEND
   ATEN_COO_SWITCH(mat, XPU, IdType, "COORowWiseSampling", {
     if (IsNullArray(prob_or_mask)) {
       ret = impl::COORowWiseSamplingUniform<XPU, IdType>(
