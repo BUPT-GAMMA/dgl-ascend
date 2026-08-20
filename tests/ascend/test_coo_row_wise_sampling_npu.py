@@ -59,12 +59,14 @@ def _uv(g):
     """Return (u, v) CPU tensors of a graph's edges.
 
     The graph may live on NPU. Move to CPU first (COOSort_, needed for
-    ``order='srcdst'``, is only implemented on CPU; and CSR-format graphs do
-    not support the default ``eid`` order). The sampling under test has
-    already happened on NPU by the time this is called.
+    ``order='srcdst'``, is only implemented on CPU). COO-format graphs do
+    not support ``order='srcdst'`` (only "eid"), so use the default order
+    there. The sampling under test has already happened on NPU by the time
+    this is called.
     """
     gc = g.cpu() if g.device != torch.device("cpu") else g
-    return gc.edges(order="srcdst")
+    order = "eid" if "coo" in gc.formats()["created"] else "srcdst"
+    return gc.edges(order=order)
 
 
 def _sorted_edges(g):
