@@ -1570,7 +1570,7 @@ void CSRSDDMM(
     NDArray out, int lhs_target, int rhs_target) {
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
 
-  ATEN_XPU_SWITCH_CUDA(csr.indptr->ctx.device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA_ASCEND(csr.indptr->ctx.device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(csr.indptr->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         SDDMMCsr<XPU, IdType, Dtype>(
@@ -1614,7 +1614,7 @@ void COOSDDMM(
     NDArray out, int lhs_target, int rhs_target) {
   const auto& bcast = CalcBcastOff(op, ufeat, efeat);
 
-  ATEN_XPU_SWITCH_CUDA(coo.row->ctx.device_type, XPU, "SDDMM", {
+  ATEN_XPU_SWITCH_CUDA_ASCEND(coo.row->ctx.device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(out->dtype, Dtype, XPU, "Feature data", {
         SDDMMCoo<XPU, IdType, Dtype>(
