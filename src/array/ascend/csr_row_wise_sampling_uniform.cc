@@ -46,6 +46,7 @@ aclrtStream getCurrentAscendStream();
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "../array_op.h"
@@ -86,7 +87,15 @@ COOMatrix CSRRowWiseSamplingUniform(
     for (int64_t i = 0; i < num_rows; ++i) sum_deg += deg_host[i];
     max_output = static_cast<int64_t>(sum_deg);
   } else {
+    // Saturating product: overflow of int64 (or of the IdType index space)
+    // must fail loudly, not silently wrap and under-allocate the output.
+    constexpr int64_t kMaxInt64 = std::numeric_limits<int64_t>::max();
+    CHECK(num_rows <= kMaxInt64 / num_samples)
+        << "num_rows * num_samples overflows int64: " << num_rows << " * "
+        << num_samples;
     max_output = num_rows * num_samples;
+    CHECK(max_output <= static_cast<int64_t>(std::numeric_limits<IdType>::max()))
+        << "Output size " << max_output << " exceeds IdType range";
   }
 
   IdArray picked_row = aten::NewIdArray(max_output, ctx, nbits);
@@ -105,7 +114,7 @@ COOMatrix CSRRowWiseSamplingUniform(
   const bool has_data = aten::CSRHasData(mat);
   void* data_ptr = has_data ? mat.data->data : nullptr;
 
-  uint32_t tiling_data[6] = {
+  uint32_t tiling_data[7] = {
       static_cast<uint32_t>(num_rows),
       select_all ? 0u : static_cast<uint32_t>(num_samples),
       static_cast<uint32_t>(replace ? 1 : 0),
@@ -113,6 +122,7 @@ COOMatrix CSRRowWiseSamplingUniform(
       static_cast<uint32_t>(
           RandomEngine::ThreadLocal()->RandInt(1000000000)),
       static_cast<uint32_t>(select_all ? 1 : 0),
+      static_cast<uint32_t>(mat.num_rows),
   };
   void* tiling_dev = nullptr;
   ASCEND_CALL(aclrtMalloc(&tiling_dev, sizeof(tiling_data),

@@ -49,7 +49,8 @@ class KernelCsrRowWiseSamplingUniform {
       GM_ADDR indptr, GM_ADDR indices, GM_ADDR data, GM_ADDR rows,
       GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
       uint32_t num_rows, uint32_t num_samples, uint32_t replace,
-      uint32_t has_data, uint32_t seed, uint32_t select_all) {
+      uint32_t has_data, uint32_t seed, uint32_t select_all,
+      uint32_t num_total_rows) {
     indptr_gm.SetGlobalBuffer((__gm__ IdT*)indptr);
     indices_gm.SetGlobalBuffer((__gm__ IdT*)indices);
     if (has_data) data_gm.SetGlobalBuffer((__gm__ IdT*)data);
@@ -64,6 +65,7 @@ class KernelCsrRowWiseSamplingUniform {
     has_data_ = has_data;
     seed_ = seed;
     select_all_ = select_all;
+    num_total_rows_ = num_total_rows;
   }
 
   __aicore__ inline void Process() {
@@ -71,6 +73,12 @@ class KernelCsrRowWiseSamplingUniform {
     for (uint32_t i = 0; i < num_rows_; ++i) {
       out_ptr_gm.SetValue(i, static_cast<IdT>(offset));
       IdT rid = rows_gm.GetValue(i);
+      // Defensive: drop out-of-range row ids (negative or >= num_total_rows)
+      // as empty rows instead of reading indptr out of bounds. Matches the
+      // CPU path, where COOSliceRows silently discards invalid seed ids.
+      if (rid < 0 || rid >= static_cast<IdT>(num_total_rows_)) {
+        continue;
+      }
       IdT off = indptr_gm.GetValue(static_cast<uint32_t>(rid));
       IdT end = indptr_gm.GetValue(static_cast<uint32_t>(rid) + 1);
       uint32_t deg = static_cast<uint32_t>(end - off);
@@ -118,6 +126,7 @@ class KernelCsrRowWiseSamplingUniform {
   }
   GlobalTensor<IdT> indptr_gm, indices_gm, data_gm, rows_gm, out_ptr_gm, out_rows_gm, out_cols_gm, out_idxs_gm;
   uint32_t num_rows_ = 0, num_samples_ = 0, replace_ = 0, has_data_ = 0, seed_ = 0, select_all_ = 0;
+  uint32_t num_total_rows_ = 0;
 };
 
 extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_int32(
@@ -125,11 +134,12 @@ extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_int32(
     GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
     GM_ADDR tiling_ptr) {
   GlobalTensor<uint32_t> tilingGm;
-  tilingGm.SetGlobalBuffer((__gm__ uint32_t*)tiling_ptr, 6);
+  tilingGm.SetGlobalBuffer((__gm__ uint32_t*)tiling_ptr, 7);
   KernelCsrRowWiseSamplingUniform<int32_t> op;
   op.Init(indptr, indices, data, rows, out_ptr, out_rows, out_cols, out_idxs,
           tilingGm.GetValue(0), tilingGm.GetValue(1), tilingGm.GetValue(2),
-          tilingGm.GetValue(3), tilingGm.GetValue(4), tilingGm.GetValue(5));
+          tilingGm.GetValue(3), tilingGm.GetValue(4), tilingGm.GetValue(5),
+          tilingGm.GetValue(6));
   op.Process();
 }
 
@@ -138,10 +148,11 @@ extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_int64(
     GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
     GM_ADDR tiling_ptr) {
   GlobalTensor<uint32_t> tilingGm;
-  tilingGm.SetGlobalBuffer((__gm__ uint32_t*)tiling_ptr, 6);
+  tilingGm.SetGlobalBuffer((__gm__ uint32_t*)tiling_ptr, 7);
   KernelCsrRowWiseSamplingUniform<int64_t> op;
   op.Init(indptr, indices, data, rows, out_ptr, out_rows, out_cols, out_idxs,
           tilingGm.GetValue(0), tilingGm.GetValue(1), tilingGm.GetValue(2),
-          tilingGm.GetValue(3), tilingGm.GetValue(4), tilingGm.GetValue(5));
+          tilingGm.GetValue(3), tilingGm.GetValue(4), tilingGm.GetValue(5),
+          tilingGm.GetValue(6));
   op.Process();
 }
