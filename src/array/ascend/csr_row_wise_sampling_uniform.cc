@@ -14,10 +14,10 @@
 #ifdef DGL_USE_ASCEND
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
-#define ASCEND_CALL(func)                                                \
-  {                                                                      \
-    aclError e = (func);                                                 \
-    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;              \
+#define ASCEND_CALL(func)                                   \
+  {                                                         \
+    aclError e = (func);                                    \
+    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e; \
   }
 
 #ifndef ACLRT_LAUNCH_KERNEL
@@ -25,16 +25,14 @@
 #endif
 
 extern "C" uint32_t aclrtlaunch_csr_row_wise_sampling_uniform_int32(
-    uint32_t blockDim, aclrtStream stream,
-    void* indptr, void* indices, void* data, void* rows,
-    void* out_ptr, void* out_rows, void* out_cols, void* out_idxs,
-    void* row_split, void* out_starts, void* tiling);
+    uint32_t blockDim, aclrtStream stream, void* indptr, void* indices,
+    void* data, void* rows, void* out_ptr, void* out_rows, void* out_cols,
+    void* out_idxs, void* row_split, void* out_starts, void* tiling);
 
 extern "C" uint32_t aclrtlaunch_csr_row_wise_sampling_uniform_int64(
-    uint32_t blockDim, aclrtStream stream,
-    void* indptr, void* indices, void* data, void* rows,
-    void* out_ptr, void* out_rows, void* out_cols, void* out_idxs,
-    void* row_split, void* out_starts, void* tiling);
+    uint32_t blockDim, aclrtStream stream, void* indptr, void* indices,
+    void* data, void* rows, void* out_ptr, void* out_rows, void* out_cols,
+    void* out_idxs, void* row_split, void* out_starts, void* tiling);
 
 namespace dgl {
 namespace runtime {
@@ -69,8 +67,8 @@ namespace {
 // the query is unavailable.
 uint32_t QueryVectorCoreCount(int device_id) {
   int64_t core_num = 0;
-  aclError err = aclrtGetDeviceInfo(
-      device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &core_num);
+  aclError err =
+      aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &core_num);
   if (err != ACL_SUCCESS || core_num <= 0 || core_num > 4096) {
     return kDefaultVectorCoreCount;
   }
@@ -84,14 +82,13 @@ uint32_t QueryUbAvailableBytes(int device_id) {
   int64_t ub_bytes = 0;
   aclError err = aclrtGetDeviceInfo(
       device_id, ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE, &ub_bytes);
-  if (err != ACL_SUCCESS || ub_bytes <= static_cast<int64_t>(kUbReservedBytes) ||
+  if (err != ACL_SUCCESS ||
+      ub_bytes <= static_cast<int64_t>(kUbReservedBytes) ||
       ub_bytes > (1 << 30)) {
     return kDefaultUbBytes - kUbReservedBytes;
   }
-  return static_cast<uint32_t>(
-      ub_bytes > static_cast<int64_t>(kUbReservedBytes)
-          ? ub_bytes - kUbReservedBytes
-          : 0);
+  // Reaching here means ub_bytes > kUbReservedBytes (checked above).
+  return static_cast<uint32_t>(ub_bytes - kUbReservedBytes);
 }
 
 // Copies a device uint32 array to host.
@@ -99,9 +96,9 @@ std::vector<uint32_t> CopyDeviceArrayToHostUInt32(
     const void* dev_ptr, size_t count) {
   std::vector<uint32_t> host(count);
   if (count == 0) return host;
-  ASCEND_CALL(aclrtMemcpy(host.data(), count * sizeof(uint32_t), dev_ptr,
-                          count * sizeof(uint32_t),
-                          ACL_MEMCPY_DEVICE_TO_HOST));
+  ASCEND_CALL(aclrtMemcpy(
+      host.data(), count * sizeof(uint32_t), dev_ptr, count * sizeof(uint32_t),
+      ACL_MEMCPY_DEVICE_TO_HOST));
   return host;
 }
 
@@ -137,8 +134,7 @@ std::vector<uint32_t> BuildBalancedPartitions(
   for (uint32_t part = 1; part < num_parts; ++part) {
     const double target = total_weight * part / num_parts;
     auto it = std::lower_bound(prefix.begin(), prefix.end(), target);
-    boundaries[part] =
-        static_cast<uint32_t>(it - prefix.begin());
+    boundaries[part] = static_cast<uint32_t>(it - prefix.begin());
   }
   // Enforce monotonicity against ties landing on the same boundary.
   for (uint32_t part = 1; part < num_parts; ++part) {
@@ -154,11 +150,10 @@ std::vector<uint32_t> BuildBalancedPartitions(
 // scope: an async copy only captures the source pointer, so returning
 // without a sync would upload stack garbage (spmm precedes its cached
 // uploads with the same sync).
-void* UploadHostUInt32(
-    const std::vector<uint32_t>& host, aclrtStream stream) {
+void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
   void* dev = nullptr;
-  ASCEND_CALL(aclrtMalloc(&dev, host.size() * sizeof(uint32_t),
-                          ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(aclrtMalloc(
+      &dev, host.size() * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
   ASCEND_CALL(aclrtMemcpyAsync(
       dev, host.size() * sizeof(uint32_t), host.data(),
       host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
@@ -183,25 +178,25 @@ COOMatrix CSRRowWiseSamplingUniform(
   const int64_t num_rows = rows->shape[0];
   const uint8_t nbits = mat.indptr->dtype.bits;
 
-  if (num_rows == 0 || mat.indptr->shape[0] <= 1 ||
-      (num_samples == 0 && !select_all)) {
+  // num_samples == 0 implies !select_all (select_all means -1).
+  if (num_rows == 0 || mat.indptr->shape[0] <= 1 || num_samples == 0) {
     IdArray empty_row = aten::NewIdArray(0, ctx, nbits);
-    return COOMatrix(mat.num_rows, mat.num_cols, empty_row, empty_row,
-                     empty_row);
+    return COOMatrix(
+        mat.num_rows, mat.num_cols, empty_row, empty_row, empty_row);
   }
 
   // Per-row pick counts (degrees come back to the host once).
   const uint32_t fanout = select_all ? 0u : static_cast<uint32_t>(num_samples);
   NDArray deg = CSRGetRowNNZ<kDGLAscend, IdType>(mat, rows);
   std::vector<IdType> deg_host(num_rows);
-  ASCEND_CALL(aclrtMemcpy(deg_host.data(), num_rows * sizeof(IdType),
-                           deg->data, num_rows * sizeof(IdType),
-                           ACL_MEMCPY_DEVICE_TO_HOST));
+  ASCEND_CALL(aclrtMemcpy(
+      deg_host.data(), num_rows * sizeof(IdType), deg->data,
+      num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
   std::vector<uint32_t> picks(num_rows);
   for (int64_t i = 0; i < num_rows; ++i) {
     const uint32_t d = static_cast<uint32_t>(deg_host[i]);
     picks[i] = select_all ? d
-              : replace   ? (d == 0 ? 0u : fanout)
+               : replace  ? (d == 0 ? 0u : fanout)
                           : std::min(fanout, d);
   }
 
@@ -218,14 +213,12 @@ COOMatrix CSRRowWiseSamplingUniform(
   std::vector<uint32_t> out_starts(block_dim + 1, 0);
   {
     std::vector<uint32_t> prefix(num_rows + 1, 0);
-    for (int64_t i = 0; i < num_rows; ++i)
-      prefix[i + 1] = prefix[i] + picks[i];
+    for (int64_t i = 0; i < num_rows; ++i) prefix[i + 1] = prefix[i] + picks[i];
     for (uint32_t b = 0; b <= block_dim; ++b)
       out_starts[b] = prefix[row_split[b]];
   }
   const int64_t max_output = out_starts[block_dim];
-  CHECK(max_output <=
-        static_cast<int64_t>(std::numeric_limits<IdType>::max()))
+  CHECK(max_output <= static_cast<int64_t>(std::numeric_limits<IdType>::max()))
       << "Output size " << max_output << " exceeds IdType range";
 
   auto stream = dgl::runtime::getCurrentAscendStream();
@@ -237,8 +230,7 @@ COOMatrix CSRRowWiseSamplingUniform(
       fanout,
       static_cast<uint32_t>(replace ? 1 : 0),
       static_cast<uint32_t>(has_data ? 1 : 0),
-      static_cast<uint32_t>(
-          RandomEngine::ThreadLocal()->RandInt(1000000000)),
+      static_cast<uint32_t>(RandomEngine::ThreadLocal()->RandInt(1000000000)),
       static_cast<uint32_t>(select_all ? 1 : 0),
       static_cast<uint32_t>(mat.num_rows),
       QueryUbAvailableBytes(ctx.device_id),
@@ -250,10 +242,11 @@ COOMatrix CSRRowWiseSamplingUniform(
   IdArray out_ptr = aten::NewIdArray(num_rows + 1, ctx, nbits);
 
   if (max_output == 0) {
-    return COOMatrix(mat.num_rows, mat.num_cols,
-                     picked_row.CreateView({0}, picked_row->dtype),
-                     picked_col.CreateView({0}, picked_col->dtype),
-                     picked_idx.CreateView({0}, picked_idx->dtype));
+    return COOMatrix(
+        mat.num_rows, mat.num_cols,
+        picked_row.CreateView({0}, picked_row->dtype),
+        picked_col.CreateView({0}, picked_col->dtype),
+        picked_idx.CreateView({0}, picked_idx->dtype));
   }
 
   // Zero the output buffers on the launch stream (spmm pattern): DGL's
@@ -261,16 +254,16 @@ COOMatrix CSRRowWiseSamplingUniform(
   // kernel does not write (idle blocks) must read as 0, not stale data
   // from earlier launches.
   const int64_t out_bytes = max_output * (nbits / 8);
-  ASCEND_CALL(aclrtMemsetAsync(
-      picked_row->data, out_bytes, 0, out_bytes, stream));
-  ASCEND_CALL(aclrtMemsetAsync(
-      picked_col->data, out_bytes, 0, out_bytes, stream));
-  ASCEND_CALL(aclrtMemsetAsync(
-      picked_idx->data, out_bytes, 0, out_bytes, stream));
+  ASCEND_CALL(
+      aclrtMemsetAsync(picked_row->data, out_bytes, 0, out_bytes, stream));
+  ASCEND_CALL(
+      aclrtMemsetAsync(picked_col->data, out_bytes, 0, out_bytes, stream));
+  ASCEND_CALL(
+      aclrtMemsetAsync(picked_idx->data, out_bytes, 0, out_bytes, stream));
 
   void* tiling_dev = nullptr;
-  ASCEND_CALL(aclrtMalloc(&tiling_dev, sizeof(tiling_data),
-                          ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(
+      aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
   ASCEND_CALL(aclrtMemcpyAsync(
       tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
       ACL_MEMCPY_HOST_TO_DEVICE, stream));

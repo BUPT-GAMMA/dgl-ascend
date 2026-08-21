@@ -36,8 +36,8 @@ constexpr uint32_t kUbReservedBytes = 2 * 1024;   // runtime reserved tail
 // gather, sized for the worst case (fanout picks per row).
 
 // RNG constants (xorshift32 with Knuth golden-ratio row hashing).
-constexpr uint32_t kGoldenRatioHash = 2654435761u;  // 2^32 / phi
-constexpr uint32_t kGoldenRatioOffset = 0x9e3779b9u; // frac(2^32 / phi)
-constexpr uint32_t kRngFallbackSeed = 0x12345678u;  // nonzero-state guard
+constexpr uint32_t kGoldenRatioHash = 2654435761u;    // 2^32 / phi
+constexpr uint32_t kGoldenRatioOffset = 0x9e3779b9u;  // frac(2^32 / phi)
+constexpr uint32_t kRngFallbackSeed = 0x12345678u;    // nonzero-state guard
 
 #endif  // CSR_ROW_WISE_SAMPLING_UNIFORM_TILING_H

@@ -35,11 +35,12 @@ COOMatrix COORowWiseSamplingUniform(
   const uint8_t nbits = mat.row->dtype.bits;
 
   // Structural early exit for degenerate inputs (mirrors the CSR path).
-  if (num_rows == 0 || mat.row->shape[0] == 0 ||
-      (num_samples == 0 && !select_all)) {
+  // Note: num_samples == 0 implies !select_all (select_all means -1), so
+  // the redundant conjunct is omitted.
+  if (num_rows == 0 || mat.row->shape[0] == 0 || num_samples == 0) {
     IdArray empty_row = aten::NewIdArray(0, ctx, nbits);
-    return COOMatrix(mat.num_rows, mat.num_cols, empty_row, empty_row,
-                     empty_row);
+    return COOMatrix(
+        mat.num_rows, mat.num_cols, empty_row, empty_row, empty_row);
   }
 
   // Full-graph conversion. Sorting inside COOToCSR handles unsorted input;

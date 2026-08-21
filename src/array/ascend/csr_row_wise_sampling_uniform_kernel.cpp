@@ -25,8 +25,8 @@
  *   100k-row graphs). Replaced by v2.
  */
 
-#include "kernel_operator.h"
 #include "csr_row_wise_sampling_uniform_tiling.h"
+#include "kernel_operator.h"
 
 using namespace AscendC;
 
@@ -55,8 +55,7 @@ class KernelCsrRowWiseSamplingUniform {
   __aicore__ inline void Init(
       GM_ADDR indptr, GM_ADDR indices, GM_ADDR data, GM_ADDR rows,
       GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
-      GM_ADDR row_split, GM_ADDR out_starts, GM_ADDR tiling_ptr,
-      TPipe* pipe) {
+      GM_ADDR row_split, GM_ADDR out_starts, GM_ADDR tiling_ptr, TPipe* pipe) {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 
     // Struct-pointer tiling access (spmm pattern): field loads through a
@@ -101,13 +100,12 @@ class KernelCsrRowWiseSamplingUniform {
     // triples, and one double-buffered VECOUT queue. The per-buffer size
     // is the budget divided across ALL buffer instances:
     // 2*2 (VECIN db) + 2*2 (VECOUT db) + 4 (VECCALC) = 12 instances.
-    constexpr uint32_t kUbInstances = 2 * kQueueDepth   // win_idx_q_
-                                     + 2 * kQueueDepth  // win_data_q_
-                                     + 2 * kQueueDepth  // out_q_
-                                     + 1                // pick_buf_
-                                     + 3;               // out_r/c/e bufs
-    window_elems_ =
-        ub_available / kUbInstances / sizeof(IdT);
+    constexpr uint32_t kUbInstances = 2 * kQueueDepth    // win_idx_q_
+                                      + 2 * kQueueDepth  // win_data_q_
+                                      + 2 * kQueueDepth  // out_q_
+                                      + 1                // pick_buf_
+                                      + 3;               // out_r/c/e bufs
+    window_elems_ = ub_available / kUbInstances / sizeof(IdT);
     pipe->InitBuffer(win_idx_q_, kQueueDepth, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(win_data_q_, kQueueDepth, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(pick_buf_, window_elems_ * sizeof(uint32_t));
@@ -131,15 +129,16 @@ class KernelCsrRowWiseSamplingUniform {
       IdT off = indptr_gm_.GetValue(static_cast<uint32_t>(rid));
       IdT end = indptr_gm_.GetValue(static_cast<uint32_t>(rid) + 1);
       uint32_t deg = static_cast<uint32_t>(end - off);
-      uint32_t num_picks = select_all_ ? deg :
-          (replace_ ? (deg == 0 ? 0 : num_samples_) :
-           (deg < num_samples_ ? deg : num_samples_));
+      uint32_t num_picks =
+          select_all_ ? deg
+                      : (replace_ ? (deg == 0 ? 0 : num_samples_)
+                                  : (deg < num_samples_ ? deg : num_samples_));
 
       if (num_picks > 0) {
         uint32_t state = seed_ ^ (i * kGoldenRatioHash + kGoldenRatioOffset);
         if (state == 0) state = kRngFallbackSeed;
-        offset += SampleRow(
-            out_start_ + offset, rid, off, deg, num_picks, state);
+        offset +=
+            SampleRow(out_start_ + offset, rid, off, deg, num_picks, state);
       }
     }
     if (row_end_ == num_rows_) {
@@ -205,8 +204,9 @@ class KernelCsrRowWiseSamplingUniform {
       uint32_t local = picks.GetValue(j);
       out_r.SetValue(j, rid);
       out_c.SetValue(j, win_idx.GetValue(local));
-      out_e.SetValue(j, has_data_ ? win_data.GetValue(local)
-                                  : static_cast<IdT>(off + local));
+      out_e.SetValue(
+          j,
+          has_data_ ? win_data.GetValue(local) : static_cast<IdT>(off + local));
     }
 
     // Copy each output array out through the VECOUT queue, one complete
@@ -247,19 +247,17 @@ class KernelCsrRowWiseSamplingUniform {
         IdT picked = off + local;
         out_rows_gm_.SetValue(out_pos + j, rid);
         out_cols_gm_.SetValue(
-            out_pos + j,
-            indices_gm_.GetValue(static_cast<uint32_t>(picked)));
+            out_pos + j, indices_gm_.GetValue(static_cast<uint32_t>(picked)));
         out_idxs_gm_.SetValue(
-            out_pos + j,
-            has_data_ ? data_gm_.GetValue(static_cast<uint32_t>(picked))
-                      : picked);
+            out_pos + j, has_data_
+                             ? data_gm_.GetValue(static_cast<uint32_t>(picked))
+                             : picked);
       }
     }
     return num_picks;
   }
 
-  __aicore__ inline void WritePickGm(
-      uint32_t pos, IdT rid, IdT picked) {
+  __aicore__ inline void WritePickGm(uint32_t pos, IdT rid, IdT picked) {
     out_rows_gm_.SetValue(pos, rid);
     out_cols_gm_.SetValue(
         pos, indices_gm_.GetValue(static_cast<uint32_t>(picked)));
@@ -278,7 +276,8 @@ class KernelCsrRowWiseSamplingUniform {
     for (uint32_t j = 0; j < count; ++j) {
       out.SetValue(j, staging.GetValue(j));
     }
-    DataCopyExtParams cp{1, static_cast<uint32_t>(count * sizeof(IdT)), 0, 0, 0};
+    DataCopyExtParams cp{
+        1, static_cast<uint32_t>(count * sizeof(IdT)), 0, 0, 0};
     DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
     out_q_.EnQue(out);
     LocalTensor<IdT> ready = out_q_.DeQue<IdT>();
@@ -304,8 +303,9 @@ extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_int32(
     GM_ADDR row_split, GM_ADDR out_starts, GM_ADDR tiling_ptr) {
   KernelCsrRowWiseSamplingUniform<int32_t> op;
   TPipe pipe;
-  op.Init(indptr, indices, data, rows, out_ptr, out_rows, out_cols, out_idxs,
-          row_split, out_starts, tiling_ptr, &pipe);
+  op.Init(
+      indptr, indices, data, rows, out_ptr, out_rows, out_cols, out_idxs,
+      row_split, out_starts, tiling_ptr, &pipe);
   op.Process();
 }
 
@@ -315,7 +315,8 @@ extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_int64(
     GM_ADDR row_split, GM_ADDR out_starts, GM_ADDR tiling_ptr) {
   KernelCsrRowWiseSamplingUniform<int64_t> op;
   TPipe pipe;
-  op.Init(indptr, indices, data, rows, out_ptr, out_rows, out_cols, out_idxs,
-          row_split, out_starts, tiling_ptr, &pipe);
+  op.Init(
+      indptr, indices, data, rows, out_ptr, out_rows, out_cols, out_idxs,
+      row_split, out_starts, tiling_ptr, &pipe);
   op.Process();
 }
