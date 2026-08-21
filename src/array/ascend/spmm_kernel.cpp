@@ -1,0 +1,468 @@
+// ============================================================================
+// Ascend C Kernel 实现 - SpMM (Sparse Matrix-Matrix Multiplication)
+// ============================================================================
+//
+// 对应 DESIGN.md §1.2 API 映射、§1.5 Buffer 规划、§2.4 伪代码
+//
+// 数学公式 (copy_lhs + reduce, DESIGN.md §1.1):
+//   for dst in 0..num_dst_nodes-1:
+//       for j in indptr[dst]..indptr[dst+1]-1:
+//           src = indices[j]
+//           out[dst] = reduce(out[dst], ufeat[src])
+//   reduce: sum / max / min
+//
+// 架构（DESIGN.md §2.1）:
+//   - 行并行：每核处理连续 dst 行区间
+//   - 纯向量计算：__global__ __aicore__
+//   - 多核切分：blockDim = min(num_dst_nodes, coreNum)
+//
+// 实现说明:
+//   1. 使用 aclrtlaunch_* 启动模式（参考 sddmm）：
+//      通过 ascendc_library() 编译为静态库，Host 侧调用 aclrtlaunch_spmm_kernel()。
+//   2. 尾核 indptr 越界读修复（WALKTHROUGH.md 问题1仲裁结论）：
+//      尾核按 actualRows = num_dst_nodes - blockIdx * rowsPerCore 加载 indptr，
+//      而非固定 (rowsPerCore + 1)，避免越界读 GM。
+//   3. 极值初始化（WALKTHROUGH.md 问题3仲裁结论）：
+//      max 用 -__builtin_huge_valf()，min 用 +__builtin_huge_valf()，
+//      若不可用则用 Duplicate 填充已知大值（1e30f）。
+//   4. FP16 精度策略（DESIGN.md §1.4）：
+//      FP16 输入升精度到 FP32 进行 Add/Max/Min，结果 Cast 回 FP16。
+//   5. degree=0 处理（DESIGN.md §2.4.3）：
+//      sum: 输出 0（初始化值正确）；max/min: 特殊处理输出 0（DGL 默认行为）。
+//   6. UB_SIZE 不硬编码（参考 sddmm M5 修复）：
+//      通过 TilingData.ubSize 从 Host 侧传入。
+// ============================================================================
+
+#include "kernel_operator.h"
+#include "spmm_tiling.h"
+
+// ============================================================================
+// Kernel 类 - SpMM 计算逻辑
+// ============================================================================
+class KernelSpmm {
+public:
+    __aicore__ inline KernelSpmm(AscendC::TPipe* pipe) : pipe_(pipe) {}
+
+    __aicore__ inline void Init(GM_ADDR ufeat, GM_ADDR indptr, GM_ADDR indices, GM_ADDR out,
+                                 const __gm__ SpmmTilingData* tiling)
+    {
+        // 声明 AIV-only 任务类型（DESIGN.md §1.2）
+        KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+
+        tiling_ = tiling;
+        uint32_t blockIdx = AscendC::GetBlockIdx();
+
+        // 在 GlobalTensor 设置之前赋值（参考 sddmm M2 修复）
+        dtype_ = tiling->dtype;
+        reduceOp_ = tiling->reduceOp;
+
+        // DESIGN.md §2.1: 多核切分 — 每核处理连续 dst 行区间
+        startRow_ = blockIdx * tiling->rowsPerCore;
+        endRow_ = (blockIdx + 1) * tiling->rowsPerCore;
+        if (endRow_ > tiling->numDstNodes) {
+            endRow_ = tiling->numDstNodes;
+        }
+
+        // Global Tensor 设置（FP32 使用 float, FP16 使用 half）
+        if (dtype_ == DTYPE_FP32) {
+            ufeatGm.SetGlobalBuffer((__gm__ float*)ufeat);
+            outGm.SetGlobalBuffer((__gm__ float*)out);
+        } else {
+            ufeatHalfGm.SetGlobalBuffer((__gm__ half*)ufeat);
+            outHalfGm.SetGlobalBuffer((__gm__ half*)out);
+        }
+        indptrGm.SetGlobalBuffer((__gm__ int32_t*)indptr);
+        indicesGm.SetGlobalBuffer((__gm__ int32_t*)indices);
+
+        featDim_ = tiling->featDim;
+        batchSize_ = tiling->batchSize;
+        featDimAlignedF_ = tiling->featDimAlignedF;
+        featDimAlignedH_ = tiling->featDimAlignedH;
+
+        // ============================================================================
+        // UB Buffer 初始化
+        // ============================================================================
+        // indptrQueue: (rowsPerCore + 1) * sizeof(int32_t) — 实际加载按 actualRows+1 计算，buffer 容量按 rowsPerCore+1 预留
+        pipe_->InitBuffer(indptrQueue, 1, (tiling->rowsPerCore + 1) * sizeof(int32_t));
+
+        // idxQueue: batchSize * sizeof(int32_t)
+        pipe_->InitBuffer(idxQueue, 1, batchSize_ * sizeof(int32_t));
+
+        if (dtype_ == DTYPE_FP32) {
+            // featQueue: FP32, BUFFER_NUM=2 (Double Buffer)
+            pipe_->InitBuffer(featQueue, 2, featDimAlignedF_ * sizeof(float));
+            // outQueue: FP32 输出（兼作累加 buffer，DESIGN.md §1.5.1）
+            pipe_->InitBuffer(outQueue, 1, featDimAlignedF_ * sizeof(float));
+        } else {
+            // featQueue: FP16, BUFFER_NUM=2 (Double Buffer)
+            pipe_->InitBuffer(featQueue, 2, featDimAlignedH_ * sizeof(half));
+            // featF32Buf: FP32 中间特征（Cast FP16→FP32），TBuf 用单参数 InitBuffer
+            pipe_->InitBuffer(featF32Buf, featDimAlignedF_ * sizeof(float));
+            // outF32Buf: FP32 累加/比较结果（独立 VECCALC buffer，不复用 featF32Buf）
+            pipe_->InitBuffer(outF32Buf, featDimAlignedF_ * sizeof(float));
+            // outQueue: FP16 输出
+            pipe_->InitBuffer(outQueue, 1, featDimAlignedH_ * sizeof(half));
+        }
+    }
+
+    __aicore__ inline void Process()
+    {
+        // DESIGN.md §2.1: 空闲核早退守卫
+        if (startRow_ >= endRow_) {
+            return;
+        }
+
+        if (dtype_ == DTYPE_FP32) {
+            ProcessFp32();
+        } else {
+            ProcessFp16();
+        }
+    }
+
+private:
+    // ============================================================================
+    // FP32 分支（DESIGN.md §2.4.1）
+    // ============================================================================
+    __aicore__ inline void ProcessFp32()
+    {
+        // 1. 批量加载 indptr 到 UB
+        // WALKTHROUGH.md 问题1修复：尾核按 actualRows 加载，避免越界读
+        uint32_t actualRows = endRow_ - startRow_;
+        AscendC::LocalTensor<int32_t> indptrLocal = indptrQueue.AllocTensor<int32_t>();
+        AscendC::DataCopyExtParams indptrParams{1, static_cast<uint32_t>((actualRows + 1) * sizeof(int32_t)), 0, 0, 0};
+        AscendC::DataCopyPadExtParams<int32_t> indptrPad{false, 0, 0, 0};
+        AscendC::DataCopyPad(indptrLocal, indptrGm[startRow_], indptrParams, indptrPad);
+        indptrQueue.EnQue(indptrLocal);
+        indptrLocal = indptrQueue.DeQue<int32_t>();
+
+        // 2. 逐行处理
+        for (uint32_t dst = startRow_; dst < endRow_; dst++) {
+            uint32_t rowStart = static_cast<uint32_t>(indptrLocal.GetValue(dst - startRow_));
+            uint32_t rowEnd   = static_cast<uint32_t>(indptrLocal.GetValue(dst - startRow_ + 1));
+            uint32_t degree = rowEnd - rowStart;
+
+            // 分配输出 tensor（FP32 兼作累加 buffer）
+            AscendC::LocalTensor<float> outLocal = outQueue.AllocTensor<float>();
+
+            if (degree == 0) {
+                // degree=0: 所有 reduce 统一输出 0（DGL 默认行为）
+                AscendC::Duplicate<float>(outLocal, 0.0f, featDim_);
+            } else {
+                // 初始化 outLocal
+                InitOutBuffer(outLocal);
+                // 逐邻居 Gather + Reduce（分批加载索引）
+                GatherReduceFp32(outLocal, rowStart, rowEnd);
+            }
+
+            // 3. 输出（TQue EnQue/DeQue 处理 V→MTE3 同步）
+            outQueue.EnQue<float>(outLocal);
+            AscendC::LocalTensor<float> outResult = outQueue.DeQue<float>();
+            AscendC::DataCopyExtParams outParams{1, static_cast<uint32_t>(featDim_ * sizeof(float)), 0, 0, 0};
+            AscendC::DataCopyPad(outGm[dst * featDim_], outResult, outParams);
+            outQueue.FreeTensor(outResult);
+        }
+        indptrQueue.FreeTensor(indptrLocal);
+    }
+
+    // ============================================================================
+    // FP32 分支：逐邻居 Gather + Reduce（DESIGN.md §2.4.1 邻居循环）
+    // ============================================================================
+    __aicore__ inline void GatherReduceFp32(AscendC::LocalTensor<float>& outLocal,
+                                              uint32_t rowStart, uint32_t rowEnd)
+    {
+        AscendC::DataCopyExtParams featParams{1, static_cast<uint32_t>(featDim_ * sizeof(float)), 0, 0, 0};
+        AscendC::DataCopyPadExtParams<float> featPad{false, 0, 0, 0.0f};
+        AscendC::DataCopyPadExtParams<int32_t> idxPad{false, 0, 0, 0};
+
+        uint32_t degree = rowEnd - rowStart;
+        uint32_t firstBatch = (degree < batchSize_) ? degree : batchSize_;
+
+        // 加载第一批邻居索引到 UB
+        AscendC::LocalTensor<int32_t> idxLocal = idxQueue.AllocTensor<int32_t>();
+        AscendC::DataCopyExtParams idxParams{1, static_cast<uint32_t>(firstBatch * sizeof(int32_t)), 0, 0, 0};
+        AscendC::DataCopyPad(idxLocal, indicesGm[rowStart], idxParams, idxPad);
+        idxQueue.EnQue(idxLocal);
+        idxLocal = idxQueue.DeQue<int32_t>();
+
+        // 预取第 0 个邻居特征（Double Buffer 起点）
+        uint32_t src0 = static_cast<uint32_t>(idxLocal.GetValue(0));
+        AscendC::LocalTensor<float> featCur = featQueue.AllocTensor<float>();
+        AscendC::DataCopyPad(featCur, ufeatGm[src0 * featDim_], featParams, featPad);
+        featQueue.EnQue(featCur);
+        featCur = featQueue.DeQue<float>();
+
+        // 逐邻居归约（第一批）
+        for (uint32_t j = 0; j < firstBatch; j++) {
+            // 预取下一个邻居（与当前 Compute 并行）
+            if (j + 1 < firstBatch) {
+                uint32_t srcN = static_cast<uint32_t>(idxLocal.GetValue(j + 1));
+                AscendC::LocalTensor<float> featNxt = featQueue.AllocTensor<float>();
+                AscendC::DataCopyPad(featNxt, ufeatGm[srcN * featDim_], featParams, featPad);
+                featQueue.EnQue(featNxt);
+            }
+
+            // Reduce (V 流水, dst==src0 完全重叠)
+            ApplyReduceFp32(outLocal, outLocal, featCur);
+
+            featQueue.FreeTensor(featCur);
+            if (j + 1 < firstBatch) {
+                featCur = featQueue.DeQue<float>();
+            }
+        }
+        idxQueue.FreeTensor(idxLocal);
+
+        // 后续批次
+        for (uint32_t bs = rowStart + firstBatch; bs < rowEnd; bs += batchSize_) {
+            uint32_t actualBatch = batchSize_;
+            if (bs + actualBatch > rowEnd) {
+                actualBatch = rowEnd - bs;
+            }
+
+            AscendC::LocalTensor<int32_t> idxBatch = idxQueue.AllocTensor<int32_t>();
+            AscendC::DataCopyExtParams idxParams2{1, static_cast<uint32_t>(actualBatch * sizeof(int32_t)), 0, 0, 0};
+            AscendC::DataCopyPad(idxBatch, indicesGm[bs], idxParams2, idxPad);
+            idxQueue.EnQue(idxBatch);
+            idxBatch = idxQueue.DeQue<int32_t>();
+
+            // 预取本批第 0 个邻居
+            uint32_t src0b = static_cast<uint32_t>(idxBatch.GetValue(0));
+            featCur = featQueue.AllocTensor<float>();
+            AscendC::DataCopyPad(featCur, ufeatGm[src0b * featDim_], featParams, featPad);
+            featQueue.EnQue(featCur);
+            featCur = featQueue.DeQue<float>();
+
+            for (uint32_t j = 0; j < actualBatch; j++) {
+                if (j + 1 < actualBatch) {
+                    uint32_t srcN = static_cast<uint32_t>(idxBatch.GetValue(j + 1));
+                    AscendC::LocalTensor<float> featNxt = featQueue.AllocTensor<float>();
+                    AscendC::DataCopyPad(featNxt, ufeatGm[srcN * featDim_], featParams, featPad);
+                    featQueue.EnQue(featNxt);
+                }
+
+                ApplyReduceFp32(outLocal, outLocal, featCur);
+
+                featQueue.FreeTensor(featCur);
+                if (j + 1 < actualBatch) {
+                    featCur = featQueue.DeQue<float>();
+                }
+            }
+            idxQueue.FreeTensor(idxBatch);
+        }
+    }
+
+    // ============================================================================
+    // FP16 分支（DESIGN.md §2.4.2）：升精度到 FP32 进行归约
+    // ============================================================================
+    __aicore__ inline void ProcessFp16()
+    {
+        // 1. 批量加载 indptr 到 UB
+        uint32_t actualRows = endRow_ - startRow_;
+        AscendC::LocalTensor<int32_t> indptrLocal = indptrQueue.AllocTensor<int32_t>();
+        AscendC::DataCopyExtParams indptrParams{1, static_cast<uint32_t>((actualRows + 1) * sizeof(int32_t)), 0, 0, 0};
+        AscendC::DataCopyPadExtParams<int32_t> indptrPad{false, 0, 0, 0};
+        AscendC::DataCopyPad(indptrLocal, indptrGm[startRow_], indptrParams, indptrPad);
+        indptrQueue.EnQue(indptrLocal);
+        indptrLocal = indptrQueue.DeQue<int32_t>();
+
+        // 2. 逐行处理
+        for (uint32_t dst = startRow_; dst < endRow_; dst++) {
+            uint32_t rowStart = static_cast<uint32_t>(indptrLocal.GetValue(dst - startRow_));
+            uint32_t rowEnd   = static_cast<uint32_t>(indptrLocal.GetValue(dst - startRow_ + 1));
+            uint32_t degree = rowEnd - rowStart;
+
+            // outF32Buf: 独立 VECCALC buffer，存储 FP32 累加结果
+            AscendC::LocalTensor<float> outF32 = outF32Buf.Get<float>();
+
+            if (degree == 0) {
+                AscendC::Duplicate<float>(outF32, 0.0f, featDim_);
+            } else {
+                // 初始化 outF32
+                InitOutBuffer(outF32);
+                // 逐邻居 Gather (FP16) → Cast FP32 → Reduce (FP32)
+                GatherReduceFp16(outF32, rowStart, rowEnd);
+            }
+
+            // Cast FP32 → FP16 (V 流水)
+            AscendC::LocalTensor<half> outLocal = outQueue.AllocTensor<half>();
+            AscendC::Cast<half, float>(outLocal, outF32, AscendC::RoundMode::CAST_ROUND, featDim_);
+
+            // 输出（TQue EnQue/DeQue 处理 V→MTE3 同步）
+            outQueue.EnQue<half>(outLocal);
+            AscendC::LocalTensor<half> outResult = outQueue.DeQue<half>();
+            AscendC::DataCopyExtParams outParams{1, static_cast<uint32_t>(featDim_ * sizeof(half)), 0, 0, 0};
+            AscendC::DataCopyPad(outHalfGm[dst * featDim_], outResult, outParams);
+            outQueue.FreeTensor(outResult);
+        }
+        indptrQueue.FreeTensor(indptrLocal);
+    }
+
+    // ============================================================================
+    // FP16 分支：逐邻居 Gather (FP16) → Cast FP32 → Reduce (FP32)
+    // ============================================================================
+    __aicore__ inline void GatherReduceFp16(AscendC::LocalTensor<float>& outF32,
+                                              uint32_t rowStart, uint32_t rowEnd)
+    {
+        AscendC::DataCopyExtParams featParams{1, static_cast<uint32_t>(featDim_ * sizeof(half)), 0, 0, 0};
+        AscendC::DataCopyPadExtParams<half> featPad{false, 0, 0, half(0)};
+        AscendC::DataCopyPadExtParams<int32_t> idxPad{false, 0, 0, 0};
+
+        uint32_t degree = rowEnd - rowStart;
+        uint32_t firstBatch = (degree < batchSize_) ? degree : batchSize_;
+
+        // 加载第一批邻居索引
+        AscendC::LocalTensor<int32_t> idxLocal = idxQueue.AllocTensor<int32_t>();
+        AscendC::DataCopyExtParams idxParams{1, static_cast<uint32_t>(firstBatch * sizeof(int32_t)), 0, 0, 0};
+        AscendC::DataCopyPad(idxLocal, indicesGm[rowStart], idxParams, idxPad);
+        idxQueue.EnQue(idxLocal);
+        idxLocal = idxQueue.DeQue<int32_t>();
+
+        // 预取第 0 个邻居特征（FP16）
+        uint32_t src0 = static_cast<uint32_t>(idxLocal.GetValue(0));
+        AscendC::LocalTensor<half> featCur = featQueue.AllocTensor<half>();
+        AscendC::DataCopyPad(featCur, ufeatHalfGm[src0 * featDim_], featParams, featPad);
+        featQueue.EnQue(featCur);
+        featCur = featQueue.DeQue<half>();
+
+        // 逐邻居归约（第一批）
+        for (uint32_t j = 0; j < firstBatch; j++) {
+            if (j + 1 < firstBatch) {
+                uint32_t srcN = static_cast<uint32_t>(idxLocal.GetValue(j + 1));
+                AscendC::LocalTensor<half> featNxt = featQueue.AllocTensor<half>();
+                AscendC::DataCopyPad(featNxt, ufeatHalfGm[srcN * featDim_], featParams, featPad);
+                featQueue.EnQue(featNxt);
+            }
+
+            // Cast FP16 → FP32 (V 流水)，featF32Buf 复用
+            AscendC::LocalTensor<float> featF32 = featF32Buf.Get<float>();
+            AscendC::Cast<float, half>(featF32, featCur, AscendC::RoundMode::CAST_NONE, featDim_);
+
+            // Reduce (V 流水, dst==src0, 在 FP32 空间)
+            ApplyReduceFp32(outF32, outF32, featF32);
+
+            featQueue.FreeTensor(featCur);
+            if (j + 1 < firstBatch) {
+                featCur = featQueue.DeQue<half>();
+            }
+        }
+        idxQueue.FreeTensor(idxLocal);
+
+        // 后续批次
+        for (uint32_t bs = rowStart + firstBatch; bs < rowEnd; bs += batchSize_) {
+            uint32_t actualBatch = batchSize_;
+            if (bs + actualBatch > rowEnd) {
+                actualBatch = rowEnd - bs;
+            }
+
+            AscendC::LocalTensor<int32_t> idxBatch = idxQueue.AllocTensor<int32_t>();
+            AscendC::DataCopyExtParams idxParams2{1, static_cast<uint32_t>(actualBatch * sizeof(int32_t)), 0, 0, 0};
+            AscendC::DataCopyPad(idxBatch, indicesGm[bs], idxParams2, idxPad);
+            idxQueue.EnQue(idxBatch);
+            idxBatch = idxQueue.DeQue<int32_t>();
+
+            uint32_t src0b = static_cast<uint32_t>(idxBatch.GetValue(0));
+            featCur = featQueue.AllocTensor<half>();
+            AscendC::DataCopyPad(featCur, ufeatHalfGm[src0b * featDim_], featParams, featPad);
+            featQueue.EnQue(featCur);
+            featCur = featQueue.DeQue<half>();
+
+            for (uint32_t j = 0; j < actualBatch; j++) {
+                if (j + 1 < actualBatch) {
+                    uint32_t srcN = static_cast<uint32_t>(idxBatch.GetValue(j + 1));
+                    AscendC::LocalTensor<half> featNxt = featQueue.AllocTensor<half>();
+                    AscendC::DataCopyPad(featNxt, ufeatHalfGm[srcN * featDim_], featParams, featPad);
+                    featQueue.EnQue(featNxt);
+                }
+
+                AscendC::LocalTensor<float> featF32 = featF32Buf.Get<float>();
+                AscendC::Cast<float, half>(featF32, featCur, AscendC::RoundMode::CAST_NONE, featDim_);
+
+                ApplyReduceFp32(outF32, outF32, featF32);
+
+                featQueue.FreeTensor(featCur);
+                if (j + 1 < actualBatch) {
+                    featCur = featQueue.DeQue<half>();
+                }
+            }
+            idxQueue.FreeTensor(idxBatch);
+        }
+    }
+
+    // ============================================================================
+    // outBuf 初始化（DESIGN.md §2.4.3）
+    // ============================================================================
+    __aicore__ inline void InitOutBuffer(AscendC::LocalTensor<float>& outBuf)
+    {
+        if (reduceOp_ == REDUCE_SUM) {
+            AscendC::Duplicate<float>(outBuf, 0.0f, featDim_);
+        } else if (reduceOp_ == REDUCE_MAX) {
+            // NumericLimits 在 A2 不支持，使用 __builtin_huge_valf()
+            // WALKTHROUGH.md 问题3仲裁：若不可用则用 1e30f 已知大值
+            float negInf = -__builtin_huge_valf();
+            AscendC::Duplicate<float>(outBuf, negInf, featDim_);
+        } else { // REDUCE_MIN
+            float posInf = __builtin_huge_valf();
+            AscendC::Duplicate<float>(outBuf, posInf, featDim_);
+        }
+    }
+
+    // ============================================================================
+    // 逐邻居归约（FP32 空间，count 模式，dst==src0 完全重叠）
+    // ============================================================================
+    __aicore__ inline void ApplyReduceFp32(AscendC::LocalTensor<float>& dst,
+                                             AscendC::LocalTensor<float>& src0,
+                                             AscendC::LocalTensor<float>& src1)
+    {
+        if (reduceOp_ == REDUCE_SUM) {
+            AscendC::Add<float>(dst, src0, src1, featDim_);
+        } else if (reduceOp_ == REDUCE_MAX) {
+            AscendC::Max<float>(dst, src0, src1, featDim_);
+        } else { // REDUCE_MIN
+            AscendC::Min<float>(dst, src0, src1, featDim_);
+        }
+    }
+
+private:
+    AscendC::TPipe* pipe_;
+    const __gm__ SpmmTilingData* tiling_;
+
+    // Global Tensor
+    AscendC::GlobalTensor<float> ufeatGm;
+    AscendC::GlobalTensor<half> ufeatHalfGm;
+    AscendC::GlobalTensor<int32_t> indptrGm;
+    AscendC::GlobalTensor<int32_t> indicesGm;
+    AscendC::GlobalTensor<float> outGm;
+    AscendC::GlobalTensor<half> outHalfGm;
+
+    // UB Queue
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> indptrQueue;     // indptr 行指针
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> idxQueue;        // 批量邻居索引
+    // featQueue: Double Buffer（BUFFER_NUM=2），预取下一邻居特征
+    AscendC::TQue<AscendC::TPosition::VECIN, 2> featQueue;       // 特征向量
+    AscendC::TQue<AscendC::TPosition::VECOUT, 1> outQueue;       // 输出行
+
+    // FP16 专用 VECCALC buffer
+    AscendC::TBuf<AscendC::TPosition::VECCALC> featF32Buf;       // FP32 中间特征
+    AscendC::TBuf<AscendC::TPosition::VECCALC> outF32Buf;        // FP32 累加/比较结果
+
+    uint32_t startRow_ = 0;
+    uint32_t endRow_ = 0;
+    uint32_t featDim_ = 0;
+    uint32_t batchSize_ = 0;
+    uint32_t dtype_ = 0;
+    uint32_t reduceOp_ = 0;
+    uint32_t featDimAlignedF_ = 0;
+    uint32_t featDimAlignedH_ = 0;
+};
+
+// ============================================================================
+// 核函数入口
+// ============================================================================
+// 通过 ascendc_library 编译为静态库，Host 侧调用 aclrtlaunch_spmm_kernel()
+extern "C" __global__ __aicore__ void spmm_kernel(GM_ADDR ufeat, GM_ADDR indptr, GM_ADDR indices,
+                                                    GM_ADDR out, GM_ADDR tiling)
+{
+    AscendC::TPipe pipe;
+    KernelSpmm op(&pipe);
+    op.Init(ufeat, indptr, indices, out, (__gm__ SpmmTilingData*)tiling);
+    op.Process();
+}

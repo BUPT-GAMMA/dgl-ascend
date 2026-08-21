@@ -34,6 +34,8 @@ _context_dict = {
     "cpu": cpu(),
     "gpu": cuda(),
 }
+if hasattr(mod, "npu"):
+    _context_dict["npu"] = mod.npu()
 _default_context = _context_dict[_default_context_str]
 
 

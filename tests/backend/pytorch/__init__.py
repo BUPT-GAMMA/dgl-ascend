@@ -11,6 +11,14 @@ def is_cuda_available():
     return th.cuda.is_available()
 
 
+def npu():
+    return th.device("npu:0")
+
+
+def is_npu_available():
+    return hasattr(th, "npu") and th.npu.is_available()
+
+
 def array_equal(a, b):
     return th.equal(a.cpu(), b.cpu())
 
