@@ -181,6 +181,9 @@ class KernelCsrRowWiseSamplingUniformFused {
         uint32_t state = seed_ ^ (i * kGoldenRatioHashFused +
                                   kGoldenRatioOffsetFused);
         if (state == 0) state = kRngFallbackSeedFused;
+        // TODO(tmp-probe): remove before final review.
+        AscendC::printf("[kprobe] blk=%u i=%u seed=%u state=%u picks=%u\n",
+                        block_idx_, i, seed_, state, num_picks);
         offset += SampleRow(out_start_ + offset, i, rid, off, deg,
                             num_picks, state);
       }
