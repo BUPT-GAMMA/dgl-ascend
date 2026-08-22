@@ -526,7 +526,7 @@ class KernelCsrRowWiseSamplingUniformFused {
   uint32_t num_rows_ = 0, num_samples_ = 0, replace_ = 0, has_data_ = 0;
   uint32_t seed_ = 0, select_all_ = 0, num_total_rows_ = 0, out_start_ = 0;
   uint32_t row_begin_ = 0, row_end_ = 0, window_elems_ = 0;
-  uint32_t block_idx_ = 0, map_seed_nodes_ = 0;
+  uint32_t block_idx_ = 0, map_seed_nodes_ = 0, meta_rows_ = 0;
   uint32_t rows_valid_ = 0, rows_base_ = 0;
   uint32_t indptr_base_ = 0, indptr_valid_ = 0;
   uint32_t out_ptr_flushed_ = 0, pairs_flushed_ = 0;
