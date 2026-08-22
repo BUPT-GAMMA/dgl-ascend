@@ -897,9 +897,10 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingFused(
       CHECK_VALID_CONTEXT(prob_or_mask, rows);
       // Weighted fused sampling has no CUDA reference either; explicit
       // named gap on NPU (see the fused operator docs in the process
-      // repository).
-      LOG(FATAL) << "Weighted fused sampling (prob/mask) is not supported "
-                    "on NPU yet";
+      // repository). CHECK raises a catchable DGL error; LOG(FATAL)
+      // would abort the process out from under Python.
+      CHECK(false) << "Weighted fused sampling (prob/mask) is not supported "
+                      "on NPU yet";
     }
   } else
 #endif  // DGL_USE_ASCEND
