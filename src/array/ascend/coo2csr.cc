@@ -256,7 +256,18 @@ struct BandWorkspaces {
     if (reduces_dev) ASCEND_CALL(aclrtFree(reduces_dev));
     if (row_split_dev) ASCEND_CALL(aclrtFree(row_split_dev));
     if (tiling_dev) ASCEND_CALL(aclrtFree(tiling_dev));
+    counts_dev = reduces_dev = row_split_dev = nullptr;
+    tiling_dev = nullptr;
   }
+  // RAII backstop: ~10 throwing sites (ASCEND_CALL / CHECK) sit between
+  // Allocate and the explicit Free on the success path; dmlc CHECK throws
+  // in default DGL builds, so any of them would otherwise leak all four
+  // device buffers. A partial-Allocate failure is covered too: already
+  // allocated members are non-null here.
+  ~BandWorkspaces() { Free(); }
+  BandWorkspaces() = default;
+  BandWorkspaces(const BandWorkspaces&) = delete;
+  BandWorkspaces& operator=(const BandWorkspaces&) = delete;
 };
 
 // Even row-range split of one band across active blocks. row_split has
@@ -389,15 +400,15 @@ CSRMatrix COOToCSRCountingSort(const COOMatrix& coo) {
 
   NDArray indptr = NDArray::Empty({num_rows + 1}, coo.row->dtype, ctx);
   NDArray indices = NDArray::Empty({nnz}, coo.col->dtype, ctx);
-  // The CSR data array: explicit input data when present, else the
-  // original edge position (i), which the scatter kernel writes inline.
+  // The CSR data array is always freshly allocated: the scatter kernel
+  // streams the input col/data arrays chunk-by-chunk while writing the
+  // reordered output, so aliasing the input data buffer (as the input
+  // row-major order differs from the output CSR order for unsorted COO)
+  // would let already-written regions overwrite input chunks not yet
+  // read. The dtype matches the CPU path's ret_data (id dtype; the CPU
+  // reference reads/writes data through IdType pointers as well).
   const bool has_data = aten::COOHasData(coo);
-  NDArray data;
-  if (has_data) {
-    data = coo.data;
-  } else {
-    data = NDArray::Empty({nnz}, coo.row->dtype, ctx);
-  }
+  NDArray data = NDArray::Empty({nnz}, coo.row->dtype, ctx);
 
   if (nnz == 0) {
     ASCEND_CALL(aclrtMemset(
@@ -410,6 +421,9 @@ CSRMatrix COOToCSRCountingSort(const COOMatrix& coo) {
   // Row-band sizing: one band must fit (band_rows histogram words + the
   // stream chunk minimum) in a block's UB, and the cursor array of the
   // scatter pass (band_rows * sizeof(IdType)) likewise.
+  CHECK(num_rows <= 0xFFFFFFFFLL)
+      << "COOToCSR: num_rows " << num_rows
+      << " exceeds uint32 addressing used by the counting-sort kernels";
   const uint32_t min_chunk_elems = 16;  // keep DMA efficiency sane
   const uint32_t hist_guard =
       ub_available - 2 * min_chunk_elems * sizeof(IdType);
