@@ -183,11 +183,14 @@ void ScatterSeedMappingFromPairs(
   ASCEND_CALL(aclrtMemcpy(
       pairs.data(), 2 * pair_count * sizeof(IdType), seed_pairs->data,
       2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
-  std::vector<IdType> mapping(num_rows);
   const int64_t mapping_len = seed_mapping->shape[0];
-  CHECK(mapping_len == num_rows)
+  // The mapping spans the graph's node count; the CSR row count is the
+  // seed count. A homo graph makes them equal, but heterographs and
+  // partial seed sets make mapping_len >= needed rows; both are valid.
+  CHECK(mapping_len >= num_rows)
       << "seed_mapping length " << mapping_len
-      << " does not cover the CSR row count " << num_rows;
+      << " is smaller than the row count " << num_rows;
+  std::vector<IdType> mapping(mapping_len);
   ASCEND_CALL(aclrtMemcpy(
       mapping.data(), mapping_len * sizeof(IdType), seed_mapping->data,
       mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
