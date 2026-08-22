@@ -377,8 +377,9 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   // the training workloads this operator serves.
   if (replace) {
     const uint32_t ub_available = QueryUbAvailableBytesFused(ctx.device_id);
-    const uint32_t window_elems = (ub_available - kMetaUbReserve) /
-                                  kWindowInstancesFused / sizeof(IdType);
+    const uint32_t window_elems =
+        (ub_available - kMetaUbReserveFused) / kWindowInstancesFused /
+        sizeof(IdType);
     CHECK(fanout <= window_elems)
         << "fused sampling fanout " << fanout
         << " exceeds the per-core window of " << window_elems
