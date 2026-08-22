@@ -214,8 +214,7 @@ void ScatterSeedMappingFromPairs(
 // rows is a device array; pull it once and scatter directly.
 template <typename IdType>
 void ScatterSeedMappingFromRows(
-    IdArray rows, IdArray seed_mapping, int64_t num_rows,
-    aclrtStream stream) {
+    IdArray rows, IdArray seed_mapping, int64_t num_rows, aclrtStream stream) {
   if (num_rows <= 0 || !seed_mapping.defined()) return;
   std::vector<IdType> rows_host(num_rows);
   ASCEND_CALL(aclrtMemcpy(
@@ -247,19 +246,17 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
     std::vector<IdType>* new_seed_nodes, int64_t num_samples, bool replace) {
 #ifdef DGL_USE_ASCEND
   auto ctx = mat.indptr->ctx;
-  CHECK(ctx.device_type == kDGLAscend)
-      << "Expected Ascend device context for "
-         "CSRRowWiseSamplingUniformFused";
+  CHECK(ctx.device_type == kDGLAscend) << "Expected Ascend device context for "
+                                          "CSRRowWiseSamplingUniformFused";
   // Defense in depth (ADR-0012): the upstream Python layer historically
   // created the mapping as int64 regardless of graph idtype, which the
   // CPU path silently misreads (4-byte offset UB). Reject it here.
   if (map_seed_nodes) {
-    CHECK(seed_mapping.defined() &&
-          seed_mapping->dtype == mat.indptr->dtype)
+    CHECK(seed_mapping.defined() && seed_mapping->dtype == mat.indptr->dtype)
         << "seed_mapping dtype must match the CSR idtype "
            "(got bits="
-        << (seed_mapping.defined() ? seed_mapping->dtype.bits : 0)
-        << ", want " << mat.indptr->dtype.bits << ")";
+        << (seed_mapping.defined() ? seed_mapping->dtype.bits : 0) << ", want "
+        << mat.indptr->dtype.bits << ")";
   }
   ASCEND_CALL(aclrtSetDevice(ctx.device_id));
 
@@ -370,8 +367,7 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
     // rows (all rows map to their positions; degenerate picks are zero
     // but the mapping is row-position based, independent of picks).
     if (map_seed_nodes) {
-      ScatterSeedMappingFromRows<IdType>(
-          rows, seed_mapping, num_rows, stream);
+      ScatterSeedMappingFromRows<IdType>(rows, seed_mapping, num_rows, stream);
       if (new_seed_nodes != nullptr) {
         new_seed_nodes->resize(num_rows);
         ASCEND_CALL(aclrtMemcpy(
@@ -381,8 +377,10 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
     }
     ASCEND_CALL(aclrtSynchronizeStream(stream));
     return std::make_pair(
-        CSRMatrix(num_rows, 0, block_csr_indptr, picked_col.CreateView({0}, picked_col->dtype),
-                  picked_idx.CreateView({0}, picked_idx->dtype)),
+        CSRMatrix(
+            num_rows, 0, block_csr_indptr,
+            picked_col.CreateView({0}, picked_col->dtype),
+            picked_idx.CreateView({0}, picked_idx->dtype)),
         picked_coo_rows.CreateView({0}, picked_coo_rows->dtype));
   }
 
@@ -405,8 +403,8 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
       aclrtMemsetAsync(seed_pairs->data, pairs_bytes, 0, pairs_bytes, stream));
 
   void* tiling_dev = nullptr;
-  ASCEND_CALL(aclrtMalloc(
-      &tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(
+      aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
   ASCEND_CALL(aclrtMemcpyAsync(
       tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
       ACL_MEMCPY_HOST_TO_DEVICE, stream));
@@ -423,8 +421,7 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
         picked_col->data, picked_idx->data, seed_pairs->data, row_split_dev,
         out_starts_dev, tiling_dev);
     CHECK(err == ACL_SUCCESS)
-        << "csr_row_wise_sampling_uniform_fused_int32 launch failed: "
-        << err;
+        << "csr_row_wise_sampling_uniform_fused_int32 launch failed: " << err;
   } else {
     aclError err = aclrtlaunch_csr_row_wise_sampling_uniform_fused_int64(
         block_dim, stream, mat.indptr->data, mat.indices->data, data_ptr,
@@ -432,8 +429,7 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
         picked_col->data, picked_idx->data, seed_pairs->data, row_split_dev,
         out_starts_dev, tiling_dev);
     CHECK(err == ACL_SUCCESS)
-        << "csr_row_wise_sampling_uniform_fused_int64 launch failed: "
-        << err;
+        << "csr_row_wise_sampling_uniform_fused_int64 launch failed: " << err;
   }
 
   ASCEND_CALL(aclrtSynchronizeStream(stream));
@@ -445,8 +441,8 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   // seed_mapping on the host, then write the mapping back. The kernel is
   // already synchronized, so a plain D2H copy is safe.
   if (map_seed_nodes) {
-    ScatterSeedMappingFromPairs<IdType>(seed_pairs, num_rows, seed_mapping,
-                                        num_rows, stream);
+    ScatterSeedMappingFromPairs<IdType>(
+        seed_pairs, num_rows, seed_mapping, num_rows, stream);
     if (new_seed_nodes != nullptr) {
       new_seed_nodes->resize(num_rows);
       ASCEND_CALL(aclrtMemcpy(
@@ -456,8 +452,7 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   }
 
   return std::make_pair(
-      CSRMatrix(num_rows, max_output, block_csr_indptr, picked_col,
-                picked_idx),
+      CSRMatrix(num_rows, max_output, block_csr_indptr, picked_col, picked_idx),
       picked_coo_rows);
 #else
   LOG(FATAL) << "Ascend support is not compiled. "

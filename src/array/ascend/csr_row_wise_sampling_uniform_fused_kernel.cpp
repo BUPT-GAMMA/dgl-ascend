@@ -174,15 +174,15 @@ class KernelCsrRowWiseSamplingUniformFused {
       uint32_t num_picks = 0;
       if (rid_valid && deg > 0) {
         num_picks = select_all_ ? deg
-                   : replace_  ? num_samples_
-                               : (deg < num_samples_ ? deg : num_samples_);
+                    : replace_  ? num_samples_
+                                : (deg < num_samples_ ? deg : num_samples_);
       }
       if (num_picks > 0) {
-        uint32_t state = seed_ ^ (i * kGoldenRatioHashFused +
-                                  kGoldenRatioOffsetFused);
+        uint32_t state =
+            seed_ ^ (i * kGoldenRatioHashFused + kGoldenRatioOffsetFused);
         if (state == 0) state = kRngFallbackSeedFused;
-        offset += SampleRow(out_start_ + offset, i, rid, off, deg,
-                            num_picks, state);
+        offset +=
+            SampleRow(out_start_ + offset, i, rid, off, deg, num_picks, state);
       }
       // Flush meta staging before overflow (one spare out_ptr slot for
       // the final prefix entry appended after the loop).
@@ -328,9 +328,8 @@ class KernelCsrRowWiseSamplingUniformFused {
       uint32_t emitted = 0;
       for (uint32_t base = 0; base < deg && emitted < num_picks;
            base += window_elems_) {
-        const uint32_t chunk = (deg - base) < window_elems_
-                                   ? (deg - base)
-                                   : window_elems_;
+        const uint32_t chunk =
+            (deg - base) < window_elems_ ? (deg - base) : window_elems_;
         const uint32_t got = EmitWindow(
             out_pos, row_pos, off, base, chunk, &picks, num_picks, true);
         emitted += got;
@@ -357,9 +356,8 @@ class KernelCsrRowWiseSamplingUniformFused {
     uint32_t emitted = 0;
     for (uint32_t base = 0; base < deg && emitted < num_picks;
          base += window_elems_) {
-      const uint32_t chunk = (deg - base) < window_elems_
-                                 ? (deg - base)
-                                 : window_elems_;
+      const uint32_t chunk =
+          (deg - base) < window_elems_ ? (deg - base) : window_elems_;
       const uint32_t got = EmitWindow(
           out_pos, row_pos, off, base, chunk, &picks, num_picks, false);
       emitted += got;
@@ -405,9 +403,8 @@ class KernelCsrRowWiseSamplingUniformFused {
         out_r.SetValue(j, static_cast<IdT>(row_pos));
         out_c.SetValue(j, win_idx.GetValue(j));
         out_e.SetValue(
-            j,
-            has_data_ ? win_data.GetValue(j)
-                      : static_cast<IdT>(off + base + j));
+            j, has_data_ ? win_data.GetValue(j)
+                         : static_cast<IdT>(off + base + j));
       }
       emitted = chunk;
     } else {
@@ -422,9 +419,8 @@ class KernelCsrRowWiseSamplingUniformFused {
           out_r.SetValue(emitted, static_cast<IdT>(row_pos));
           out_c.SetValue(emitted, win_idx.GetValue(idx - base));
           out_e.SetValue(
-              emitted,
-              has_data_ ? win_data.GetValue(idx - base)
-                        : static_cast<IdT>(off + idx));
+              emitted, has_data_ ? win_data.GetValue(idx - base)
+                                 : static_cast<IdT>(off + idx));
           ++emitted;
           pick_cursor_ = p + 1;
         } else if (replace_mode && idx < base) {
@@ -446,8 +442,8 @@ class KernelCsrRowWiseSamplingUniformFused {
 
   // Writes staged out_ptr entries to GM (contiguous run starting at the
   // block's row_begin_ + already-flushed count).
-  __aicore__ inline void FlushOutPtr(LocalTensor<IdT>& staging,
-                                     uint32_t count) {
+  __aicore__ inline void FlushOutPtr(
+      LocalTensor<IdT>& staging, uint32_t count) {
     if (count == 0) return;
     const uint32_t copy_bytes = count * sizeof(IdT);
     DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
@@ -458,13 +454,12 @@ class KernelCsrRowWiseSamplingUniformFused {
   // Writes staged interleaved (rid, pos) pairs to the compact output
   // array. The destination is the block's own row range — pairs are a
   // function of the row index, so no cross-block offset is needed.
-  __aicore__ inline void FlushSeedPairs(LocalTensor<IdT>& staging,
-                                        uint32_t count) {
+  __aicore__ inline void FlushSeedPairs(
+      LocalTensor<IdT>& staging, uint32_t count) {
     if (count == 0) return;
     const uint32_t copy_bytes = 2 * count * sizeof(IdT);
     DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
-    DataCopyPad(seed_pairs_gm_[2 * (row_begin_ + pairs_flushed_)], staging,
-                cp);
+    DataCopyPad(seed_pairs_gm_[2 * (row_begin_ + pairs_flushed_)], staging, cp);
     pairs_flushed_ += count;
   }
 
@@ -508,8 +503,7 @@ class KernelCsrRowWiseSamplingUniformFused {
   uint32_t pick_cursor_ = 0;
 };
 
-extern "C" __global__ __aicore__ void
-csr_row_wise_sampling_uniform_fused_int32(
+extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_fused_int32(
     GM_ADDR indptr, GM_ADDR indices, GM_ADDR data, GM_ADDR rows,
     GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
     GM_ADDR seed_pairs, GM_ADDR row_split, GM_ADDR out_starts,
@@ -522,8 +516,7 @@ csr_row_wise_sampling_uniform_fused_int32(
   op.Process();
 }
 
-extern "C" __global__ __aicore__ void
-csr_row_wise_sampling_uniform_fused_int64(
+extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_fused_int64(
     GM_ADDR indptr, GM_ADDR indices, GM_ADDR data, GM_ADDR rows,
     GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
     GM_ADDR seed_pairs, GM_ADDR row_split, GM_ADDR out_starts,
