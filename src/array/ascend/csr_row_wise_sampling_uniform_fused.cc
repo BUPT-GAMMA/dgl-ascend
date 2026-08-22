@@ -239,17 +239,18 @@ void ScatterSeedMappingFromPairs(
   CHECK(mapping_len >= num_rows)
       << "seed_mapping length " << mapping_len
       << " is smaller than the row count " << num_rows;
-  // Both D2H copies go on the stream back to back with one sync: two
-  // separate synchronous round-trips serialized twice the latency.
+  // Synchronous D2H copies: async D2H into pageable host memory is not
+  // reliably visible on this stack (async + sync is only the proven
+  // pattern for H2D uploads), and the pipelined variant corrupted the
+  // mapping — reverted after a real-machine regression.
   std::vector<IdType> pairs(2 * pair_count);
-  std::vector<IdType> mapping(mapping_len);
-  ASCEND_CALL(aclrtMemcpyAsync(
+  ASCEND_CALL(aclrtMemcpy(
       pairs.data(), 2 * pair_count * sizeof(IdType), seed_pairs->data,
-      2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST, stream));
-  ASCEND_CALL(aclrtMemcpyAsync(
+      2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+  std::vector<IdType> mapping(mapping_len);
+  ASCEND_CALL(aclrtMemcpy(
       mapping.data(), mapping_len * sizeof(IdType), seed_mapping->data,
-      mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST, stream));
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
+      mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
   for (int64_t p = 0; p < pair_count; ++p) {
     const IdType rid = pairs[2 * p];
     const IdType pos = pairs[2 * p + 1];
