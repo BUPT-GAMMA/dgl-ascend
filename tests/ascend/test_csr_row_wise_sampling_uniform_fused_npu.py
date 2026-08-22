@@ -102,10 +102,12 @@ def _sample_fused(g, nodes, fanout, edge_dir="in", replace=False,
     Raises the original exception when the call fails (e.g. the operator
     is not implemented yet -- the expected first-run failure of P3).
     """
+    # copy_ndata must stay True: the fused path fills the block's NID
+    # fields through the node_frames machinery, and downstream checks
+    # (renumbering semantics, multi-layer seeding) read them.
     return dgl.sampling.sample_neighbors_fused(
         g, nodes, fanout, edge_dir=edge_dir, replace=replace,
-        copy_ndata=False, copy_edata=False, exclude_edges=exclude_edges,
-        mapping=mapping)
+        exclude_edges=exclude_edges, mapping=mapping)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +210,12 @@ def test_fused_replace_structural():
 
 
 def test_fused_statistical():
-    """Over many seeds, each predecessor is picked with ~equal frequency."""
+    """Over many seeds, each predecessor is picked with ~equal frequency.
+
+    The fused block renumbers its sources, so count ORIGINAL ids via
+    srcdata NID (in the renumbered frame the sampled source is always
+    new-id 1 for fanout=1, both on CPU and NPU).
+    """
     device, cpu = _setup()
     if device is None:
         return
@@ -220,8 +227,8 @@ def test_fused_statistical():
     counts = Counter()
     for _ in range(trials):
         sg = _sample_fused(g, nodes, fanout, replace=False)
-        u, v = _uv(sg)
-        counts[u.item()] += 1
+        nid = sg.srcdata[dgl.NID]
+        counts[nid.cpu().item()] += 1
     assert sum(counts.values()) == trials, counts
     for pred in (0, 1, 2):
         assert 120 < counts[pred] < 280, f"pred {pred}: {counts}"
