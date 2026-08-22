@@ -1,310 +1,535 @@
+/**
+ * Copyright (c) 2024 by Contributors
+ * @file coo2csr.cc
+ * @brief Ascend NPU implementation of COO -> CSR conversion.
+ *
+ * Counting sort on the NPU (ADR-0006): two kernel launches per row band
+ * with a host-side exclusive scan in between (ADR-0005) —
+ *
+ *   count kernel:   per-block row histograms + min/max reductions
+ *   host:           exclusive scan of counts -> indptr
+ *   scatter kernel: stable scatter of col/data in global edge order
+ *
+ * A preprocess cache (ADR-0004) keyed on the input tensors' identity
+ * returns the previously computed CSR for repeated conversions of the
+ * same graph — the common case in training loops. Cache entries hold
+ * references to the input arrays, so a freed tensor's address can never
+ * be mistaken for a new tensor's (allocator address reuse is safe), and
+ * an LRU byte budget bounds memory held by dead graphs.
+ */
+
 #include <dgl/array.h>
-#include "../array_op.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <map>
+#include <cstdlib>
+#include <mutex>
 #include <numeric>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
+
+#include "../array_op.h"
 
 #ifdef DGL_USE_ASCEND
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
-#define ASCEND_CALL(func)                                                \
-  {                                                                      \
-    aclError e = (func);                                                 \
-    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;              \
-  }
-#ifndef ACLRT_LAUNCH_KERNEL
-#define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
-#endif
 
-struct CooToCsrIndptrTiling {
-  uint32_t nnz;
-  uint32_t num_rows;
-  uint32_t block_idx;
-  uint32_t block_num;
+#include "coo2csr_tiling.h"
+
+#define ASCEND_CALL(func)                                   \
+  {                                                         \
+    aclError e = (func);                                    \
+    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e; \
+  }
+
+namespace dgl {
+namespace runtime {
+aclrtStream getCurrentAscendStream();
+}  // namespace runtime
+}  // namespace dgl
+
+extern "C" uint32_t aclrtlaunch_coo_to_csr_count_int32(
+    uint32_t blockDim, aclrtStream stream, void* rows, void* counts,
+    void* reduces, void* row_split, void* tiling);
+
+extern "C" uint32_t aclrtlaunch_coo_to_csr_count_int64(
+    uint32_t blockDim, aclrtStream stream, void* rows, void* counts,
+    void* reduces, void* row_split, void* tiling);
+
+extern "C" uint32_t aclrtlaunch_coo_to_csr_scatter_int32(
+    uint32_t blockDim, aclrtStream stream, void* rows, void* cols, void* data,
+    void* indptr, void* out_indices, void* out_data, void* row_split,
+    void* tiling);
+
+extern "C" uint32_t aclrtlaunch_coo_to_csr_scatter_int64(
+    uint32_t blockDim, aclrtStream stream, void* rows, void* cols, void* data,
+    void* indptr, void* out_indices, void* out_data, void* row_split,
+    void* tiling);
+
+namespace dgl {
+namespace aten {
+namespace impl {
+namespace {
+
+// ---------------------------------------------------------------------------
+// Preprocess cache (ADR-0004).
+// ---------------------------------------------------------------------------
+
+struct CooToCsrCacheKey {
+  int device_id;
+  const void* row_ptr;
+  const void* col_ptr;
+  const void* data_ptr;
+  int64_t num_rows;
+  int64_t num_cols;
+  int64_t nnz;
+  uint8_t id_bits;
+  bool has_data;
+  bool row_sorted;
+  bool col_sorted;
+
+  bool operator==(const CooToCsrCacheKey& other) const {
+    return device_id == other.device_id && row_ptr == other.row_ptr &&
+           col_ptr == other.col_ptr && data_ptr == other.data_ptr &&
+           num_rows == other.num_rows && num_cols == other.num_cols &&
+           nnz == other.nnz && id_bits == other.id_bits &&
+           has_data == other.has_data && row_sorted == other.row_sorted &&
+           col_sorted == other.col_sorted;
+  }
 };
 
-extern "C" uint32_t aclrtlaunch_coo_to_csr_indptr(
-    uint32_t blockDim, aclrtStream stream,
-    void* rows, void* indptr, void* tiling);
+struct CooToCsrCacheKeyHash {
+  size_t operator()(const CooToCsrCacheKey& k) const {
+    size_t h = std::hash<int>{}(k.device_id);
+    auto combine = [&h](size_t v) {
+      h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    };
+    combine(std::hash<const void*>{}(k.row_ptr));
+    combine(std::hash<const void*>{}(k.col_ptr));
+    combine(std::hash<const void*>{}(k.data_ptr));
+    combine(std::hash<int64_t>{}(k.num_rows));
+    combine(std::hash<int64_t>{}(k.num_cols));
+    combine(std::hash<int64_t>{}(k.nnz));
+    combine(std::hash<uint8_t>{}(k.id_bits));
+    combine(k.has_data ? 1 : 0);
+    combine(k.row_sorted ? 2 : 0);
+    combine(k.col_sorted ? 4 : 0);
+    return h;
+  }
+};
 
-extern "C" uint32_t aclrtlaunch_coo_to_csr_indptr_int64(
-    uint32_t blockDim, aclrtStream stream,
-    void* rows, void* indptr, void* tiling);
+struct CooToCsrCacheValue {
+  CSRMatrix csr;           // holds indptr/indices/data output arrays
+  NDArray row, col, data;  // input retention: pins the key's identity
+  uint64_t last_used = 0;
+  uint64_t bytes = 0;
+};
 
-extern "C" uint32_t aclrtlaunch_coo_gather_int32(
-    uint32_t blockDim, aclrtStream stream,
-    void* src, void* idx, void* dst, void* tiling);
+// LRU byte budget for entries whose inputs are otherwise dead. The
+// budget is deliberately modest relative to HBM (2GB on 64GB parts).
+constexpr uint64_t kCacheBudgetBytes = 2ULL << 30;
 
-extern "C" uint32_t aclrtlaunch_coo_gather_int64(
-    uint32_t blockDim, aclrtStream stream,
-    void* src, void* idx, void* dst, void* tiling);
+uint64_t NextCacheClock() {
+  static std::atomic<uint64_t> clock{1};
+  return clock.fetch_add(1, std::memory_order_relaxed);
+}
 
-extern "C" uint32_t aclrtlaunch_coo_gather_float(
-    uint32_t blockDim, aclrtStream stream,
-    void* src, void* idx, void* dst, void* tiling);
+std::unordered_map<
+    CooToCsrCacheKey, std::shared_ptr<CooToCsrCacheValue>, CooToCsrCacheKeyHash>
+    g_coo2csr_cache;
+std::mutex g_coo2csr_cache_mutex;
 
-#endif
+uint64_t EstimateEntryBytes(const COOMatrix& coo, const CSRMatrix& csr) {
+  const auto arr_bytes = [](const NDArray& a) {
+    return a.defined() ? static_cast<uint64_t>(a.GetSize()) : 0;
+  };
+  // Inputs shared with a live graph are ~free; charging the full size
+  // keeps the budget conservative for orphaned entries.
+  return arr_bytes(coo.row) + arr_bytes(coo.col) + arr_bytes(coo.data) +
+         arr_bytes(csr.indptr) + arr_bytes(csr.indices) + arr_bytes(csr.data);
+}
+
+// Evicts LRU entries until the budget is met. Called with the mutex held.
+void EvictCacheLocked(uint64_t budget) {
+  uint64_t total = std::accumulate(
+      g_coo2csr_cache.begin(), g_coo2csr_cache.end(), uint64_t{0},
+      [](uint64_t sum, const auto& kv) { return sum + kv.second->bytes; });
+  while (total > budget && !g_coo2csr_cache.empty()) {
+    const auto victim = std::min_element(
+        g_coo2csr_cache.begin(), g_coo2csr_cache.end(),
+        [](const auto& a, const auto& b) {
+          return a.second->last_used < b.second->last_used;
+        });
+    total -= victim->second->bytes;
+    LOG(INFO) << "[Ascend][COOToCSR][Cache] evicting entry ("
+              << victim->second->bytes << " bytes, LRU)";
+    g_coo2csr_cache.erase(victim);
+  }
+}
+
+bool CacheDisabled() {
+  static const bool disabled = []() {
+    const char* env = std::getenv("DGL_COO2CSR_CACHE_DISABLE");
+    return env != nullptr && env[0] == '1';
+  }();
+  return disabled;
+}
+
+// ---------------------------------------------------------------------------
+// Counting-sort conversion (no cache).
+// ---------------------------------------------------------------------------
+
+uint32_t QueryVectorCoreCount(int device_id) {
+  int64_t core_num = 0;
+  aclError err =
+      aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &core_num);
+  if (err != ACL_SUCCESS || core_num <= 0 || core_num > 4096) {
+    return kDefaultVectorCoreCount;
+  }
+  return static_cast<uint32_t>(core_num);
+}
+
+uint32_t QueryUbAvailableBytes(int device_id) {
+  int64_t ub_bytes = 0;
+  aclError err = aclrtGetDeviceInfo(
+      device_id, ACL_DEV_ATTR_UBUF_PER_VECTOR_CORE, &ub_bytes);
+  if (err != ACL_SUCCESS ||
+      ub_bytes <= static_cast<int64_t>(kUbReservedBytes) ||
+      ub_bytes > (1 << 30)) {
+    return kDefaultUbBytes - kUbReservedBytes;
+  }
+  return static_cast<uint32_t>(ub_bytes - kUbReservedBytes);
+}
+
+// Device workspaces shared across bands of one conversion.
+struct BandWorkspaces {
+  uint32_t* counts_dev = nullptr;
+  uint32_t* reduces_dev = nullptr;
+  uint32_t* row_split_dev = nullptr;
+  CooToCsrTiling* tiling_dev = nullptr;
+
+  void Allocate(int64_t num_rows, uint32_t block_dim) {
+    ASCEND_CALL(aclrtMalloc(
+        reinterpret_cast<void**>(&counts_dev), num_rows * sizeof(uint32_t),
+        ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMalloc(
+        reinterpret_cast<void**>(&reduces_dev),
+        block_dim * kReduceWordsPerBlock * sizeof(uint32_t),
+        ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMalloc(
+        reinterpret_cast<void**>(&row_split_dev),
+        (block_dim + 1) * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMalloc(
+        reinterpret_cast<void**>(&tiling_dev), sizeof(CooToCsrTiling),
+        ACL_MEM_MALLOC_HUGE_FIRST));
+  }
+  void Free() {
+    if (counts_dev) ASCEND_CALL(aclrtFree(counts_dev));
+    if (reduces_dev) ASCEND_CALL(aclrtFree(reduces_dev));
+    if (row_split_dev) ASCEND_CALL(aclrtFree(row_split_dev));
+    if (tiling_dev) ASCEND_CALL(aclrtFree(tiling_dev));
+  }
+};
+
+// Even row-range split of one band across active blocks. row_split has
+// active_blocks+1 entries; histogram weights are unknown before counting,
+// so the split is by row count.
+std::vector<uint32_t> BuildBandRowSplit(
+    int64_t band_begin, int64_t band_end, uint32_t active_blocks) {
+  const int64_t band_rows = band_end - band_begin;
+  std::vector<uint32_t> split(active_blocks + 1, 0);
+  for (uint32_t b = 0; b <= active_blocks; ++b) {
+    const int64_t pos =
+        band_begin + (band_rows * b + active_blocks - 1) / active_blocks;
+    split[b] = static_cast<uint32_t>(std::min<int64_t>(pos, band_end));
+  }
+  return split;
+}
+
+template <typename IdType>
+void LaunchCountKernel(
+    uint32_t block_dim, aclrtStream stream, const void* rows,
+    uint32_t* counts_dev, uint32_t* reduces_dev, uint32_t* row_split_dev,
+    CooToCsrTiling* tiling_dev) {
+  uint32_t rc = 0;
+  if (std::is_same<IdType, int32_t>::value) {
+    rc = aclrtlaunch_coo_to_csr_count_int32(
+        block_dim, stream, const_cast<void*>(rows), counts_dev, reduces_dev,
+        row_split_dev, tiling_dev);
+  } else {
+    rc = aclrtlaunch_coo_to_csr_count_int64(
+        block_dim, stream, const_cast<void*>(rows), counts_dev, reduces_dev,
+        row_split_dev, tiling_dev);
+  }
+  CHECK(rc == ACL_SUCCESS) << "coo_to_csr_count launch failed: " << rc;
+}
+
+template <typename IdType>
+void LaunchScatterKernel(
+    uint32_t block_dim, aclrtStream stream, const void* rows, const void* cols,
+    const void* data, void* indptr, void* out_indices, void* out_data,
+    uint32_t* row_split_dev, CooToCsrTiling* tiling_dev) {
+  uint32_t rc = 0;
+  if (std::is_same<IdType, int32_t>::value) {
+    rc = aclrtlaunch_coo_to_csr_scatter_int32(
+        block_dim, stream, const_cast<void*>(rows), const_cast<void*>(cols),
+        const_cast<void*>(data), indptr, out_indices, out_data, row_split_dev,
+        tiling_dev);
+  } else {
+    rc = aclrtlaunch_coo_to_csr_scatter_int64(
+        block_dim, stream, const_cast<void*>(rows), const_cast<void*>(cols),
+        const_cast<void*>(data), indptr, out_indices, out_data, row_split_dev,
+        tiling_dev);
+  }
+  CHECK(rc == ACL_SUCCESS) << "coo_to_csr_scatter launch failed: " << rc;
+}
+
+// Runs the count kernel for every band and accumulates the exclusive
+// scan into indptr_vec (which receives num_rows+1 entries total).
+// Verifies the per-block min/max tripwires per band; the authoritative
+// out-of-range check (total == nnz) is the caller's.
+template <typename IdType>
+void CountAllBands(
+    const COOMatrix& coo, BandWorkspaces& ws, uint32_t block_dim,
+    aclrtStream stream, uint32_t rows_per_band, uint64_t num_bands,
+    int64_t num_rows, std::vector<IdType>* indptr_vec) {
+  for (uint64_t band = 0; band < num_bands; ++band) {
+    const int64_t band_begin = band * rows_per_band;
+    const int64_t band_end =
+        std::min<int64_t>(band_begin + rows_per_band, num_rows);
+    const uint32_t band_rows = static_cast<uint32_t>(band_end - band_begin);
+    const uint32_t active_blocks = std::min<uint32_t>(block_dim, band_rows);
+    // Upload the FULL table (block_dim+1 entries): idle blocks beyond
+    // active_blocks read their own pair to see an empty range and exit.
+    std::vector<uint32_t> row_split_host =
+        BuildBandRowSplit(band_begin, band_end, active_blocks);
+    row_split_host.resize(block_dim + 1, row_split_host.back());
+    ASCEND_CALL(aclrtMemcpy(
+        ws.row_split_dev, (block_dim + 1) * sizeof(uint32_t),
+        row_split_host.data(), (block_dim + 1) * sizeof(uint32_t),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    LaunchCountKernel<IdType>(
+        block_dim, stream, coo.row->data, ws.counts_dev, ws.reduces_dev,
+        ws.row_split_dev, ws.tiling_dev);
+    ASCEND_CALL(aclrtSynchronizeStream(stream));
+
+    std::vector<uint32_t> counts_host(band_rows);
+    ASCEND_CALL(aclrtMemcpy(
+        counts_host.data(), band_rows * sizeof(uint32_t),
+        ws.counts_dev + band_begin, band_rows * sizeof(uint32_t),
+        ACL_MEMCPY_DEVICE_TO_HOST));
+    std::vector<uint32_t> reduces_host(
+        static_cast<size_t>(block_dim) * kReduceWordsPerBlock);
+    ASCEND_CALL(aclrtMemcpy(
+        reduces_host.data(),
+        static_cast<size_t>(block_dim) * kReduceWordsPerBlock *
+            sizeof(uint32_t),
+        ws.reduces_dev,
+        static_cast<size_t>(block_dim) * kReduceWordsPerBlock *
+            sizeof(uint32_t),
+        ACL_MEMCPY_DEVICE_TO_HOST));
+
+    // A block whose observed [min, max] escapes its assigned range means
+    // the kernel's filter logic broke.
+    for (uint32_t b = 0; b < active_blocks; ++b) {
+      const uint32_t lo = reduces_host[b * kReduceWordsPerBlock + 0];
+      const uint32_t hi = reduces_host[b * kReduceWordsPerBlock + 1];
+      if (lo == kReduceEmpty) continue;
+      CHECK(lo >= row_split_host[b] && hi < row_split_host[b + 1])
+          << "COOToCSR: count kernel range invariant violated";
+    }
+
+    if (band == 0) indptr_vec->push_back(0);
+    for (uint32_t r = 0; r < band_rows; ++r) {
+      indptr_vec->push_back(indptr_vec->back() + counts_host[r]);
+    }
+  }
+}
+
+template <typename IdType>
+CSRMatrix COOToCSRCountingSort(const COOMatrix& coo) {
+  const DGLContext ctx = coo.row->ctx;
+  const int64_t nnz = coo.row->shape[0];
+  const int64_t num_rows = coo.num_rows;
+  CHECK_NO_OVERFLOW(coo.row->dtype, nnz);
+
+  const uint32_t block_dim = QueryVectorCoreCount(ctx.device_id);
+  const uint32_t ub_available = QueryUbAvailableBytes(ctx.device_id);
+  aclrtStream stream = dgl::runtime::getCurrentAscendStream();
+  ASCEND_CALL(aclrtSetDevice(ctx.device_id));
+
+  NDArray indptr = NDArray::Empty({num_rows + 1}, coo.row->dtype, ctx);
+  NDArray indices = NDArray::Empty({nnz}, coo.col->dtype, ctx);
+  // The CSR data array: explicit input data when present, else the
+  // original edge position (i), which the scatter kernel writes inline.
+  const bool has_data = aten::COOHasData(coo);
+  NDArray data;
+  if (has_data) {
+    data = coo.data;
+  } else {
+    data = NDArray::Empty({nnz}, coo.row->dtype, ctx);
+  }
+
+  if (nnz == 0) {
+    ASCEND_CALL(aclrtMemset(
+        indptr->data, (num_rows + 1) * sizeof(IdType), 0,
+        (num_rows + 1) * sizeof(IdType)));
+    return CSRMatrix(
+        num_rows, coo.num_cols, indptr, indices, data, coo.col_sorted);
+  }
+
+  // Row-band sizing: one band must fit (band_rows histogram words + the
+  // stream chunk minimum) in a block's UB, and the cursor array of the
+  // scatter pass (band_rows * sizeof(IdType)) likewise.
+  const uint32_t min_chunk_elems = 16;  // keep DMA efficiency sane
+  const uint32_t hist_guard =
+      ub_available - 2 * min_chunk_elems * sizeof(IdType);
+  const uint32_t max_rows_per_band =
+      std::max<uint32_t>(hist_guard / sizeof(uint32_t), 1);
+  const uint32_t rows_per_band =
+      std::min<uint32_t>(static_cast<uint32_t>(num_rows), max_rows_per_band);
+  const uint64_t num_bands =
+      (static_cast<uint64_t>(num_rows) + rows_per_band - 1) / rows_per_band;
+
+  BandWorkspaces ws;
+  ws.Allocate(num_rows, block_dim);
+
+  CooToCsrTiling tiling_host;
+  tiling_host.nnz = nnz;
+  tiling_host.num_rows = static_cast<uint32_t>(num_rows);
+  tiling_host.ub_available = ub_available;
+  tiling_host.has_data = has_data ? 1 : 0;
+  ASCEND_CALL(aclrtMemcpy(
+      ws.tiling_dev, sizeof(CooToCsrTiling), &tiling_host,
+      sizeof(CooToCsrTiling), ACL_MEMCPY_HOST_TO_DEVICE));
+
+  std::vector<IdType> indptr_vec;
+  indptr_vec.reserve(static_cast<size_t>(num_rows) + 1);
+
+  CountAllBands<IdType>(
+      coo, ws, block_dim, stream, rows_per_band, num_bands, num_rows,
+      &indptr_vec);
+
+  // All bands counted: total must be exactly nnz (defense against
+  // out-of-range or negative row ids, which no block would have counted).
+  CHECK(static_cast<int64_t>(indptr_vec.back()) == nnz)
+      << "COOToCSR: row ids outside [0, num_rows) detected " << "(counted "
+      << indptr_vec.back() << " of " << nnz << " edges)";
+
+  ASCEND_CALL(aclrtMemcpy(
+      indptr->data, (num_rows + 1) * sizeof(IdType), indptr_vec.data(),
+      (num_rows + 1) * sizeof(IdType), ACL_MEMCPY_HOST_TO_DEVICE));
+
+  for (uint64_t band = 0; band < num_bands; ++band) {
+    const int64_t band_begin = band * rows_per_band;
+    const int64_t band_end =
+        std::min<int64_t>(band_begin + rows_per_band, num_rows);
+    const uint32_t band_rows = static_cast<uint32_t>(band_end - band_begin);
+    const uint32_t active_blocks = std::min<uint32_t>(block_dim, band_rows);
+    // Full-table upload for idle-block early exit (see count pass).
+    std::vector<uint32_t> row_split_host =
+        BuildBandRowSplit(band_begin, band_end, active_blocks);
+    row_split_host.resize(block_dim + 1, row_split_host.back());
+    ASCEND_CALL(aclrtMemcpy(
+        ws.row_split_dev, (block_dim + 1) * sizeof(uint32_t),
+        row_split_host.data(), (block_dim + 1) * sizeof(uint32_t),
+        ACL_MEMCPY_HOST_TO_DEVICE));
+
+    LaunchScatterKernel<IdType>(
+        block_dim, stream, coo.row->data, coo.col->data,
+        has_data ? coo.data->data : nullptr, indptr->data, indices->data,
+        data->data, ws.row_split_dev, ws.tiling_dev);
+    ASCEND_CALL(aclrtSynchronizeStream(stream));
+  }
+
+  ws.Free();
+
+  // col_sorted propagates from the input only when rows were already
+  // sorted (no reordering happened relative to CPU semantics); the
+  // counting sort itself never sorts within a row.
+  const bool col_sorted = coo.row_sorted ? coo.col_sorted : false;
+  return CSRMatrix(num_rows, coo.num_cols, indptr, indices, data, col_sorted);
+}
+
+}  // anonymous namespace
+
+template <DGLDeviceType XPU, typename IdType>
+CSRMatrix COOToCSR(COOMatrix coo) {
+  CHECK(coo.row->ctx.device_type == kDGLAscend)
+      << "Expected Ascend device context";
+  ASCEND_CALL(aclrtSetDevice(coo.row->ctx.device_id));
+
+  if (!CacheDisabled()) {
+    CooToCsrCacheKey key{coo.row->ctx.device_id,
+                         coo.row->data,
+                         coo.col->data,
+                         aten::COOHasData(coo) ? coo.data->data : nullptr,
+                         coo.num_rows,
+                         coo.num_cols,
+                         coo.row->shape[0],
+                         coo.row->dtype.bits,
+                         aten::COOHasData(coo),
+                         coo.row_sorted,
+                         coo.col_sorted};
+    {
+      std::lock_guard<std::mutex> lock(g_coo2csr_cache_mutex);
+      auto it = g_coo2csr_cache.find(key);
+      if (it != g_coo2csr_cache.end()) {
+        it->second->last_used = NextCacheClock();
+        return it->second->csr;
+      }
+    }
+
+    CSRMatrix csr = COOToCSRCountingSort<IdType>(coo);
+
+    auto value = std::make_shared<CooToCsrCacheValue>();
+    value->csr = csr;
+    value->row = coo.row;
+    value->col = coo.col;
+    if (aten::COOHasData(coo)) value->data = coo.data;
+    value->last_used = NextCacheClock();
+    value->bytes = EstimateEntryBytes(coo, csr);
+    if (value->bytes <= kCacheBudgetBytes) {
+      std::lock_guard<std::mutex> lock(g_coo2csr_cache_mutex);
+      auto [it, inserted] = g_coo2csr_cache.emplace(key, value);
+      if (inserted) {
+        EvictCacheLocked(kCacheBudgetBytes);
+      } else {
+        it->second->last_used = value->last_used;  // concurrent duplicate
+      }
+    }
+    return csr;
+  }
+  return COOToCSRCountingSort<IdType>(coo);
+}
+
+template CSRMatrix COOToCSR<kDGLAscend, int32_t>(COOMatrix coo);
+template CSRMatrix COOToCSR<kDGLAscend, int64_t>(COOMatrix coo);
+
+}  // namespace impl
+}  // namespace aten
+}  // namespace dgl
+
+#else  // !DGL_USE_ASCEND
 
 namespace dgl {
 namespace aten {
 namespace impl {
 
-namespace {
-
-template <typename IdType>
-struct IndptrKernelLauncher;
-
-template <>
-struct IndptrKernelLauncher<int32_t> {
-  static void Launch(uint32_t blockDim, aclrtStream stream,
-                     void* rows, void* indptr, void* tiling) {
-    aclError err = aclrtlaunch_coo_to_csr_indptr(
-        blockDim, stream, rows, indptr, tiling);
-    CHECK(err == ACL_SUCCESS) << "coo_to_csr_indptr launch failed: " << err;
-  }
-};
-
-template <>
-struct IndptrKernelLauncher<int64_t> {
-  static void Launch(uint32_t blockDim, aclrtStream stream,
-                     void* rows, void* indptr, void* tiling) {
-    aclError err = aclrtlaunch_coo_to_csr_indptr_int64(
-        blockDim, stream, rows, indptr, tiling);
-    CHECK(err == ACL_SUCCESS) << "coo_to_csr_indptr_int64 launch failed: " << err;
-  }
-};
-
-template <typename IdType>
-CSRMatrix COOToCSRWithKernel(COOMatrix coo) {
-  auto ctx = coo.row->ctx;
-  CHECK(ctx.device_type == kDGLAscend) << "Expected Ascend device context";
-  ASCEND_CALL(aclrtSetDevice(ctx.device_id));
-  ASCEND_CALL(aclrtSynchronizeDevice());
-
-  const int64_t nnz = coo.row->shape[0];
-  CHECK_NO_OVERFLOW(coo.row->dtype, nnz);
-
-  if (nnz == 0) {
-    NDArray indptr = NDArray::Empty({coo.num_rows + 1}, coo.row->dtype, ctx);
-    ASCEND_CALL(aclrtMemset(indptr->data, (coo.num_rows + 1) * sizeof(IdType),
-                             0, (coo.num_rows + 1) * sizeof(IdType)));
-    NDArray indices = NDArray::Empty({0}, coo.row->dtype, ctx);
-    NDArray data;
-    if (COOHasData(coo)) {
-      data = coo.data;
-    } else {
-      data = NDArray::Empty({0}, coo.row->dtype, ctx);
-    }
-    return CSRMatrix(
-        coo.num_rows, coo.num_cols, indptr, indices, data, coo.col_sorted);
-  }
-
-  bool col_sorted = coo.col_sorted;
-
-  // Helper to launch gather on NPU: dst[i] = src[perm[i]]
-  auto launch_gather = [&](aclrtStream stream, NDArray dst,
-                           NDArray src, NDArray perm_npu) {
-    if (dst->shape[0] == 0) return;
-    uint32_t gather_n = static_cast<uint32_t>(dst->shape[0]);
-    void* gather_tiling_dev;
-    ASCEND_CALL(aclrtMalloc(
-        &gather_tiling_dev, sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
-    ASCEND_CALL(aclrtMemcpyAsync(
-        gather_tiling_dev, sizeof(uint32_t),
-        &gather_n, sizeof(uint32_t),
-        ACL_MEMCPY_HOST_TO_DEVICE, stream));
-    if (src->dtype.code == kDGLFloat && src->dtype.bits == 32) {
-      aclrtlaunch_coo_gather_float(1, stream,
-          src->data, perm_npu->data, dst->data, gather_tiling_dev);
-    } else if (src->dtype.bits == 32) {
-      aclrtlaunch_coo_gather_int32(1, stream,
-          src->data, perm_npu->data, dst->data, gather_tiling_dev);
-    } else {
-      aclrtlaunch_coo_gather_int64(1, stream,
-          src->data, perm_npu->data, dst->data, gather_tiling_dev);
-    }
-    ASCEND_CALL(aclrtSynchronizeStream(stream));
-    ASCEND_CALL(aclrtFree(gather_tiling_dev));
-  };
-
-  if (!coo.row_sorted) {
-    auto cpu_ctx = DGLContext{kDGLCPU, 0};
-
-    // Only copy rows to CPU; cols and data stay on NPU
-    IdArray cpu_row = coo.row.CopyTo(cpu_ctx);
-    IdType* rows = cpu_row.Ptr<IdType>();
-
-    std::vector<int64_t> perm(nnz);
-    std::iota(perm.begin(), perm.end(), 0);
-    std::stable_sort(perm.begin(), perm.end(),
-                     [rows](int64_t a, int64_t b) { return rows[a] < rows[b]; });
-
-    // Build sorted rows on CPU
-    std::vector<IdType> sorted_rows(nnz);
-    for (int64_t i = 0; i < nnz; i++) {
-      sorted_rows[i] = rows[perm[i]];
-    }
-
-    // Copy sorted_rows and perm to NPU
-    NDArray npu_sorted_rows = NDArray::Empty({nnz}, coo.row->dtype, ctx);
-    NDArray perm_npu = aten::NewIdArray(nnz, ctx, 64);
-    ASCEND_CALL(aclrtMemcpy(npu_sorted_rows->data, nnz * sizeof(IdType),
-                            sorted_rows.data(), nnz * sizeof(IdType),
-                            ACL_MEMCPY_HOST_TO_DEVICE));
-    ASCEND_CALL(aclrtMemcpy(perm_npu->data, nnz * sizeof(int64_t),
-                            perm.data(), nnz * sizeof(int64_t),
-                            ACL_MEMCPY_HOST_TO_DEVICE));
-
-    // Gather cols and data on NPU
-    NDArray npu_sorted_cols = NDArray::Empty({nnz}, coo.col->dtype, ctx);
-    NDArray npu_sorted_data;
-    {
-      aclrtStream gather_stream;
-      ASCEND_CALL(aclrtCreateStream(&gather_stream));
-      launch_gather(gather_stream, npu_sorted_cols, coo.col, perm_npu);
-
-      if (COOHasData(coo)) {
-        npu_sorted_data = NDArray::Empty({nnz}, coo.data->dtype, ctx);
-        launch_gather(gather_stream, npu_sorted_data, coo.data, perm_npu);
-      } else {
-        // No explicit edge IDs: synthesize [0, nnz) and gather by perm so the
-        // data array aligns with the reordered rows/cols (matches CPU's
-        // Bx[index] = i semantics, where i is the original COO position).
-        // Without this gather, data would be identity [0..nnz) while rows/cols
-        // are reordered, corrupting the position-to-eid mapping (breaks CSC
-        // data and thus weighted in-edge sampling).
-        IdArray cpu_data = aten::Range(0, nnz, coo.row->dtype.bits, cpu_ctx);
-        NDArray npu_range_data = cpu_data.CopyTo(ctx);
-        npu_sorted_data = NDArray::Empty({nnz}, coo.row->dtype, ctx);
-        launch_gather(gather_stream, npu_sorted_data, npu_range_data, perm_npu);
-      }
-      ASCEND_CALL(aclrtDestroyStream(gather_stream));
-    }
-
-    coo.row = npu_sorted_rows;
-    coo.col = npu_sorted_cols;
-    coo.data = npu_sorted_data;
-    col_sorted = false;
-  } else {
-    if (!COOHasData(coo)) {
-      auto cpu_ctx = DGLContext{kDGLCPU, 0};
-      IdArray cpu_data = aten::Range(0, nnz, coo.row->dtype.bits, cpu_ctx);
-      coo.data = cpu_data.CopyTo(ctx);
-    }
-  }
-
-  // -----------------------------------------------------------------------
-  //  Multi-stream parallel: each stream processes a row slice and writes
-  //  to its own private indptr buffer (full size). No GM coherence issue
-  //  since each kernel only writes to its own buffer. After sync, merge
-  //  by copying each block's row range into the final indptr.
-  // -----------------------------------------------------------------------
-  NDArray indptr = NDArray::Empty({coo.num_rows + 1}, coo.row->dtype, ctx);
-
-  int64_t indptr_bytes = (coo.num_rows + 1) * sizeof(IdType);
-  ASCEND_CALL(aclrtMemset(indptr->data, indptr_bytes, 0, indptr_bytes));
-
-  // Max 8 streams = up to 8x parallel binary search, avoids excessive memory
-  static constexpr uint32_t kMaxStreams = 8;
-  uint32_t numStreams = std::max(
-      std::min(static_cast<uint32_t>(coo.num_rows), kMaxStreams),
-      static_cast<uint32_t>(1));
-
-  // Cache streams per device to avoid create/destroy overhead
-  static std::map<int, std::vector<aclrtStream>> streamCache;
-  auto& streams = streamCache[ctx.device_id];
-  if (streams.size() < numStreams) {
-    for (uint32_t i = streams.size(); i < numStreams; i++) {
-      aclrtStream s;
-      ASCEND_CALL(aclrtCreateStream(&s));
-      streams.push_back(s);
-    }
-  }
-
-  // Each stream gets a private indptr buffer → no GM coherence issue
-  std::vector<void*> perBlockIndptr(numStreams, nullptr);
-  for (uint32_t i = 0; i < numStreams; i++) {
-    ASCEND_CALL(aclrtMalloc(&perBlockIndptr[i], indptr_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-    ASCEND_CALL(aclrtMemset(perBlockIndptr[i], indptr_bytes, 0, indptr_bytes));
-  }
-  ASCEND_CALL(aclrtSynchronizeDevice());
-
-  void* row_ptr = coo.row.Ptr<IdType>();
-
-  for (uint32_t i = 0; i < numStreams; i++) {
-    CooToCsrIndptrTiling tilingHost;
-    tilingHost.nnz = static_cast<uint32_t>(nnz);
-    tilingHost.num_rows = static_cast<uint32_t>(coo.num_rows);
-    tilingHost.block_idx = i;
-    tilingHost.block_num = numStreams;
-
-    CooToCsrIndptrTiling* tilingDev = nullptr;
-    ASCEND_CALL(aclrtMalloc(
-        reinterpret_cast<void**>(&tilingDev),
-        sizeof(CooToCsrIndptrTiling),
-        ACL_MEM_MALLOC_HUGE_FIRST));
-    ASCEND_CALL(aclrtMemcpyAsync(
-        tilingDev, sizeof(CooToCsrIndptrTiling),
-        &tilingHost, sizeof(CooToCsrIndptrTiling),
-        ACL_MEMCPY_HOST_TO_DEVICE, streams[i]));
-
-    IndptrKernelLauncher<IdType>::Launch(
-        1, streams[i], row_ptr, perBlockIndptr[i], tilingDev);
-
-    ASCEND_CALL(aclrtSynchronizeStream(streams[i]));
-    ASCEND_CALL(aclrtFree(tilingDev));
-  }
-
-  // Full device sync ensures private buffer writes are visible to D2D memcpy
-  ASCEND_CALL(aclrtSynchronizeDevice());
-
-  // Merge: copy each block's row slice from private buffer to final indptr
-  for (uint32_t i = 0; i < numStreams; i++) {
-    uint32_t rowsPerBlock = (static_cast<uint32_t>(coo.num_rows) + numStreams - 1) / numStreams;
-    uint32_t rowStart = i * rowsPerBlock;
-    uint32_t rowEnd = std::min(rowStart + rowsPerBlock, static_cast<uint32_t>(coo.num_rows));
-    if (rowEnd > rowStart) {
-      int64_t copy_offset = (rowStart + 1) * sizeof(IdType);
-      int64_t copy_bytes = (rowEnd - rowStart) * sizeof(IdType);
-      ASCEND_CALL(aclrtMemcpy(
-          static_cast<char*>(indptr->data) + copy_offset, copy_bytes,
-          static_cast<char*>(perBlockIndptr[i]) + copy_offset, copy_bytes,
-          ACL_MEMCPY_DEVICE_TO_DEVICE));
-    }
-    ASCEND_CALL(aclrtFree(perBlockIndptr[i]));
-  }
-
-  ASCEND_CALL(aclrtSynchronizeDevice());
-
-  return CSRMatrix(
-      coo.num_rows, coo.num_cols, indptr, coo.col, coo.data, col_sorted);
-}
-
-}  // anonymous namespace
-
-template <>
-CSRMatrix COOToCSR<kDGLAscend, int32_t>(COOMatrix coo) {
-#ifdef DGL_USE_ASCEND
-  return COOToCSRWithKernel<int32_t>(coo);
-#else
+template <DGLDeviceType XPU, typename IdType>
+CSRMatrix COOToCSR(COOMatrix coo) {
   LOG(FATAL) << "Ascend support is not compiled.";
   return {};
-#endif
 }
 
-template <>
-CSRMatrix COOToCSR<kDGLAscend, int64_t>(COOMatrix coo) {
-#ifdef DGL_USE_ASCEND
-  return COOToCSRWithKernel<int64_t>(coo);
-#else
-  LOG(FATAL) << "Ascend support is not compiled.";
-  return {};
-#endif
-}
+template CSRMatrix COOToCSR<kDGLAscend, int32_t>(COOMatrix coo);
+template CSRMatrix COOToCSR<kDGLAscend, int64_t>(COOMatrix coo);
 
 }  // namespace impl
 }  // namespace aten
 }  // namespace dgl
+
+#endif  // DGL_USE_ASCEND
