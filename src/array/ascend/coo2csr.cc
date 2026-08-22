@@ -19,6 +19,7 @@
  */
 
 #include <dgl/array.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -136,10 +137,36 @@ uint64_t NextCacheClock() {
   return clock.fetch_add(1, std::memory_order_relaxed);
 }
 
-std::unordered_map<
-    CooToCsrCacheKey, std::shared_ptr<CooToCsrCacheValue>, CooToCsrCacheKeyHash>
-    g_coo2csr_cache;
-std::mutex g_coo2csr_cache_mutex;
+// The cache is process-lifetime state. Its entries own NDArrays whose
+// destructors call into the ACL runtime; at process exit, static
+// destruction order is not guaranteed relative to the runtime's own
+// singletons, which produced "pure virtual method called" aborts in
+// spawned workers. Deliberately leak the containers (never destroyed);
+// the OS reclaims everything at exit.
+auto& CacheMap() {
+  static auto* map = new std::unordered_map<
+      CooToCsrCacheKey, std::shared_ptr<CooToCsrCacheValue>,
+      CooToCsrCacheKeyHash>();
+  return *map;
+}
+auto& CacheMutex() {
+  static auto* mutex = new std::mutex();
+  return *mutex;
+}
+
+// Called with the mutex held. Device pointers and allocator state are
+// process-specific: a fork()ed child (distributed-training workers fork
+// after the parent has already converted graphs) inherits cache entries
+// whose addresses are invalid in its address space. Detect the PID
+// change on entry and drop the whole table.
+void ResetCacheIfForked() {
+  static std::atomic<pid_t> owner{0};
+  const pid_t current = getpid();
+  if (owner.load(std::memory_order_relaxed) != current) {
+    CacheMap().clear();
+    owner.store(current, std::memory_order_relaxed);
+  }
+}
 
 uint64_t EstimateEntryBytes(const COOMatrix& coo, const CSRMatrix& csr) {
   const auto arr_bytes = [](const NDArray& a) {
@@ -154,18 +181,17 @@ uint64_t EstimateEntryBytes(const COOMatrix& coo, const CSRMatrix& csr) {
 // Evicts LRU entries until the budget is met. Called with the mutex held.
 void EvictCacheLocked(uint64_t budget) {
   uint64_t total = std::accumulate(
-      g_coo2csr_cache.begin(), g_coo2csr_cache.end(), uint64_t{0},
+      CacheMap().begin(), CacheMap().end(), uint64_t{0},
       [](uint64_t sum, const auto& kv) { return sum + kv.second->bytes; });
-  while (total > budget && !g_coo2csr_cache.empty()) {
+  while (total > budget && !CacheMap().empty()) {
     const auto victim = std::min_element(
-        g_coo2csr_cache.begin(), g_coo2csr_cache.end(),
-        [](const auto& a, const auto& b) {
+        CacheMap().begin(), CacheMap().end(), [](const auto& a, const auto& b) {
           return a.second->last_used < b.second->last_used;
         });
     total -= victim->second->bytes;
     LOG(INFO) << "[Ascend][COOToCSR][Cache] evicting entry ("
               << victim->second->bytes << " bytes, LRU)";
-    g_coo2csr_cache.erase(victim);
+    CacheMap().erase(victim);
   }
 }
 
@@ -475,9 +501,10 @@ CSRMatrix COOToCSR(COOMatrix coo) {
                          coo.row_sorted,
                          coo.col_sorted};
     {
-      std::lock_guard<std::mutex> lock(g_coo2csr_cache_mutex);
-      auto it = g_coo2csr_cache.find(key);
-      if (it != g_coo2csr_cache.end()) {
+      std::lock_guard<std::mutex> lock(CacheMutex());
+      ResetCacheIfForked();
+      auto it = CacheMap().find(key);
+      if (it != CacheMap().end()) {
         it->second->last_used = NextCacheClock();
         return it->second->csr;
       }
@@ -493,8 +520,9 @@ CSRMatrix COOToCSR(COOMatrix coo) {
     value->last_used = NextCacheClock();
     value->bytes = EstimateEntryBytes(coo, csr);
     if (value->bytes <= kCacheBudgetBytes) {
-      std::lock_guard<std::mutex> lock(g_coo2csr_cache_mutex);
-      auto [it, inserted] = g_coo2csr_cache.emplace(key, value);
+      std::lock_guard<std::mutex> lock(CacheMutex());
+      ResetCacheIfForked();
+      auto [it, inserted] = CacheMap().emplace(key, value);
       if (inserted) {
         EvictCacheLocked(kCacheBudgetBytes);
       } else {
