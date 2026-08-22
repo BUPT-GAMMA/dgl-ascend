@@ -280,6 +280,8 @@ class KernelCsrRowWiseSamplingUniformFused {
     LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
     for (uint32_t j = 0; j < num_picks; ++j) {
       uint32_t local = picks.GetValue(j);
+      // TODO(tmp-probe): remove before final review.
+      AscendC::printf("[kprobe2] local=%u\n", local);
       out_r.SetValue(j, static_cast<IdT>(row_pos));  // row POSITION (fused)
       out_c.SetValue(j, win_idx.GetValue(local));
       out_e.SetValue(
