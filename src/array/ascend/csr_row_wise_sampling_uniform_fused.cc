@@ -229,7 +229,7 @@ namespace {
 // the fused host path already moves mapping-sized arrays per layer.
 template <typename IdType>
 void ScatterSeedMappingFromPairs(
-    IdArray seed_pairs, int64_t pair_count, IdArray seed_mapping,
+    const IdArray& seed_pairs, int64_t pair_count, const IdArray& seed_mapping,
     int64_t num_rows, aclrtStream stream) {
   if (pair_count <= 0 || !seed_mapping.defined()) return;
   std::vector<IdType> pairs(2 * pair_count);
@@ -267,7 +267,8 @@ void ScatterSeedMappingFromPairs(
 // rows is a device array; pull it once and scatter directly.
 template <typename IdType>
 void ScatterSeedMappingFromRows(
-    IdArray rows, IdArray seed_mapping, int64_t num_rows, aclrtStream stream) {
+    const IdArray& rows, const IdArray& seed_mapping, int64_t num_rows,
+    aclrtStream stream) {
   if (num_rows <= 0 || !seed_mapping.defined()) return;
   std::vector<IdType> rows_host(num_rows);
   ASCEND_CALL(aclrtMemcpy(
