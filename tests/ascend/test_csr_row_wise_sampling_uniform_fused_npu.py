@@ -304,7 +304,8 @@ def test_fused_mapping_reuse_multilayer():
     seeds = torch.tensor([3, 4], dtype=torch.int64, device=device)
     layer1 = _sample_fused(g, seeds, -1, mapping=mapping)
     # Second layer: seed with the newly discovered source nodes.
-    seeds2 = layer1.srcdata[dgl.NID]
+    # NID is host-side (upstream design), so move it back to the NPU.
+    seeds2 = layer1.srcdata[dgl.NID].to(device)
     layer2 = _sample_fused(g, seeds2, -1, mapping=mapping)
 
     # Layer-2 edges must be real edges of the original graph.
