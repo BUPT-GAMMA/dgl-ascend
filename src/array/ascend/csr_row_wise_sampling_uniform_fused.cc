@@ -298,8 +298,8 @@ std::pair<CSRMatrix, IdArray> ZeroOutputResult(
     const CSRMatrix& mat, const DGLContext& ctx, const IdArray& rows,
     const IdArray& seed_mapping, std::vector<IdType>* new_seed_nodes,
     int64_t num_rows, uint8_t nbits, bool map_seed_nodes, aclrtStream stream,
-    const IdArray& picked_coo_rows, const IdArray& picked_col,
-    const IdArray& picked_idx, const IdArray& block_csr_indptr) {
+    IdArray picked_coo_rows, IdArray picked_col, IdArray picked_idx,
+    IdArray block_csr_indptr) {
   const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
   ASCEND_CALL(aclrtMemsetAsync(
       block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream));
