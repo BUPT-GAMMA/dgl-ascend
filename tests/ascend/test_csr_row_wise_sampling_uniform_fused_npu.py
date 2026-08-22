@@ -558,3 +558,64 @@ def test_fused_neighborsampler_two_layers():
     nid0 = blocks[0].srcdata[dgl.NID].cpu()
     nid1 = blocks[1].dstdata[dgl.NID].cpu()
     assert torch.equal(nid0[: nid1.shape[0]], nid1)
+
+
+# ---------------------------------------------------------------------------
+# Segmented-path semantics (review R2/R3 regression): rows whose degree
+# exceeds the UB window stream through window-sized segments; the pick
+# emission scans the full picks array per window (a slot-order cursor
+# drops picks because reservoir slots are unordered).
+# ---------------------------------------------------------------------------
+
+
+def test_fused_segmented_no_replace_unique():
+    """deg 4100 > window: 50 unique picks through the segmented reservoir."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    n = 4100
+    src = torch.arange(n, dtype=torch.int64)
+    dst = torch.zeros(n, dtype=torch.int64)
+    g = dgl.graph((src, dst), num_nodes=n)
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    sg = _sample_fused(g_npu, nodes, 50, replace=False)
+    assert sg.num_edges() == 50
+    u, _ = _uv(sg)
+    u_list = u.tolist()
+    assert len(set(u_list)) == 50, "duplicates in segmented no-replace"
+    assert all(0 <= x < n for x in u_list)
+
+
+def test_fused_segmented_two_hub_rows():
+    """Two consecutive huge-degree rows: per-row pick state must not leak."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    n = 4100
+    src = torch.arange(n, dtype=torch.int64)
+    src2 = torch.cat([src, src])
+    dst2 = torch.cat([torch.zeros(n, dtype=torch.int64),
+                      torch.ones(n, dtype=torch.int64)])
+    g = dgl.graph((src2, dst2), num_nodes=n)
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    sg = _sample_fused(g_npu, nodes, 30, replace=False)
+    assert sg.num_edges() == 60, f"two hubs: {sg.num_edges()}"
+
+
+def test_fused_fanout_beyond_window_rejected():
+    """With-replace fanout beyond the UB window overflows kernel scratch;
+    the host rejects it explicitly (review R2)."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    n = 4100
+    src = torch.arange(n, dtype=torch.int64)
+    dst = torch.zeros(n, dtype=torch.int64)
+    g = dgl.graph((src, dst), num_nodes=n)
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    with pytest.raises(Exception):
+        dgl.sampling.sample_neighbors_fused(
+            g_npu, nodes, 99999, edge_dir="in", replace=True)
