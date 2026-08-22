@@ -281,8 +281,11 @@ def test_fused_renumbering_and_mapping_semantics():
     nid = sg.srcdata[dgl.NID]
     nid_set = set(nid.cpu().tolist())
     u_set = set(u.tolist())
-    assert nid_set == u_set, \
-        f"srcdata NID {sorted(nid_set)} != sampled sources {sorted(u_set)}"
+    # Unibipartite: srcdata NID = sampled sources UNION the seed nodes.
+    seed_set = set(nodes.cpu().tolist())
+    assert u_set <= nid_set <= u_set | seed_set, \
+        f"srcdata NID {sorted(nid_set)} vs sources {sorted(u_set)} "" \
+        seeds {sorted(seed_set)}"
     # The mapping dict was populated (harness for cross-call reuse).
     assert len(mapping) == 1
     mvec = next(iter(mapping.values()))[0]
