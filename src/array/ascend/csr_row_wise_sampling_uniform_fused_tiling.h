@@ -41,4 +41,17 @@ constexpr uint32_t kGoldenRatioHashFused = 2654435761u;    // 2^32 / phi
 constexpr uint32_t kGoldenRatioOffsetFused = 0x9e3779b9u;  // frac(2^32/phi)
 constexpr uint32_t kRngFallbackSeedFused = 0x12345678u;    // nonzero guard
 
+// UB window equation (single source of truth, shared by kernel and host
+// launcher — the host re-derives the window to bound the fanout).
+// Window instances: 2*depth idx queue + 2*depth data queue + 2*depth out
+// queue + pick scratch + 3 output staging buffers. Meta staging
+// (out_ptr + seed pairs) is reserved as a fixed byte budget below.
+constexpr uint32_t kQueueDepthFused = 2;  // double buffering
+constexpr uint32_t kMetaRowsFused = 256;  // meta staging rows per flush
+constexpr uint32_t kWindowInstancesFused =
+    2 * kQueueDepthFused + 2 * kQueueDepthFused + 2 * kQueueDepthFused + 1 + 3;
+constexpr uint32_t kMetaUbReserveFused =
+    ((kMetaRowsFused + 1) + 2 * kMetaRowsFused) *
+    8;  // out_ptr + interleaved seed pairs, int64 worst case
+
 #endif  // CSR_ROW_WISE_SAMPLING_UNIFORM_FUSED_TILING_H

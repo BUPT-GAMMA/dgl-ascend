@@ -369,6 +369,21 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
 
   // Per-row pick counts (degrees come back to the host once).
   const uint32_t fanout = select_all ? 0u : static_cast<uint32_t>(num_samples);
+  // Replacement sampling draws num_picks == fanout picks per row into a
+  // UB-sized scratch regardless of degree; a fanout beyond the window
+  // would overflow the pick scratch and output staging (the kernel's
+  // window check bounds degree, not fanout). Reject it here — sampling
+  // with replacement beyond a few thousand picks per row is far outside
+  // the training workloads this operator serves.
+  if (replace) {
+    const uint32_t ub_available = QueryUbAvailableBytesFused(ctx.device_id);
+    const uint32_t window_elems = (ub_available - kMetaUbReserve) /
+                                  kWindowInstancesFused / sizeof(IdType);
+    CHECK(fanout <= window_elems)
+        << "fused sampling fanout " << fanout
+        << " exceeds the per-core window of " << window_elems
+        << " (with-replace draws that many picks into UB scratch)";
+  }
   std::vector<uint32_t> picks =
       ComputeRowPicks<IdType>(mat, rows, num_rows, fanout, select_all, replace);
 

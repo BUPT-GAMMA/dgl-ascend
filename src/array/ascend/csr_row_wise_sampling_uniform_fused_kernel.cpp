@@ -117,26 +117,20 @@ class KernelCsrRowWiseSamplingUniformFused {
     row_end_ = row_split_p[block_idx + 1];
     out_start_ = out_starts_p[block_idx];
 
-    // UB budget split (runtime-queried total, explicit instance count —
-    // the multi-buffer rule: sum of ALL instances must fit):
-    //   window queues: 2*depth idx + 2*depth data + 2*depth out = 6
-    //   window scratch: pick + 3 output staging = 4
-    //   meta staging: rows + indptr + out_ptr + seed_pairs = 4
-    // Window buffers get the lion's share; meta buffers are clamped to
-    // kMetaRows (tiny), so the window still gets the remainder.
-    constexpr uint32_t kWindowInstances =
-        2 * kQueueDepth + 2 * kQueueDepth + 2 * kQueueDepth + 1 + 3;
-    window_elems_ =
-        (ub_available - kMetaUbReserve) / kWindowInstances / sizeof(IdT);
-    meta_rows_ = kMetaRows;
+    // UB budget split: see the shared window equation in the tiling
+    // header (single source of truth for kernel and host).
+    window_elems_ = (ub_available - kMetaUbReserveFused) /
+                    kWindowInstancesFused / sizeof(IdT);
+    meta_rows_ = kMetaRowsFused;
 
-    pipe->InitBuffer(win_idx_q_, kQueueDepth, window_elems_ * sizeof(IdT));
-    pipe->InitBuffer(win_data_q_, kQueueDepth, window_elems_ * sizeof(IdT));
+    pipe->InitBuffer(win_idx_q_, kQueueDepthFused, window_elems_ * sizeof(IdT));
+    pipe->InitBuffer(
+        win_data_q_, kQueueDepthFused, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(pick_buf_, window_elems_ * sizeof(uint32_t));
     pipe->InitBuffer(out_r_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_c_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_e_buf_, window_elems_ * sizeof(IdT));
-    pipe->InitBuffer(out_q_, kQueueDepth, window_elems_ * sizeof(IdT));
+    pipe->InitBuffer(out_q_, kQueueDepthFused, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_ptr_buf_, (meta_rows_ + 1) * sizeof(IdT));
     pipe->InitBuffer(seed_pairs_buf_, 2 * meta_rows_ * sizeof(IdT));
   }
@@ -360,6 +354,11 @@ class KernelCsrRowWiseSamplingUniformFused {
       return deg;
     }
     LocalTensor<uint32_t> picks = pick_buf_.Get<uint32_t>();
+    // The pick cursor is per-row state: picks slots hold UNORDERED
+    // indices (reservoir slots get replaced by arbitrary later indices),
+    // so a monotone cursor skips picks that live in earlier windows —
+    // scan the full picks array per window instead, and reset for each
+    // row so the previous row's tail cannot leak in.
     if (replace_) {
       for (uint32_t j = 0; j < num_picks; ++j) {
         picks.SetValue(j, RandBelowFused(state, deg));
@@ -449,12 +448,12 @@ class KernelCsrRowWiseSamplingUniformFused {
       }
       emitted = chunk;
     } else {
-      // Resume the pick cursor from where the previous window stopped:
-      // picks below pick_cursor_ are either emitted or belong to an
-      // earlier window. With distinct indices (no-replace) or arbitrary
-      // order (replace), a pick in an earlier window has already been
-      // handled, so scanning from pick_cursor_ is complete.
-      for (uint32_t p = pick_cursor_; p < num_picks; ++p) {
+      // Full scan per window: picks slots are unordered (reservoir
+      // replacement puts later indices into early slots), so a cursor
+      // monotone in p is not monotone in window — cursor-based resumes
+      // DROP picks (verified counterexample in the review). The extra
+      // scan cost is bounded by picks*windows, same order as emission.
+      for (uint32_t p = 0; p < num_picks; ++p) {
         const uint32_t idx = (*picks).GetValue(p);
         if (idx >= base && idx < base + chunk) {
           out_r.SetValue(emitted, static_cast<IdT>(row_pos));
@@ -463,11 +462,6 @@ class KernelCsrRowWiseSamplingUniformFused {
               emitted, has_data_ ? win_data.GetValue(idx - base)
                                  : static_cast<IdT>(off + idx));
           ++emitted;
-          pick_cursor_ = p + 1;
-        } else if (replace_mode && idx < base) {
-          // Should not happen when windows are visited in order (the
-          // cursor guarantees it); kept as a defensive skip.
-          pick_cursor_ = p + 1;
         }
       }
     }
@@ -521,18 +515,13 @@ class KernelCsrRowWiseSamplingUniformFused {
     out_q_.FreeTensor(ready);
   }
 
-  static constexpr uint32_t kQueueDepth = 2;  // double buffering
-  static constexpr uint32_t kMetaRows = 256;  // meta staging rows per flush
-  static constexpr uint32_t kMetaUbReserve =
-      ((kMetaRows + 1) + 2 * kMetaRows) * 8;  // out_ptr + seed pairs
-
   const __gm__ IdT* indptr_p_ = nullptr;
   const __gm__ IdT* rows_p_ = nullptr;
   GlobalTensor<IdT> indptr_gm_, indices_gm_, data_gm_, rows_gm_;
   GlobalTensor<IdT> out_ptr_gm_, out_rows_gm_, out_cols_gm_, out_idxs_gm_;
   GlobalTensor<IdT> seed_pairs_gm_;
-  TQue<TPosition::VECIN, kQueueDepth> win_idx_q_, win_data_q_;
-  TQue<TPosition::VECOUT, kQueueDepth> out_q_;
+  TQue<TPosition::VECIN, kQueueDepthFused> win_idx_q_, win_data_q_;
+  TQue<TPosition::VECOUT, kQueueDepthFused> out_q_;
   TBuf<TPosition::VECCALC> pick_buf_;
   TBuf<TPosition::VECCALC> out_r_buf_, out_c_buf_, out_e_buf_;
   TBuf<TPosition::VECCALC> out_ptr_buf_, seed_pairs_buf_;
@@ -541,7 +530,6 @@ class KernelCsrRowWiseSamplingUniformFused {
   uint32_t row_begin_ = 0, row_end_ = 0, window_elems_ = 0;
   uint32_t block_idx_ = 0, map_seed_nodes_ = 0, meta_rows_ = 0;
   uint32_t out_ptr_flushed_ = 0, pairs_flushed_ = 0;
-  uint32_t pick_cursor_ = 0;
 };
 
 extern "C" __global__ __aicore__ void csr_row_wise_sampling_uniform_fused_int32(
