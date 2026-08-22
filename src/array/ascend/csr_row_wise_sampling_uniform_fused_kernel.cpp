@@ -205,6 +205,47 @@ class KernelCsrRowWiseSamplingUniformFused {
   }
 
  private:
+  // Processes one row: stages its out_ptr prefix entry and seed pair,
+  // samples its edges, returns the updated output offset.
+  __aicore__ inline uint32_t ProcessRow(
+      uint32_t i, uint32_t offset, LocalTensor<IdT>& out_ptr_local,
+      uint32_t* out_ptr_staged, LocalTensor<IdT>& pairs_local,
+      uint32_t* pairs_staged) {
+    out_ptr_local.SetValue(
+        *out_ptr_staged, static_cast<IdT>(out_start_ + offset));
+    ++*out_ptr_staged;
+
+    const IdT rid = ReadRows(i);
+    const bool rid_valid = rid >= 0 && rid < static_cast<IdT>(num_total_rows_);
+    IdT off = 0;
+    uint32_t deg = 0;
+    if (rid_valid) ReadIndptr(rid, &off, &deg);
+    if (map_seed_nodes_) {
+      // One pair per row (invalid rids become sentinel pairs the host
+      // skips): pairs are a strict function of the row index, so each
+      // block writes its own contiguous slice [row_begin_, row_end_)
+      // with no cross-block offset bookkeeping.
+      pairs_local.SetValue(2 * *pairs_staged, rid);
+      pairs_local.SetValue(2 * *pairs_staged + 1, static_cast<IdT>(i));
+      ++*pairs_staged;
+    }
+
+    uint32_t num_picks = 0;
+    if (rid_valid && deg > 0) {
+      num_picks = select_all_ ? deg
+                  : replace_  ? num_samples_
+                              : (deg < num_samples_ ? deg : num_samples_);
+    }
+    if (num_picks > 0) {
+      uint32_t state =
+          seed_ ^ (i * kGoldenRatioHashFused + kGoldenRatioOffsetFused);
+      if (state == 0) state = kRngFallbackSeedFused;
+      offset +=
+          SampleRow(out_start_ + offset, i, rid, off, deg, num_picks, state);
+    }
+    return offset;
+  }
+
   // Reads rows[i] through the typed __gm__ pointer captured in Init
   // (the rowSplit table pattern from the plain uniform kernel): the
   // launch was preceded by a host-side stream sync, so direct scalar

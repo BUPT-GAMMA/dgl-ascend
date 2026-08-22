@@ -147,6 +147,59 @@ std::vector<uint32_t> BuildBalancedPartitionsFused(
   return boundaries;
 }
 
+// Per-block output offsets: prefix sums of the per-row pick counts at
+// the partition boundaries.
+std::vector<uint32_t> BlockOutputStarts(
+    const std::vector<uint32_t>& picks, const std::vector<uint32_t>& row_split,
+    uint32_t block_dim) {
+  std::vector<uint32_t> out_starts(block_dim + 1, 0);
+  std::vector<uint32_t> prefix(picks.size() + 1, 0);
+  for (size_t i = 0; i < picks.size(); ++i)
+    prefix[i + 1] = prefix[i] + picks[i];
+  for (uint32_t b = 0; b <= block_dim; ++b)
+    out_starts[b] = prefix[row_split[b]];
+  return out_starts;
+}
+
+// Per-row pick counts: select-all picks the degree, replace picks the
+// fanout for non-empty rows, no-replace picks min(fanout, degree).
+template <typename IdType>
+std::vector<uint32_t> ComputeRowPicks(
+    const CSRMatrix& mat, const IdArray& rows, int64_t num_rows,
+    uint32_t fanout, bool select_all, bool replace) {
+  NDArray deg = CSRGetRowNNZ<kDGLAscend, IdType>(mat, rows);
+  std::vector<IdType> deg_host(num_rows);
+  ASCEND_CALL(aclrtMemcpy(
+      deg_host.data(), num_rows * sizeof(IdType), deg->data,
+      num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+  std::vector<uint32_t> picks(num_rows);
+  for (int64_t i = 0; i < num_rows; ++i) {
+    const uint32_t d = static_cast<uint32_t>(deg_host[i]);
+    picks[i] = select_all ? d
+               : replace  ? (d == 0 ? 0u : fanout)
+                          : std::min(fanout, d);
+  }
+  return picks;
+}
+
+// Empty/degenerate early-exit result: a zeroed block CSR indptr (the CPU
+// reference allocates it unconditionally) plus empty edge arrays.
+std::pair<CSRMatrix, IdArray> EmptyResult(
+    const DGLContext& ctx, int64_t num_rows, uint8_t nbits) {
+  IdArray block_csr_indptr = aten::NewIdArray(num_rows + 1, ctx, nbits);
+  IdArray empty = aten::NewIdArray(0, ctx, nbits);
+  // Zero indptr: DGL's allocator reuses memory without zeroing.
+  const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
+  auto stream0 = dgl::runtime::getCurrentAscendStream();
+  if (num_rows + 1 > 0) {
+    ASCEND_CALL(aclrtMemsetAsync(
+        block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream0));
+    ASCEND_CALL(aclrtSynchronizeStream(stream0));
+  }
+  return std::make_pair(
+      CSRMatrix(num_rows, 0, block_csr_indptr, empty, empty), empty);
+}
+
 // Uploads a host uint32 table to device memory on the launch stream.
 // The stream is synchronized BEFORE the caller's stack buffers go out of
 // scope: an async copy only captures the source pointer, so returning
@@ -237,6 +290,36 @@ void ScatterSeedMappingFromRows(
   ASCEND_CALL(aclrtSynchronizeStream(stream));
 }
 
+// Zero-output degenerate path: the kernel does not run, but valid rows
+// still get their mapping positions and the indptr stays well-formed.
+template <typename IdType>
+std::pair<CSRMatrix, IdArray> ZeroOutputResult(
+    const CSRMatrix& mat, const DGLContext& ctx, const IdArray& rows,
+    const IdArray& seed_mapping, std::vector<IdType>* new_seed_nodes,
+    int64_t num_rows, uint8_t nbits, bool map_seed_nodes, aclrtStream stream,
+    const IdArray& picked_coo_rows, const IdArray& picked_col,
+    const IdArray& picked_idx, const IdArray& block_csr_indptr) {
+  const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
+  ASCEND_CALL(aclrtMemsetAsync(
+      block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream));
+  if (map_seed_nodes) {
+    ScatterSeedMappingFromRows<IdType>(rows, seed_mapping, num_rows, stream);
+    if (new_seed_nodes != nullptr) {
+      new_seed_nodes->resize(num_rows);
+      ASCEND_CALL(aclrtMemcpy(
+          new_seed_nodes->data(), num_rows * sizeof(IdType), rows->data,
+          num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+    }
+  }
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  return std::make_pair(
+      CSRMatrix(
+          num_rows, 0, block_csr_indptr,
+          picked_col.CreateView({0}, picked_col->dtype),
+          picked_idx.CreateView({0}, picked_idx->dtype)),
+      picked_coo_rows.CreateView({0}, picked_coo_rows->dtype));
+}
+
 }  // namespace
 #endif  // DGL_USE_ASCEND
 
@@ -274,42 +357,13 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   // (num_rows + 1 zeros) so downstream consumers see a well-formed empty
   // matrix (CPU reference allocates block_csr_indptr unconditionally).
   if (num_rows == 0 || mat.indptr->shape[0] <= 1 || num_samples == 0) {
-    IdArray block_csr_indptr = aten::NewIdArray(num_rows + 1, ctx, nbits);
-    IdArray empty = aten::NewIdArray(0, ctx, nbits);
-    // Zero indptr: DGL's allocator reuses memory without zeroing.
-    const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
-    auto stream0 = dgl::runtime::getCurrentAscendStream();
-    if (num_rows + 1 > 0) {
-      ASCEND_CALL(aclrtMemsetAsync(
-          block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream0));
-      ASCEND_CALL(aclrtSynchronizeStream(stream0));
-    }
-    if (map_seed_nodes && new_seed_nodes != nullptr && num_rows > 0) {
-      // CPU reference copies rows into new_seed_nodes even on early exit
-      // only when sampling ran; on the empty path it stays empty. But the
-      // seed mapping positions for valid rows must still be written when
-      // the kernel would have done so — for the degenerate cases here the
-      // CPU path also leaves the mapping untouched (no rows processed).
-      new_seed_nodes->clear();
-    }
-    return std::make_pair(
-        CSRMatrix(num_rows, 0, block_csr_indptr, empty, empty), empty);
+    return EmptyResult(ctx, num_rows, nbits);
   }
 
   // Per-row pick counts (degrees come back to the host once).
   const uint32_t fanout = select_all ? 0u : static_cast<uint32_t>(num_samples);
-  NDArray deg = CSRGetRowNNZ<kDGLAscend, IdType>(mat, rows);
-  std::vector<IdType> deg_host(num_rows);
-  ASCEND_CALL(aclrtMemcpy(
-      deg_host.data(), num_rows * sizeof(IdType), deg->data,
-      num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
-  std::vector<uint32_t> picks(num_rows);
-  for (int64_t i = 0; i < num_rows; ++i) {
-    const uint32_t d = static_cast<uint32_t>(deg_host[i]);
-    picks[i] = select_all ? d
-               : replace  ? (d == 0 ? 0u : fanout)
-                          : std::min(fanout, d);
-  }
+  std::vector<uint32_t> picks =
+      ComputeRowPicks<IdType>(mat, rows, num_rows, fanout, select_all, replace);
 
   // nnz-balanced row partitions across all vector cores (spmm pattern).
   const uint32_t block_dim = QueryVectorCoreCountFused(ctx.device_id);
@@ -317,13 +371,8 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
       BuildBalancedPartitionsFused(picks, block_dim);
 
   // Per-block output offsets as prefix sums of picks over row ranges.
-  std::vector<uint32_t> out_starts(block_dim + 1, 0);
-  {
-    std::vector<uint32_t> prefix(num_rows + 1, 0);
-    for (int64_t i = 0; i < num_rows; ++i) prefix[i + 1] = prefix[i] + picks[i];
-    for (uint32_t b = 0; b <= block_dim; ++b)
-      out_starts[b] = prefix[row_split[b]];
-  }
+  std::vector<uint32_t> out_starts =
+      BlockOutputStarts(picks, row_split, block_dim);
   const int64_t max_output = out_starts[block_dim];
   CHECK(max_output <= static_cast<int64_t>(std::numeric_limits<IdType>::max()))
       << "Output size " << max_output << " exceeds IdType range";
@@ -355,33 +404,10 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   IdArray seed_pairs = aten::NewIdArray(pair_count, ctx, nbits);
 
   if (max_output == 0) {
-    // No edges: indptr must still be a valid all-zero prefix (the kernel
-    // is not launched; zero it explicitly — allocator reuse).
-    const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
-    ASCEND_CALL(aclrtMemsetAsync(
-        block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream));
-    // Seed pairs are still produced for valid rows (pos writes) — but
-    // with zero output the kernel did not run, so scatter nothing. The
-    // CPU reference in this regime processes rows and writes mapping
-    // entries; replicate that by scattering on the host directly from
-    // rows (all rows map to their positions; degenerate picks are zero
-    // but the mapping is row-position based, independent of picks).
-    if (map_seed_nodes) {
-      ScatterSeedMappingFromRows<IdType>(rows, seed_mapping, num_rows, stream);
-      if (new_seed_nodes != nullptr) {
-        new_seed_nodes->resize(num_rows);
-        ASCEND_CALL(aclrtMemcpy(
-            new_seed_nodes->data(), num_rows * sizeof(IdType), rows->data,
-            num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
-      }
-    }
-    ASCEND_CALL(aclrtSynchronizeStream(stream));
-    return std::make_pair(
-        CSRMatrix(
-            num_rows, 0, block_csr_indptr,
-            picked_col.CreateView({0}, picked_col->dtype),
-            picked_idx.CreateView({0}, picked_idx->dtype)),
-        picked_coo_rows.CreateView({0}, picked_coo_rows->dtype));
+    return ZeroOutputResult(
+        mat, ctx, rows, seed_mapping, new_seed_nodes, num_rows, nbits,
+        map_seed_nodes, stream, picked_coo_rows, picked_col, picked_idx,
+        block_csr_indptr);
   }
 
   // Zero the output buffers on the launch stream (spmm pattern): DGL's
