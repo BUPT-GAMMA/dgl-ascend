@@ -551,7 +551,10 @@ def test_fused_neighborsampler_two_layers():
     for blk in blocks:
         u, v = blk.edges()
         assert u.device.type == "npu", "blocks must stay on NPU"
-    # Block chain consistency: layer i's src nodes == layer i-1's dst nodes.
-    nid0 = blocks[0].srcdata[dgl.NID]
-    nid1 = blocks[1].dstdata[dgl.NID]
-    assert torch.equal(nid0.cpu(), nid1.cpu())
+    # Block chain consistency: the second layer's seeds (dst of block 1)
+    # are the first block's seed nodes, which sit at the HEAD of block
+    # 0's srcdata NID (unibipartite layout: seeds first, then the newly
+    # discovered neighbors).
+    nid0 = blocks[0].srcdata[dgl.NID].cpu()
+    nid1 = blocks[1].dstdata[dgl.NID].cpu()
+    assert torch.equal(nid0[: nid1.shape[0]], nid1)
