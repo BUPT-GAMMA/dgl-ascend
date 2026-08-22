@@ -95,6 +95,19 @@ def _predecessors(g, nodes):
     return pred
 
 
+def _uv_original(sg):
+    """Return (u, v) in ORIGINAL node-id coordinates for a fused block.
+
+    Fused blocks renumber their nodes (unibipartite), so raw edges() are
+    block-local ids; map through srcdata/dstdata NID like the upstream
+    fused tests do.
+    """
+    u, v = _uv(sg)
+    src_nid = sg.srcdata[dgl.NID].cpu()
+    dst_nid = sg.dstdata[dgl.NID].cpu()
+    return src_nid[u.cpu()], dst_nid[v.cpu()]
+
+
 def _sample_fused(g, nodes, fanout, edge_dir="in", replace=False,
                   mapping=None, exclude_edges=None):
     """Call the fused sampling API; NPU graphs must take the NPU path.
@@ -173,7 +186,7 @@ def test_fused_no_replace_structural(idtype):
     nodes = torch.tensor([0, 1, 2, 3, 4], dtype=idtype, device=device)
     fanout = 2
     sg = _sample_fused(g, nodes, fanout, replace=False)
-    u, v = _uv(sg)
+    u, v = _uv_original(sg)
     pred = _predecessors(g, nodes)
     for uu, vv in zip(u.tolist(), v.tolist()):
         assert uu in pred[vv], f"sampled edge ({uu},{vv}) not a real in-edge"
@@ -197,7 +210,7 @@ def test_fused_replace_structural():
     nodes = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=device)
     fanout = 4
     sg = _sample_fused(g, nodes, fanout, replace=True)
-    u, v = _uv(sg)
+    u, v = _uv_original(sg)
     pred = _predecessors(g, nodes)
     for uu, vv in zip(u.tolist(), v.tolist()):
         assert uu in pred[vv]
@@ -254,8 +267,9 @@ def test_fused_renumbering_and_mapping_semantics():
     sg = _sample_fused(g, nodes, -1, mapping=mapping)
 
     assert sg.is_unibipartite
-    # All sampled sources must be predecessors of the seed nodes.
-    u, v = _uv(sg)
+    # All sampled sources must be predecessors of the seed nodes
+    # (in original-id coordinates).
+    u, v = _uv_original(sg)
     pred = _predecessors(g, nodes)
     for uu, vv in zip(u.tolist(), v.tolist()):
         assert uu in pred[vv]
@@ -288,7 +302,7 @@ def test_fused_mapping_reuse_multilayer():
     layer2 = _sample_fused(g, seeds2, -1, mapping=mapping)
 
     # Layer-2 edges must be real edges of the original graph.
-    u, v = _uv(layer2)
+    u, v = _uv_original(layer2)
     gc = g.cpu()
     for uu, vv in zip(u.tolist(), v.tolist()):
         assert gc.has_edges_between(uu, vv)
@@ -496,7 +510,7 @@ def test_fused_large_graph():
     g = dgl.graph((src.to(device), dst.to(device)), num_nodes=n).formats("csc")
     nodes = torch.arange(0, n, dtype=torch.int64, device=device)
     sg = _sample_fused(g, nodes, 5, replace=False)
-    u, v = _uv(sg)
+    u, v = _uv_original(sg)
     pred = _predecessors(g, nodes)
     for uu, vv in zip(u.tolist(), v.tolist()):
         assert uu in pred[vv]
