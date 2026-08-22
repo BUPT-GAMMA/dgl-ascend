@@ -233,10 +233,6 @@ void ScatterSeedMappingFromPairs(
     const IdArray& seed_pairs, int64_t pair_count, const IdArray& seed_mapping,
     int64_t num_rows, aclrtStream stream) {
   if (pair_count <= 0 || !seed_mapping.defined()) return;
-  std::vector<IdType> pairs(2 * pair_count);
-  ASCEND_CALL(aclrtMemcpy(
-      pairs.data(), 2 * pair_count * sizeof(IdType), seed_pairs->data,
-      2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
   const int64_t mapping_len = seed_mapping->shape[0];
   // The mapping spans the graph's node count; the CSR row count is the
   // seed count. A homo graph makes them equal, but heterographs and
@@ -244,10 +240,17 @@ void ScatterSeedMappingFromPairs(
   CHECK(mapping_len >= num_rows)
       << "seed_mapping length " << mapping_len
       << " is smaller than the row count " << num_rows;
+  // Both D2H copies go on the stream back to back with one sync: two
+  // separate synchronous round-trips serialized twice the latency.
+  std::vector<IdType> pairs(2 * pair_count);
   std::vector<IdType> mapping(mapping_len);
-  ASCEND_CALL(aclrtMemcpy(
+  ASCEND_CALL(aclrtMemcpyAsync(
+      pairs.data(), 2 * pair_count * sizeof(IdType), seed_pairs->data,
+      2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST, stream));
+  ASCEND_CALL(aclrtMemcpyAsync(
       mapping.data(), mapping_len * sizeof(IdType), seed_mapping->data,
-      mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+      mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST, stream));
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
   for (int64_t p = 0; p < pair_count; ++p) {
     const IdType rid = pairs[2 * p];
     const IdType pos = pairs[2 * p + 1];
@@ -470,9 +473,9 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   ASCEND_CALL(aclrtFree(row_split_dev));
   ASCEND_CALL(aclrtFree(out_starts_dev));
   auto t_kernel1 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
-  LOG(INFO) << "[fused-timing] picks="
-            << std::chrono::duration<double, std::milli>(t_picks1 - t_picks0)
-                   .count();
+  LOG(INFO)
+      << "[fused-timing] picks="
+      << std::chrono::duration<double, std::milli>(t_picks1 - t_picks0).count();
 
   // ADR-0014 A1 closure: scatter the compact (rid, pos) pairs into
   // seed_mapping on the host, then write the mapping back. The kernel is
@@ -489,12 +492,12 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   }
 
   auto t_scatter1 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
-  LOG(INFO) << "[fused-timing] kernel+setup="
-            << std::chrono::duration<double, std::milli>(t_kernel1 - t_picks1)
-                   .count()
-            << " scatter="
-            << std::chrono::duration<double, std::milli>(t_scatter1 - t_kernel1)
-                   .count();
+  LOG(INFO)
+      << "[fused-timing] kernel+setup="
+      << std::chrono::duration<double, std::milli>(t_kernel1 - t_picks1).count()
+      << " scatter="
+      << std::chrono::duration<double, std::milli>(t_scatter1 - t_kernel1)
+             .count();
   return std::make_pair(
       CSRMatrix(num_rows, max_output, block_csr_indptr, picked_col, picked_idx),
       picked_coo_rows);
