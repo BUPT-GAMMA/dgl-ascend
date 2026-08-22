@@ -92,9 +92,11 @@ class KernelCsrRowWiseSamplingUniformFused {
     map_seed_nodes_ = tiling->map_seed_nodes;
     const uint32_t ub_available = tiling->ub_available;
 
+    indptr_p_ = (const __gm__ IdT*)indptr;
     indptr_gm_.SetGlobalBuffer((__gm__ IdT*)indptr, num_total_rows_ + 1);
     indices_gm_.SetGlobalBuffer((__gm__ IdT*)indices);
     if (has_data_) data_gm_.SetGlobalBuffer((__gm__ IdT*)data);
+    rows_p_ = (const __gm__ IdT*)rows;
     rows_gm_.SetGlobalBuffer((__gm__ IdT*)rows, num_rows_);
     out_ptr_gm_.SetGlobalBuffer((__gm__ IdT*)out_ptr, num_rows_ + 1);
     out_rows_gm_.SetGlobalBuffer((__gm__ IdT*)out_rows);
@@ -135,8 +137,6 @@ class KernelCsrRowWiseSamplingUniformFused {
     pipe->InitBuffer(out_c_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_e_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_q_, kQueueDepth, window_elems_ * sizeof(IdT));
-    pipe->InitBuffer(rows_buf_, meta_rows_ * sizeof(IdT));
-    pipe->InitBuffer(indptr_buf_, (meta_rows_ + 1) * sizeof(IdT));
     pipe->InitBuffer(out_ptr_buf_, (meta_rows_ + 1) * sizeof(IdT));
     pipe->InitBuffer(seed_pairs_buf_, 2 * meta_rows_ * sizeof(IdT));
   }
@@ -203,45 +203,18 @@ class KernelCsrRowWiseSamplingUniformFused {
   }
 
  private:
-  // Reads rows[i] through the UB prefetch buffer (rows are consumed in
-  // order, so a rolling window of meta_rows_ covers every access).
-  __aicore__ inline IdT ReadRows(uint32_t i) {
-    const uint32_t local = i - row_begin_;
-    if (rows_valid_ == 0 || local >= rows_base_ + rows_valid_) {
-      rows_base_ = local;
-      const uint32_t avail = static_cast<uint32_t>(row_end_ - i);
-      const uint32_t count = avail < meta_rows_ ? avail : meta_rows_;
-      const uint32_t copy_bytes = count * sizeof(IdT);
-      DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
-      DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
-      LocalTensor<IdT> buf = rows_buf_.Get<IdT>();
-      DataCopyPad(buf, rows_gm_[i], cp, pad);
-      rows_valid_ = count;
-    }
-    return rows_buf_.Get<IdT>().GetValue(local - rows_base_);
-  }
+  // Reads rows[i] through the typed __gm__ pointer captured in Init
+  // (the rowSplit table pattern from the plain uniform kernel): the
+  // launch was preceded by a host-side stream sync, so direct scalar
+  // loads are consistently visible. A UB prefetch here would need queue
+  // discipline for the async copy to land before the read (the async
+  // prefetch in the first draft raced the read — stale UB garbage).
+  __aicore__ inline IdT ReadRows(uint32_t i) { return rows_p_[i]; }
 
-  // Reads indptr[rid] and indptr[rid+1] through the UB prefetch buffer.
-  // Row ids are arbitrary (not monotonic), so a miss refetches a small
-  // segment starting at rid: [rid, rid + segment).
+  // Reads indptr[rid] and indptr[rid+1] the same way.
   __aicore__ inline void ReadIndptr(IdT rid, IdT* off, uint32_t* deg) {
-    const uint32_t r = static_cast<uint32_t>(rid);
-    if (indptr_valid_ == 0 || r < indptr_base_ ||
-        (r + 1) >= indptr_base_ + indptr_valid_) {
-      indptr_base_ = r;
-      const uint32_t avail = static_cast<uint32_t>(num_total_rows_ + 1 - r);
-      const uint32_t count =
-          avail < (meta_rows_ + 1) ? avail : (meta_rows_ + 1);
-      const uint32_t copy_bytes = count * sizeof(IdT);
-      DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
-      DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
-      LocalTensor<IdT> buf = indptr_buf_.Get<IdT>();
-      DataCopyPad(buf, indptr_gm_[r], cp, pad);
-      indptr_valid_ = count;
-    }
-    LocalTensor<IdT> buf = indptr_buf_.Get<IdT>();
-    const IdT start = buf.GetValue(r - indptr_base_);
-    const IdT end = buf.GetValue(r + 1 - indptr_base_);
+    const IdT start = indptr_p_[rid];
+    const IdT end = indptr_p_[rid + 1];
     *off = start;
     *deg = static_cast<uint32_t>(end - start);
   }
@@ -511,9 +484,10 @@ class KernelCsrRowWiseSamplingUniformFused {
   static constexpr uint32_t kQueueDepth = 2;  // double buffering
   static constexpr uint32_t kMetaRows = 256;  // meta staging rows per flush
   static constexpr uint32_t kMetaUbReserve =
-      (kMetaRows + (kMetaRows + 1) + (kMetaRows + 1) + 2 * kMetaRows) *
-      8;  // worst-case meta staging bytes (int64, all four buffers)
+      ((kMetaRows + 1) + 2 * kMetaRows) * 8;  // out_ptr + seed pairs
 
+  const __gm__ IdT* indptr_p_ = nullptr;
+  const __gm__ IdT* rows_p_ = nullptr;
   GlobalTensor<IdT> indptr_gm_, indices_gm_, data_gm_, rows_gm_;
   GlobalTensor<IdT> out_ptr_gm_, out_rows_gm_, out_cols_gm_, out_idxs_gm_;
   GlobalTensor<IdT> seed_pairs_gm_;
@@ -521,14 +495,11 @@ class KernelCsrRowWiseSamplingUniformFused {
   TQue<TPosition::VECOUT, kQueueDepth> out_q_;
   TBuf<TPosition::VECCALC> pick_buf_;
   TBuf<TPosition::VECCALC> out_r_buf_, out_c_buf_, out_e_buf_;
-  TBuf<TPosition::VECCALC> rows_buf_, indptr_buf_, out_ptr_buf_,
-      seed_pairs_buf_;
+  TBuf<TPosition::VECCALC> out_ptr_buf_, seed_pairs_buf_;
   uint32_t num_rows_ = 0, num_samples_ = 0, replace_ = 0, has_data_ = 0;
   uint32_t seed_ = 0, select_all_ = 0, num_total_rows_ = 0, out_start_ = 0;
   uint32_t row_begin_ = 0, row_end_ = 0, window_elems_ = 0;
   uint32_t block_idx_ = 0, map_seed_nodes_ = 0, meta_rows_ = 0;
-  uint32_t rows_valid_ = 0, rows_base_ = 0;
-  uint32_t indptr_base_ = 0, indptr_valid_ = 0;
   uint32_t out_ptr_flushed_ = 0, pairs_flushed_ = 0;
   uint32_t pick_cursor_ = 0;
 };
