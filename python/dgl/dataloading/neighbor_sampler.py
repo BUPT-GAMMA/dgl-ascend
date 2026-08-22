@@ -184,7 +184,10 @@ class NeighborSampler(BlockSampler):
                         exclude_edges=exclude_eids,
                         mapping=self.mapping,
                     )
-                    seed_nodes = block.srcdata[NID]
+                    # The fused block emits host-side NID; move it back to
+                    # the graph device so the next layer's seeds match.
+                    seed_nodes = F.copy_to(
+                        block.srcdata[NID], F.context(seed_nodes))
                     blocks.insert(0, block)
                 return seed_nodes, output_nodes, blocks
 
