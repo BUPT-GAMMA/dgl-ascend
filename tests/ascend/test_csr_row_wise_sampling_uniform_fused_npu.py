@@ -227,8 +227,10 @@ def test_fused_statistical():
     counts = Counter()
     for _ in range(trials):
         sg = _sample_fused(g, nodes, fanout, replace=False)
+        # srcdata NID holds [seed node, sampled source] (unibipartite):
+        # the sampled predecessor is the LAST entry.
         nid = sg.srcdata[dgl.NID]
-        counts[nid.cpu().item()] += 1
+        counts[nid.cpu()[-1].item()] += 1
     assert sum(counts.values()) == trials, counts
     for pred in (0, 1, 2):
         assert 120 < counts[pred] < 280, f"pred {pred}: {counts}"
