@@ -61,6 +61,7 @@ aclrtStream getCurrentAscendStream();
 #include <dgl/runtime/device_api.h>
 
 #include <algorithm>
+#include <chrono>  // TODO(tmp-probe)
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -259,6 +260,8 @@ void ScatterSeedMappingFromPairs(
   ASCEND_CALL(aclrtMemcpyAsync(
       seed_mapping->data, mapping_len * sizeof(IdType), mapping.data(),
       mapping_len * sizeof(IdType), ACL_MEMCPY_HOST_TO_DEVICE, stream));
+  // Stack buffers back this async copy: sync before returning so the
+  // source outlives the transfer (queue-discipline rule).
   ASCEND_CALL(aclrtSynchronizeStream(stream));
 }
 
@@ -363,8 +366,10 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
 
   // Per-row pick counts (degrees come back to the host once).
   const uint32_t fanout = select_all ? 0u : static_cast<uint32_t>(num_samples);
+  auto t_picks0 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
   std::vector<uint32_t> picks =
       ComputeRowPicks<IdType>(mat, rows, num_rows, fanout, select_all, replace);
+  auto t_picks1 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
 
   // nnz-balanced row partitions across all vector cores (spmm pattern).
   const uint32_t block_dim = QueryVectorCoreCountFused(ctx.device_id);
@@ -464,6 +469,10 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   ASCEND_CALL(aclrtFree(tiling_dev));
   ASCEND_CALL(aclrtFree(row_split_dev));
   ASCEND_CALL(aclrtFree(out_starts_dev));
+  auto t_kernel1 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
+  LOG(INFO) << "[fused-timing] picks="
+            << std::chrono::duration<double, std::milli>(t_picks1 - t_picks0)
+                   .count();
 
   // ADR-0014 A1 closure: scatter the compact (rid, pos) pairs into
   // seed_mapping on the host, then write the mapping back. The kernel is
@@ -479,6 +488,13 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
     }
   }
 
+  auto t_scatter1 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
+  LOG(INFO) << "[fused-timing] kernel+setup="
+            << std::chrono::duration<double, std::milli>(t_kernel1 - t_picks1)
+                   .count()
+            << " scatter="
+            << std::chrono::duration<double, std::milli>(t_scatter1 - t_kernel1)
+                   .count();
   return std::make_pair(
       CSRMatrix(num_rows, max_output, block_csr_indptr, picked_col, picked_idx),
       picked_coo_rows);
