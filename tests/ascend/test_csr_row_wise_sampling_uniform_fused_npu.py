@@ -475,8 +475,11 @@ def test_fused_exclude_edges():
     g_npu = _build_graph(5, EDGES_5, device)
     g_cpu = _build_graph(5, EDGES_5, cpu)
     nodes = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=device)
-    # Exclude every edge into node 0: (2,0) and (3,0).
-    excl = torch.tensor([6, 7], dtype=torch.int64, device=device)
+    # Exclude every edge into node 0: (2,0) and (3,0). Look the edge ids
+    # up instead of hardcoding — eid order follows the CSC construction
+    # and is easy to get wrong by hand.
+    excl = g_cpu.edge_ids(
+        torch.tensor([2, 3]), torch.tensor([0, 0])).to(device)
     sg_npu = _sample_fused(g_npu, nodes, -1, exclude_edges=excl)
     sg_cpu = _sample_fused(g_cpu, nodes.cpu(), -1,
                            exclude_edges=excl.cpu())
