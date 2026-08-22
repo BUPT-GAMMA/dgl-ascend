@@ -508,12 +508,16 @@ SampleNeighborsFused(
         mapping_host = mapping[lhs_node_type].CopyTo(cpu_ctx);
         indices_host = sampled_graphs[etype].indices.CopyTo(cpu_ctx);
       }
-      IdArray& mapping_ref =
-          on_npu ? mapping_host : mapping[lhs_node_type];
-      IdArray& indices_ref =
-          on_npu ? indices_host : sampled_graphs[etype].indices;
-      IdType* mapping_data_dst = mapping_ref.Ptr<IdType>();
-      IdType* cdata = indices_ref.Ptr<IdType>();
+      // Pointer indirection: `mapping` is const, so on the CPU path the
+      // element binds to a const NDArray — only the NPU host copies are
+      // mutable (they are written back after the parallel section).
+      IdArray* mapping_ref =
+          on_npu ? &mapping_host
+                 : const_cast<IdArray*>(&mapping[lhs_node_type]);
+      IdArray* indices_ref =
+          on_npu ? &indices_host : &sampled_graphs[etype].indices;
+      IdType* mapping_data_dst = mapping_ref->Ptr<IdType>();
+      IdType* cdata = indices_ref->Ptr<IdType>();
 #pragma omp parallel num_threads(num_threads_col)
       {
         const int thread_id = omp_get_thread_num();
@@ -571,6 +575,8 @@ SampleNeighborsFused(
         mapping_host.CopyTo(mapping[lhs_node_type]);
         indices_host.CopyTo(sampled_graphs[etype].indices);
       }
+      (void)mapping_ref;
+      (void)indices_ref;
     }
   }
 
