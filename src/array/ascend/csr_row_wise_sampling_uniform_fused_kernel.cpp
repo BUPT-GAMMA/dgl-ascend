@@ -160,13 +160,15 @@ class KernelCsrRowWiseSamplingUniformFused {
           rid >= 0 && rid < static_cast<IdT>(num_total_rows_);
       IdT off = 0;
       uint32_t deg = 0;
-      if (rid_valid) {
-        ReadIndptr(rid, &off, &deg);
-        if (map_seed_nodes_) {
-          pairs_local.SetValue(2 * pairs_staged, rid);
-          pairs_local.SetValue(2 * pairs_staged + 1, static_cast<IdT>(i));
-          ++pairs_staged;
-        }
+      if (rid_valid) ReadIndptr(rid, &off, &deg);
+      if (map_seed_nodes_) {
+        // One pair per row (invalid rids become sentinel pairs the host
+        // skips): pairs are a strict function of the row index, so each
+        // block writes its own contiguous slice [row_begin_, row_end_)
+        // with no cross-block offset bookkeeping.
+        pairs_local.SetValue(2 * pairs_staged, rid);
+        pairs_local.SetValue(2 * pairs_staged + 1, static_cast<IdT>(i));
+        ++pairs_staged;
       }
 
       uint32_t num_picks = 0;
@@ -454,13 +456,15 @@ class KernelCsrRowWiseSamplingUniformFused {
   }
 
   // Writes staged interleaved (rid, pos) pairs to the compact output
-  // array (contiguous run; host scatters them into seed_mapping).
+  // array. The destination is the block's own row range — pairs are a
+  // function of the row index, so no cross-block offset is needed.
   __aicore__ inline void FlushSeedPairs(LocalTensor<IdT>& staging,
                                         uint32_t count) {
     if (count == 0) return;
     const uint32_t copy_bytes = 2 * count * sizeof(IdT);
     DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
-    DataCopyPad(seed_pairs_gm_[2 * pairs_flushed_], staging, cp);
+    DataCopyPad(seed_pairs_gm_[2 * (row_begin_ + pairs_flushed_)], staging,
+                cp);
     pairs_flushed_ += count;
   }
 

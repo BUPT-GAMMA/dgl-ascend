@@ -197,11 +197,11 @@ void ScatterSeedMappingFromPairs(
   for (int64_t p = 0; p < pair_count; ++p) {
     const IdType rid = pairs[2 * p];
     const IdType pos = pairs[2 * p + 1];
-    // Kernel-side validation guarantees rid in [0, num_total_rows);
-    // clamp again here (defense in depth, rule: never trust the buffer).
-    if (rid >= 0 && rid < static_cast<IdType>(mapping_len)) {
-      mapping[rid] = pos;
-    }
+    // Invalid rows emit sentinel pairs (rid untouched, out of range);
+    // skip them and clamp valid rids (defense in depth: never trust the
+    // device buffer).
+    if (rid < 0 || rid >= static_cast<IdType>(mapping_len)) continue;
+    mapping[rid] = pos;
   }
   ASCEND_CALL(aclrtMemcpyAsync(
       seed_mapping->data, mapping_len * sizeof(IdType), mapping.data(),
