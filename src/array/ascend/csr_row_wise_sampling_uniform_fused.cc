@@ -445,18 +445,6 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   // seed_mapping on the host, then write the mapping back. The kernel is
   // already synchronized, so a plain D2H copy is safe.
   if (map_seed_nodes) {
-    // TODO(tmp-probe): remove before final review — dump seed_pairs.
-    {
-      std::vector<IdType> dbg(2 * num_rows, -99);
-      ASCEND_CALL(aclrtMemcpy(
-          dbg.data(), 2 * num_rows * sizeof(IdType), seed_pairs->data,
-          2 * num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
-      LOG(INFO) << "[fused-probe] map=" << map_seed_nodes
-                << " num_rows=" << num_rows << " pairs=";
-      for (int64_t i = 0; i < num_rows; ++i)
-        LOG(INFO) << "[fused-probe]   (" << dbg[2 * i] << "," << dbg[2 * i + 1]
-                  << ")";
-    }
     ScatterSeedMappingFromPairs<IdType>(seed_pairs, num_rows, seed_mapping,
                                         num_rows, stream);
     if (new_seed_nodes != nullptr) {

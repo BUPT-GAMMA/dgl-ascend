@@ -181,9 +181,6 @@ class KernelCsrRowWiseSamplingUniformFused {
         uint32_t state = seed_ ^ (i * kGoldenRatioHashFused +
                                   kGoldenRatioOffsetFused);
         if (state == 0) state = kRngFallbackSeedFused;
-        // TODO(tmp-probe): remove before final review.
-        AscendC::printf("[kprobe] blk=%u i=%u seed=%u state=%u picks=%u\n",
-                        block_idx_, i, seed_, state, num_picks);
         offset += SampleRow(out_start_ + offset, i, rid, off, deg,
                             num_picks, state);
       }
@@ -280,8 +277,6 @@ class KernelCsrRowWiseSamplingUniformFused {
     LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
     for (uint32_t j = 0; j < num_picks; ++j) {
       uint32_t local = picks.GetValue(j);
-      // TODO(tmp-probe): remove before final review.
-      AscendC::printf("[kprobe2] local=%u\n", local);
       out_r.SetValue(j, static_cast<IdT>(row_pos));  // row POSITION (fused)
       out_c.SetValue(j, win_idx.GetValue(local));
       out_e.SetValue(
