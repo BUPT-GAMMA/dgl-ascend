@@ -890,11 +890,9 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingFused(
 #ifdef DGL_USE_ASCEND
   if (rows->ctx.device_type == kDGLAscend) {
     if (IsNullArray(prob_or_mask)) {
-      ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType2, {
-        ret = impl::CSRRowWiseSamplingUniformFused<
-            kDGLAscend, IdType2, map_seed_nodes>(
-            mat, rows, seed_mapping, new_seed_nodes, num_samples, replace);
-      });
+      ret = impl::CSRRowWiseSamplingUniformFused<
+          kDGLAscend, IdType, map_seed_nodes>(
+          mat, rows, seed_mapping, new_seed_nodes, num_samples, replace);
     } else {
       CHECK_VALID_CONTEXT(prob_or_mask, rows);
       // Weighted fused sampling has no CUDA reference either; explicit
