@@ -762,7 +762,8 @@ HeteroSubgraph SampleNeighborsBiased(
         hg->GetRelationGraph(etype)->NumVertexTypes(),
         hg->NumVertices(src_vtype), hg->NumVertices(dst_vtype), hg->DataType(),
         hg->Context());
-    induced_edges = aten::NullArray();
+    induced_edges =
+        aten::NullArray(hg->DataType(), hg->Context());
   } else {
     // sample from one relation graph
     const auto req_fmt = (dir == EdgeDir::kOut) ? CSR_CODE : CSC_CODE;
