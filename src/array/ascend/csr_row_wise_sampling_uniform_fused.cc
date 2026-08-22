@@ -399,10 +399,11 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   IdArray picked_idx = aten::NewIdArray(max_output, ctx, nbits);
   IdArray block_csr_indptr = aten::NewIdArray(num_rows + 1, ctx, nbits);
   // Compact (rid, pos) pair array: one pair per valid row when mapping.
-  // When map_seed_nodes is false the kernel never touches it; a 1-element
+  // Interleaved (rid, pos) pairs: TWO elements per row. When
+  // map_seed_nodes is false the kernel never touches it; a 1-element
   // dummy keeps the GlobalTensor binding safe (ADR-0014).
   const int64_t pair_count = map_seed_nodes ? num_rows : 1;
-  IdArray seed_pairs = aten::NewIdArray(pair_count, ctx, nbits);
+  IdArray seed_pairs = aten::NewIdArray(2 * pair_count, ctx, nbits);
 
   if (max_output == 0) {
     return ZeroOutputResult(
@@ -425,7 +426,7 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
   ASCEND_CALL(aclrtMemsetAsync(
       block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream));
-  const int64_t pairs_bytes = pair_count * (nbits / 8);
+  const int64_t pairs_bytes = 2 * pair_count * (nbits / 8);
   ASCEND_CALL(
       aclrtMemsetAsync(seed_pairs->data, pairs_bytes, 0, pairs_bytes, stream));
 
