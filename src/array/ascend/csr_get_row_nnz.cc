@@ -34,20 +34,6 @@ namespace dgl {
 namespace aten {
 namespace impl {
 
-#ifdef DGL_USE_ASCEND
-namespace {
-// Vector-core count at runtime (falls back to the 910B-family default
-// when the query is unavailable); AIV counts differ across SoCs.
-uint32_t QueryVectorCoreCountLocal(int device_id) {
-  int64_t core_num = 0;
-  aclError err =
-      aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &core_num);
-  if (err != ACL_SUCCESS || core_num <= 0 || core_num > 4096) return 40;
-  return static_cast<uint32_t>(core_num);
-}
-}  // namespace
-#endif  // DGL_USE_ASCEND
-
 template <DGLDeviceType XPU, typename IdType>
 int64_t CSRGetRowNNZ(CSRMatrix csr, int64_t row) {
   if (row >= csr.num_rows) return 0;
@@ -83,12 +69,7 @@ NDArray CSRGetRowNNZ(CSRMatrix csr, NDArray rows) {
 
   uint32_t n = static_cast<uint32_t>(len);
   uint32_t orig_rows = static_cast<uint32_t>(csr.num_rows);
-  // The kernel already partitions work across blocks (GetBlockNum
-  // chunks); launching on one core serialized a 100k-row gather behind
-  // a single vector core. Cap the block count by the row count so tiny
-  // requests do not spin up idle blocks.
-  uint32_t block_dim = QueryVectorCoreCountLocal(ctx.device_id);
-  if (block_dim > n) block_dim = n;
+  uint32_t block_dim = 1;
   uint32_t tiling_data[2] = {n, orig_rows};
   void* tiling_dev = nullptr;
   ASCEND_CALL(aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
