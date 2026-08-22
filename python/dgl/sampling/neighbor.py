@@ -612,6 +612,11 @@ def _sample_neighbors(
                 "Only PyTorch backend and cpu/npu is supported in fused "
                 "sampling"
             )
+        if F.device_type(g.device) == "npu" and prob is not None:
+            raise DGLError(
+                "Weighted fused sampling (prob/mask) is not supported on "
+                "NPU yet"
+            )
 
         if mapping is None:
             mapping = {}
