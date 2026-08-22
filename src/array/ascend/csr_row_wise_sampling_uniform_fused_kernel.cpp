@@ -209,9 +209,10 @@ class KernelCsrRowWiseSamplingUniformFused {
     const uint32_t local = i - row_begin_;
     if (rows_valid_ == 0 || local >= rows_base_ + rows_valid_) {
       rows_base_ = local;
-      const uint32_t count = (row_end_ - i) < meta_rows_ ? (row_end_ - i)
-                                                         : meta_rows_;
-      DataCopyExtParams cp{1, count * sizeof(IdT), 0, 0, 0};
+      const uint32_t avail = static_cast<uint32_t>(row_end_ - i);
+      const uint32_t count = avail < meta_rows_ ? avail : meta_rows_;
+      const uint32_t copy_bytes = count * sizeof(IdT);
+      DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
       DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
       LocalTensor<IdT> buf = rows_buf_.Get<IdT>();
       DataCopyPad(buf, rows_gm_[i], cp, pad);
@@ -228,11 +229,11 @@ class KernelCsrRowWiseSamplingUniformFused {
     if (indptr_valid_ == 0 || r < indptr_base_ ||
         (r + 1) >= indptr_base_ + indptr_valid_) {
       indptr_base_ = r;
+      const uint32_t avail = static_cast<uint32_t>(num_total_rows_ + 1 - r);
       const uint32_t count =
-          (num_total_rows_ + 1 - r) < (meta_rows_ + 1)
-              ? (num_total_rows_ + 1 - r)
-              : (meta_rows_ + 1);
-      DataCopyExtParams cp{1, count * sizeof(IdT), 0, 0, 0};
+          avail < (meta_rows_ + 1) ? avail : (meta_rows_ + 1);
+      const uint32_t copy_bytes = count * sizeof(IdT);
+      DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
       DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
       LocalTensor<IdT> buf = indptr_buf_.Get<IdT>();
       DataCopyPad(buf, indptr_gm_[r], cp, pad);
@@ -356,7 +357,7 @@ class KernelCsrRowWiseSamplingUniformFused {
                                    ? (deg - base)
                                    : window_elems_;
         const uint32_t got = EmitWindow(
-            out_pos, row_pos, off, base, chunk, picks, num_picks, true);
+            out_pos, row_pos, off, base, chunk, &picks, num_picks, true);
         emitted += got;
         out_pos += got;
       }
@@ -385,7 +386,7 @@ class KernelCsrRowWiseSamplingUniformFused {
                                  ? (deg - base)
                                  : window_elems_;
       const uint32_t got = EmitWindow(
-          out_pos, row_pos, off, base, chunk, picks, num_picks, false);
+          out_pos, row_pos, off, base, chunk, &picks, num_picks, false);
       emitted += got;
       out_pos += got;
     }
@@ -473,9 +474,9 @@ class KernelCsrRowWiseSamplingUniformFused {
   __aicore__ inline void FlushOutPtr(LocalTensor<IdT>& staging,
                                      uint32_t count) {
     if (count == 0) return;
-    DataCopyExtParams cp{1, count * sizeof(IdT), 0, 0, 0};
-    DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
-    DataCopyPad(out_ptr_gm_[row_begin_ + out_ptr_flushed_], staging, cp, pad);
+    const uint32_t copy_bytes = count * sizeof(IdT);
+    DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
+    DataCopyPad(out_ptr_gm_[row_begin_ + out_ptr_flushed_], staging, cp);
     out_ptr_flushed_ += count;
   }
 
@@ -484,10 +485,9 @@ class KernelCsrRowWiseSamplingUniformFused {
   __aicore__ inline void FlushSeedPairs(LocalTensor<IdT>& staging,
                                         uint32_t count) {
     if (count == 0) return;
-    DataCopyExtParams cp{1, 2 * count * sizeof(IdT), 0, 0, 0};
-    DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
-    DataCopyPad(
-        seed_pairs_gm_[2 * pairs_flushed_], staging, cp, pad);
+    const uint32_t copy_bytes = 2 * count * sizeof(IdT);
+    DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
+    DataCopyPad(seed_pairs_gm_[2 * pairs_flushed_], staging, cp);
     pairs_flushed_ += count;
   }
 
