@@ -949,6 +949,19 @@ COOMatrix CSRRowWisePerEtypeSampling(
 COOMatrix CSRRowWiseTopk(
     CSRMatrix mat, IdArray rows, int64_t k, NDArray weight, bool ascending) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.indptr->ctx.device_type == kDGLAscend) {
+    CHECK_VALID_CONTEXT(weight, rows);
+    // The AscendC sort network is float-only; the launcher normalizes
+    // int32/int64/float64 weights to float32 (min-offset shift) before
+    // launching the kernel.
+    ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+      ret = impl::CSRRowWiseTopk<kDGLAscend, IdType, float>(
+          mat, rows, k, weight, ascending);
+    });
+    return ret;
+  }
+#endif  // DGL_USE_ASCEND
   ATEN_CSR_SWITCH(mat, XPU, IdType, "CSRRowWiseTopk", {
     ATEN_DTYPE_SWITCH(weight->dtype, DType, "weight", {
       ret = impl::CSRRowWiseTopk<XPU, IdType, DType>(

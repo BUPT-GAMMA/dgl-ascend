@@ -976,7 +976,8 @@ def select_topk(
                 "Must specify node type when the graph is not homogeneous."
             )
         nodes = {g.ntypes[0]: nodes}
-    assert g.device == F.cpu(), "Graph must be on CPU."
+    if F.device_type(g.device) == "cuda":
+        raise DGLError("select_topk with CUDA graphs is not supported yet.")
 
     # Parse nodes into a list of NDArrays.
     nodes = utils.prepare_tensor_dict(g, nodes, "nodes")
