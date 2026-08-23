@@ -887,6 +887,23 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingFused(
     std::vector<IdType>* new_seed_nodes, int64_t num_samples,
     NDArray prob_or_mask, bool replace) {
   std::pair<CSRMatrix, IdArray> ret;
+#ifdef DGL_USE_ASCEND
+  if (rows->ctx.device_type == kDGLAscend) {
+    if (IsNullArray(prob_or_mask)) {
+      ret = impl::CSRRowWiseSamplingUniformFused<
+          kDGLAscend, IdType, map_seed_nodes>(
+          mat, rows, seed_mapping, new_seed_nodes, num_samples, replace);
+    } else {
+      CHECK_VALID_CONTEXT(prob_or_mask, rows);
+      // Weighted fused sampling has no CUDA reference either; explicit
+      // named gap on NPU (see the fused operator docs in the process
+      // repository). CHECK raises a catchable DGL error; LOG(FATAL)
+      // would abort the process out from under Python.
+      CHECK(false) << "Weighted fused sampling (prob/mask) is not supported "
+                      "on NPU yet";
+    }
+  } else
+#endif  // DGL_USE_ASCEND
   if (IsNullArray(prob_or_mask)) {
     ATEN_XPU_SWITCH(
         rows->ctx.device_type, XPU, "CSRRowWiseSamplingUniformFused", {
@@ -975,6 +992,18 @@ COOMatrix CSRRowWiseSamplingBiased(
     CSRMatrix mat, IdArray rows, int64_t num_samples, NDArray tag_offset,
     FloatArray bias, bool replace) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.indptr->ctx.device_type == kDGLAscend) {
+    // The AscendC biased kernel operates in float32 (double is forbidden
+    // in __aicore__). The launcher normalizes float64 bias to float32 on
+    // the host side; the sampling itself runs natively on the NPU kernel.
+    ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+      ret = impl::CSRRowWiseSamplingBiased<kDGLAscend, IdType, float>(
+          mat, rows, num_samples, tag_offset, bias, replace);
+    });
+    return ret;
+  }
+#endif  // DGL_USE_ASCEND
   ATEN_CSR_SWITCH(mat, XPU, IdType, "CSRRowWiseSamplingBiased", {
     ATEN_FLOAT_TYPE_SWITCH(bias->dtype, FloatType, "bias", {
       ret = impl::CSRRowWiseSamplingBiased<XPU, IdType, FloatType>(
