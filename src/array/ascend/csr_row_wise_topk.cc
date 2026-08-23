@@ -4,7 +4,7 @@
  * @brief Ascend host launcher for CSR row-wise topk.
  *
  * Multi-core (v2 sampling skeleton): the host computes per-row pick counts
- * from row degrees (one CSRGetRowNNZ launch + one D2H copy — pick counts
+ * from row degrees in one fused pass fed by a bulk indptr D2H (pick counts
  * depend only on k and degree, never on weights), builds nnz-balanced
  * row-range partitions plus per-block output offsets as prefix sums,
  * allocates the output exactly, and launches the AIV kernel. Blocks write
@@ -140,11 +140,10 @@ std::vector<uint32_t> BuildBalancedPartitions(
   return boundaries;
 }
 
-// Uploads a host uint32 table to device memory on the launch stream.
-// The stream is synchronized BEFORE the caller's stack buffers go out of
-// scope: an async copy only captures the source pointer, so returning
-// without a sync would upload stack garbage (spmm precedes its cached
-// uploads with the same sync).
+// Enqueues an async H2D of a host uint32 table on the launch stream.
+// Callers batch several uploads and synchronize ONCE before the stack
+// buffers go out of scope (UploadSync): an async copy only captures the
+// source pointer, so the sync must happen before the owning frame returns.
 void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
   void* dev = nullptr;
   ASCEND_CALL(aclrtMalloc(
@@ -152,7 +151,6 @@ void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
   ASCEND_CALL(aclrtMemcpyAsync(
       dev, host.size() * sizeof(uint32_t), host.data(),
       host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
   return dev;
 }
 
@@ -227,17 +225,34 @@ COOMatrix CSRRowWiseTopk(
         mat.num_rows, mat.num_cols, empty_row, empty_row, empty_row);
   }
 
-  // Per-row pick counts depend only on k and degree — one CSRGetRowNNZ
-  // launch plus a D2H copy gives the host exact output sizing.
-  NDArray deg = CSRGetRowNNZ<kDGLAscend, IdType>(mat, rows);
-  std::vector<IdType> deg_host(num_rows);
+  // Per-row pick counts depend only on k and degree. Degrees are two
+  // adjacent indptr reads, so one bulk D2H of indptr feeding a single
+  // fused host pass (rows copy -> degree -> picks -> prefix) replaces the
+  // old single-core CSRGetRowNNZ launch + separate D2H + multiple O(n)
+  // loops — on a 1M-row graph that kernel alone cost 45 ms (D6).
+  const int64_t indptr_len = mat.indptr->shape[0];
+  std::vector<IdType> indptr_host(indptr_len);
   ASCEND_CALL(aclrtMemcpy(
-      deg_host.data(), num_rows * sizeof(IdType), deg->data,
+      indptr_host.data(), indptr_len * sizeof(IdType), mat.indptr->data,
+      indptr_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+  std::vector<IdType> rows_host(num_rows);
+  ASCEND_CALL(aclrtMemcpy(
+      rows_host.data(), num_rows * sizeof(IdType), rows->data,
       num_rows * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+
+  // Single fused pass: degree, picks, and prefix together.
   std::vector<uint32_t> picks(num_rows);
+  std::vector<uint32_t> prefix(num_rows + 1, 0);
+  const uint32_t k32 = select_all ? 0u : static_cast<uint32_t>(k);
   for (int64_t i = 0; i < num_rows; ++i) {
-    const uint32_t d = static_cast<uint32_t>(deg_host[i]);
-    picks[i] = select_all ? d : std::min(static_cast<uint32_t>(k), d);
+    const IdType r = rows_host[i];
+    uint32_t d = 0;
+    if (r >= 0 && static_cast<int64_t>(r) + 1 < indptr_len) {
+      d = static_cast<uint32_t>(
+          indptr_host[static_cast<int64_t>(r) + 1] - indptr_host[r]);
+    }
+    picks[i] = select_all ? d : std::min(k32, d);
+    prefix[i + 1] = prefix[i] + picks[i];
   }
 
   // nnz-balanced row partitions across all vector cores (spmm pattern).
@@ -247,12 +262,8 @@ COOMatrix CSRRowWiseTopk(
 
   // Per-block output offsets as prefix sums of picks over row ranges.
   std::vector<uint32_t> out_starts(block_dim + 1, 0);
-  {
-    std::vector<uint32_t> prefix(num_rows + 1, 0);
-    for (int64_t i = 0; i < num_rows; ++i) prefix[i + 1] = prefix[i] + picks[i];
-    for (uint32_t b = 0; b <= block_dim; ++b)
-      out_starts[b] = prefix[row_split[b]];
-  }
+  for (uint32_t b = 0; b <= block_dim; ++b)
+    out_starts[b] = prefix[row_split[b]];
   const int64_t max_output = out_starts[block_dim];
   CHECK(max_output <= static_cast<int64_t>(std::numeric_limits<IdType>::max()))
       << "Output size " << max_output << " exceeds IdType range";
@@ -313,11 +324,10 @@ COOMatrix CSRRowWiseTopk(
   ASCEND_CALL(aclrtMemcpyAsync(
       tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
       ACL_MEMCPY_HOST_TO_DEVICE, stream));
-  // tiling_data is a stack array: wait for the copy to land before the
-  // frame that owns it returns.
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
   void* row_split_dev = UploadHostUInt32(row_split, stream);
   void* out_starts_dev = UploadHostUInt32(out_starts, stream);
+  // All three async uploads capture stack vectors: one sync covers them
+  // before this frame returns (D6 — previously three separate syncs).
 
   if (std::is_same<IdType, int32_t>::value) {
     aclError err = aclrtlaunch_csr_row_wise_topk_int32(
