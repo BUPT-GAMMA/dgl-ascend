@@ -33,6 +33,20 @@
 
 #include "../array_op.h"
 
+// The large-row fallback calls the CPU reference implementation. Its
+// template is only declared in array_op.h; the int32/int64 kDGLCPU
+// instantiations live in src/array/cpu/spmat_op_impl_coo.cc, so declare
+// them extern to link against those symbols instead of instantiating
+// the (undefined) template body here.
+namespace dgl {
+namespace aten {
+namespace impl {
+extern template CSRMatrix COOToCSR<kDGLCPU, int32_t>(COOMatrix coo);
+extern template CSRMatrix COOToCSR<kDGLCPU, int64_t>(COOMatrix coo);
+}  // namespace impl
+}  // namespace aten
+}  // namespace dgl
+
 #ifdef DGL_USE_ASCEND
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
@@ -131,6 +145,13 @@ struct CooToCsrCacheValue {
 // LRU byte budget for entries whose inputs are otherwise dead. The
 // budget is deliberately modest relative to HBM (2GB on 64GB parts).
 constexpr uint64_t kCacheBudgetBytes = 2ULL << 30;
+
+// Row-count threshold above which the conversion routes to the CPU
+// reference implementation. The counting-sort kernels rescan the whole
+// edge array once per row band (~47k rows/band on a 192KB-UB part);
+// past ~1M rows the band multiplication outweighs the NPU advantage
+// (multi-scale matrix, 910B3: NPU wins through 1M rows, loses by 10M).
+constexpr int64_t kNpuRowCountLimit = 1'000'000;
 
 uint64_t NextCacheClock() {
   static std::atomic<uint64_t> clock{1};
@@ -386,12 +407,45 @@ void CountAllBands(
   }
 }
 
+// CPU fallback for graphs with row counts beyond the counting-sort
+// kernels' sweet spot (see kNpuRowCountLimit): copy the COO to host,
+// run the reference CPU implementation, copy the CSR back.
+template <typename IdType>
+CSRMatrix COOToCSRViaCpu(const COOMatrix& coo) {
+  const DGLContext ctx = coo.row->ctx;
+  const DGLContext cpu_ctx = DGLContext{kDGLCPU, 0};
+  COOMatrix coo_cpu = coo;
+  coo_cpu.row = coo.row.CopyTo(cpu_ctx);
+  coo_cpu.col = coo.col.CopyTo(cpu_ctx);
+  if (aten::COOHasData(coo)) coo_cpu.data = coo.data.CopyTo(cpu_ctx);
+  coo_cpu.is_pinned = false;
+  const CSRMatrix csr_cpu = impl::COOToCSR<kDGLCPU, IdType>(coo_cpu);
+  CSRMatrix csr = csr_cpu;
+  csr.indptr = csr_cpu.indptr.CopyTo(ctx);
+  csr.indices = csr_cpu.indices.CopyTo(ctx);
+  csr.data = csr_cpu.data.CopyTo(ctx);
+  return csr;
+}
+
 template <typename IdType>
 CSRMatrix COOToCSRCountingSort(const COOMatrix& coo) {
   const DGLContext ctx = coo.row->ctx;
   const int64_t nnz = coo.row->shape[0];
   const int64_t num_rows = coo.num_rows;
   CHECK_NO_OVERFLOW(coo.row->dtype, nnz);
+
+  // Large-row fallback. The counting-sort kernels iterate once per row
+  // band over the whole edge array; with num_rows beyond ~1M the band
+  // count (num_rows / ~47k) multiplies the scan work until the scalar
+  // histogram pass is slower than the CPU reference (measured: 10M rows /
+  // 50M edges took 310s on NPU vs 133s on the old CPU path — a true-cold
+  // regression hidden until the multi-scale matrix ran with fresh tensors
+  // per rep). A2 has no vector-scatter-atomic API to vectorize the
+  // histogram (SetAtomicAdd only sums contiguous DataCopy segments), so
+  // the honest fix is routing giant graphs to the CPU implementation.
+  if (num_rows > kNpuRowCountLimit) {
+    return COOToCSRViaCpu<IdType>(coo);
+  }
 
   const uint32_t block_dim = QueryVectorCoreCount(ctx.device_id);
   const uint32_t ub_available = QueryUbAvailableBytes(ctx.device_id);
