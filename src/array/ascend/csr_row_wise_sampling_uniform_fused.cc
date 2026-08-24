@@ -200,21 +200,45 @@ std::pair<CSRMatrix, IdArray> EmptyResult(
       CSRMatrix(num_rows, 0, block_csr_indptr, empty, empty), empty);
 }
 
-// Uploads a host uint32 table to device memory on the launch stream.
-// The stream is synchronized BEFORE the caller's stack buffers go out of
-// scope: an async copy only captures the source pointer, so returning
-// without a sync would upload stack garbage (spmm precedes its cached
-// uploads with the same sync).
-void* UploadHostUInt32Fused(
-    const std::vector<uint32_t>& host, aclrtStream stream) {
+// Packs the three launch tables (tiling header + row_split + out_starts)
+// into ONE device buffer and uploads it in one shot. The tables are
+// consumed through typed __gm__ pointers at fixed offsets, so their
+// device addresses are (base, base+tiling_words, base+tiling+split).
+// One malloc + one copy + one sync replaces three of each — the sync
+// chain dominated the launcher profile (host-bound, not kernel-bound).
+struct PackedLaunchTables {
   void* dev = nullptr;
-  ASCEND_CALL(aclrtMalloc(
-      &dev, host.size() * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+  size_t bytes = 0;
+  void* tiling_ptr = nullptr;
+  void* row_split_ptr = nullptr;
+  void* out_starts_ptr = nullptr;
+};
+
+PackedLaunchTables UploadLaunchTablesFused(
+    const uint32_t* tiling_data, size_t tiling_words,
+    const std::vector<uint32_t>& row_split,
+    const std::vector<uint32_t>& out_starts, aclrtStream stream) {
+  PackedLaunchTables t;
+  const size_t split_words = row_split.size();
+  const size_t starts_words = out_starts.size();
+  t.bytes = (tiling_words + split_words + starts_words) * sizeof(uint32_t);
+  std::vector<uint32_t> packed;
+  packed.reserve(tiling_words + split_words + starts_words);
+  packed.insert(packed.end(), tiling_data, tiling_data + tiling_words);
+  packed.insert(packed.end(), row_split.begin(), row_split.end());
+  packed.insert(packed.end(), out_starts.begin(), out_starts.end());
+  ASCEND_CALL(aclrtMalloc(&t.dev, t.bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+  // packed lives on this frame; sync before returning so the async copy
+  // never reads dead stack memory (queue-discipline rule).
   ASCEND_CALL(aclrtMemcpyAsync(
-      dev, host.size() * sizeof(uint32_t), host.data(),
-      host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
+      t.dev, t.bytes, packed.data(), t.bytes, ACL_MEMCPY_HOST_TO_DEVICE,
+      stream));
   ASCEND_CALL(aclrtSynchronizeStream(stream));
-  return dev;
+  t.tiling_ptr = t.dev;
+  t.row_split_ptr = static_cast<char*>(t.dev) + tiling_words * sizeof(uint32_t);
+  t.out_starts_ptr = static_cast<char*>(t.dev) +
+                     (tiling_words + split_words) * sizeof(uint32_t);
+  return t;
 }
 
 }  // namespace
@@ -239,18 +263,25 @@ void ScatterSeedMappingFromPairs(
   CHECK(mapping_len >= num_rows)
       << "seed_mapping length " << mapping_len
       << " is smaller than the row count " << num_rows;
-  // Synchronous D2H copies: async D2H into pageable host memory is not
-  // reliably visible on this stack (async + sync is only the proven
-  // pattern for H2D uploads), and the pipelined variant corrupted the
-  // mapping — reverted after a real-machine regression.
-  std::vector<IdType> pairs(2 * pair_count);
-  ASCEND_CALL(aclrtMemcpy(
-      pairs.data(), 2 * pair_count * sizeof(IdType), seed_pairs->data,
-      2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
-  std::vector<IdType> mapping(mapping_len);
-  ASCEND_CALL(aclrtMemcpy(
-      mapping.data(), mapping_len * sizeof(IdType), seed_mapping->data,
-      mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST));
+  // PINNED staging + async D2H under one sync. The earlier pipelined
+  // attempt failed because std::vector is pageable host memory — async
+  // D2H into pageable buffers is not reliably visible on this stack.
+  // Pinned memory (aclrtMallocHost) is the DMA-safe counterpart and lets
+  // both downloads share a single stream sync (two synchronous
+  // round-trips serialized twice the latency).
+  void* pairs_pinned = nullptr;
+  void* mapping_pinned = nullptr;
+  ASCEND_CALL(aclrtMallocHost(&pairs_pinned, 2 * pair_count * sizeof(IdType)));
+  ASCEND_CALL(aclrtMallocHost(&mapping_pinned, mapping_len * sizeof(IdType)));
+  ASCEND_CALL(aclrtMemcpyAsync(
+      pairs_pinned, 2 * pair_count * sizeof(IdType), seed_pairs->data,
+      2 * pair_count * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST, stream));
+  ASCEND_CALL(aclrtMemcpyAsync(
+      mapping_pinned, mapping_len * sizeof(IdType), seed_mapping->data,
+      mapping_len * sizeof(IdType), ACL_MEMCPY_DEVICE_TO_HOST, stream));
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  IdType* pairs = static_cast<IdType*>(pairs_pinned);
+  IdType* mapping = static_cast<IdType*>(mapping_pinned);
   for (int64_t p = 0; p < pair_count; ++p) {
     const IdType rid = pairs[2 * p];
     const IdType pos = pairs[2 * p + 1];
@@ -261,11 +292,13 @@ void ScatterSeedMappingFromPairs(
     mapping[rid] = pos;
   }
   ASCEND_CALL(aclrtMemcpyAsync(
-      seed_mapping->data, mapping_len * sizeof(IdType), mapping.data(),
+      seed_mapping->data, mapping_len * sizeof(IdType), mapping_pinned,
       mapping_len * sizeof(IdType), ACL_MEMCPY_HOST_TO_DEVICE, stream));
-  // Stack buffers back this async copy: sync before returning so the
-  // source outlives the transfer (queue-discipline rule).
+  // Pinned buffers are freed below only after this sync — the transfer
+  // source must outlive the copy (queue-discipline rule).
   ASCEND_CALL(aclrtSynchronizeStream(stream));
+  ASCEND_CALL(aclrtFreeHost(pairs_pinned));
+  ASCEND_CALL(aclrtFreeHost(mapping_pinned));
 }
 
 // Zero-output path: the kernel did not run, but valid rows still need
@@ -377,9 +410,8 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   // the training workloads this operator serves.
   if (replace) {
     const uint32_t ub_available = QueryUbAvailableBytesFused(ctx.device_id);
-    const uint32_t window_elems =
-        (ub_available - kMetaUbReserveFused) / kWindowInstancesFused /
-        sizeof(IdType);
+    const uint32_t window_elems = (ub_available - kMetaUbReserveFused) /
+                                  kWindowInstancesFused / sizeof(IdType);
     CHECK(fanout <= window_elems)
         << "fused sampling fanout " << fanout
         << " exceeds the per-core window of " << window_elems
@@ -452,40 +484,31 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   ASCEND_CALL(
       aclrtMemsetAsync(seed_pairs->data, pairs_bytes, 0, pairs_bytes, stream));
 
-  void* tiling_dev = nullptr;
-  ASCEND_CALL(
-      aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
-  ASCEND_CALL(aclrtMemcpyAsync(
-      tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
-      ACL_MEMCPY_HOST_TO_DEVICE, stream));
-  // tiling_data is a stack array: wait for the copy to land before the
-  // frame that owns it returns.
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
-  void* row_split_dev = UploadHostUInt32Fused(row_split, stream);
-  void* out_starts_dev = UploadHostUInt32Fused(out_starts, stream);
+  // One packed upload replaces three malloc+copy+sync round-trips (the
+  // sync chain dominated the host-side profile; the kernels are fine).
+  const PackedLaunchTables tables = UploadLaunchTablesFused(
+      tiling_data, kTilingHeaderWordsFused, row_split, out_starts, stream);
 
   if (std::is_same<IdType, int32_t>::value) {
     aclError err = aclrtlaunch_csr_row_wise_sampling_uniform_fused_int32(
         block_dim, stream, mat.indptr->data, mat.indices->data, data_ptr,
         rows->data, block_csr_indptr->data, picked_coo_rows->data,
-        picked_col->data, picked_idx->data, seed_pairs->data, row_split_dev,
-        out_starts_dev, tiling_dev);
+        picked_col->data, picked_idx->data, seed_pairs->data,
+        tables.row_split_ptr, tables.out_starts_ptr, tables.tiling_ptr);
     CHECK(err == ACL_SUCCESS)
         << "csr_row_wise_sampling_uniform_fused_int32 launch failed: " << err;
   } else {
     aclError err = aclrtlaunch_csr_row_wise_sampling_uniform_fused_int64(
         block_dim, stream, mat.indptr->data, mat.indices->data, data_ptr,
         rows->data, block_csr_indptr->data, picked_coo_rows->data,
-        picked_col->data, picked_idx->data, seed_pairs->data, row_split_dev,
-        out_starts_dev, tiling_dev);
+        picked_col->data, picked_idx->data, seed_pairs->data,
+        tables.row_split_ptr, tables.out_starts_ptr, tables.tiling_ptr);
     CHECK(err == ACL_SUCCESS)
         << "csr_row_wise_sampling_uniform_fused_int64 launch failed: " << err;
   }
 
   ASCEND_CALL(aclrtSynchronizeStream(stream));
-  ASCEND_CALL(aclrtFree(tiling_dev));
-  ASCEND_CALL(aclrtFree(row_split_dev));
-  ASCEND_CALL(aclrtFree(out_starts_dev));
+  ASCEND_CALL(aclrtFree(tables.dev));
 
   // ADR-0014 A1 closure: scatter the compact (rid, pos) pairs into
   // seed_mapping on the host, then write the mapping back. The kernel is
