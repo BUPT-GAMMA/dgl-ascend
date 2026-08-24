@@ -250,15 +250,17 @@ class KernelCsrRowWiseTopk {
       const IdT eid = has_data_ ? data_gm_.GetValue(off + static_cast<IdT>(j))
                                 : static_cast<IdT>(off + j);
       const float w = weight_gm_.GetValue(static_cast<uint32_t>(eid));
+      const bool evict =
+          ascending_ ? (w < heap_val.GetValue(0)) : (w > heap_val.GetValue(0));
       if (size < capacity) {
         heap_val.SetValue(size, w);
         heap_idx.SetValue(size, j);
-        SiftUp(heap_val, heap_idx, size);
+        SiftUp(heap_val, heap_idx, size, ascending_);
         ++size;
-      } else if (w > heap_val.GetValue(0)) {
+      } else if (evict) {
         heap_val.SetValue(0, w);
         heap_idx.SetValue(0, j);
-        SiftDown(heap_val, heap_idx, 0, size);
+        SiftDown(heap_val, heap_idx, 0, size, ascending_);
       }
     }
     // Emit in descending order: repeatedly pop the boundary.
@@ -271,9 +273,9 @@ class KernelCsrRowWiseTopk {
       --size;
       heap_val.SetValue(0, heap_val.GetValue(size));
       heap_idx.SetValue(0, heap_idx.GetValue(size));
-      SiftDown(heap_val, heap_idx, 0, size);
-      // Pops come out weakest-first: ascending ranks forward, descending
-      // ranks from the tail.
+      SiftDown(heap_val, heap_idx, 0, size, ascending_);
+      // Max-heap pops come out strongest-first (ascending rows rank
+      // forward); min-heap pops weakest-first (descending from the tail).
       const uint32_t rank = ascending_ ? j : total - 1 - j;
       const IdT eid = has_data_
                           ? data_gm_.GetValue(off + static_cast<IdT>(local))
@@ -288,14 +290,26 @@ class KernelCsrRowWiseTopk {
     return num_picks;
   }
 
-  // Min-heap over the kept entries: the root holds the weakest value, so
-  // the first candidate to evict is always the weakest kept edge.
+  // Boundary heap over the kept entries. Descending rows keep the k
+  // largest as a min-heap (root = weakest kept); ascending rows keep the
+  // k smallest as a max-heap (root = strongest kept).
+  __aicore__ inline bool HeapOrdered(
+      float parent, float child, bool max_heap) {
+    return max_heap ? (parent >= child) : (parent <= child);
+  }
+
+  __aicore__ inline bool HeapChildBetter(
+      float child, float best, bool max_heap) {
+    return max_heap ? (child > best) : (child < best);
+  }
+
   __aicore__ inline void SiftUp(
-      LocalTensor<float>& val, LocalTensor<uint32_t>& idx, uint32_t start) {
+      LocalTensor<float>& val, LocalTensor<uint32_t>& idx, uint32_t start,
+      bool max_heap) {
     uint32_t i = start;
     while (i > 0) {
       const uint32_t parent = (i - 1) / 2;
-      if (val.GetValue(parent) <= val.GetValue(i)) break;
+      if (HeapOrdered(val.GetValue(parent), val.GetValue(i), max_heap)) break;
       Swap(val, idx, parent, i);
       i = parent;
     }
@@ -303,19 +317,21 @@ class KernelCsrRowWiseTopk {
 
   __aicore__ inline void SiftDown(
       LocalTensor<float>& val, LocalTensor<uint32_t>& idx, uint32_t start,
-      uint32_t size) {
+      uint32_t size, bool max_heap) {
     uint32_t i = start;
     while (true) {
       const uint32_t left = 2 * i + 1;
       const uint32_t right = 2 * i + 2;
-      uint32_t weakest = i;
-      if (left < size && val.GetValue(left) < val.GetValue(weakest))
-        weakest = left;
-      if (right < size && val.GetValue(right) < val.GetValue(weakest))
-        weakest = right;
-      if (weakest == i) break;
-      Swap(val, idx, i, weakest);
-      i = weakest;
+      uint32_t best = i;
+      if (left < size &&
+          HeapChildBetter(val.GetValue(left), val.GetValue(best), max_heap))
+        best = left;
+      if (right < size &&
+          HeapChildBetter(val.GetValue(right), val.GetValue(best), max_heap))
+        best = right;
+      if (best == i) break;
+      Swap(val, idx, i, best);
+      i = best;
     }
   }
 
