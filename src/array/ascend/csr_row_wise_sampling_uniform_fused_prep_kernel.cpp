@@ -78,16 +78,11 @@ class KernelFusedPrep {
     uint32_t split_idx = 0;  // rows consumed by resolved boundaries
     split_local.SetValue(0, 0);
 
-    // TODO(tmp-probe): remove — dump the first few degrees/picks.
-    for (uint32_t q = 0; q < 5 && q < num_rows_; ++q) {
-      AscendC::printf("[prep-probe] deg[%u]=%u\n", q,
-                      (uint32_t)deg_gm_.GetValue(q));
-    }
     uint32_t row = 0;
     while (row < num_rows_) {
       const uint32_t avail = num_rows_ - row;
       const uint32_t count = avail < kPrepWindow ? avail : kPrepWindow;
-      const uint32_t copy_bytes = count * sizeof(uint32_t);
+      const uint32_t copy_bytes = count * sizeof(DegT);
       DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
       DataCopyPadExtParams<DegT> pad{false, 0, 0, 0};
       LocalTensor<DegT> deg_win = win_buf_.AllocTensor<DegT>();
@@ -182,10 +177,6 @@ class KernelFusedPrep {
     }
     starts_local.SetValue(block_dim_, static_cast<uint32_t>(run3));
 
-    // TODO(tmp-probe): remove — dump the final tables.
-    AscendC::printf("[prep-probe] total=%u out_starts[bd]=%u split1=%u\n",
-                    (uint32_t)prefix, starts_local.GetValue(block_dim_),
-                    split_local.GetValue(1));
     {
       const uint32_t bytes = (block_dim_ + 1) * sizeof(uint32_t);
       DataCopyExtParams cp1{1, bytes, 0, 0, 0};
