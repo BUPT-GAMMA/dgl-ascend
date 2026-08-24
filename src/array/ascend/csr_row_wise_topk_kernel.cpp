@@ -102,10 +102,18 @@ class KernelCsrRowWiseTopk {
       const uint32_t deg = static_cast<uint32_t>(end - off);
       const uint32_t num_picks = select_all_ ? deg : (deg < k_ ? deg : k_);
       if (num_picks == 0) continue;
-      // The UB path sorts one 32-element Sort32 run (multi-run hardware
-      // merging left as a follow-up — see the plan's debt register);
-      // wider rows take the scalar GM heap.
-      if (deg <= kSortElemsPerRepeat) {
+      // The UB path sorts the whole padded window with the high-level
+      // Sort (Sort32 runs + in-UB hardware merging); rows wider than the
+      // window take the scalar GM heap.
+      // select-all fast path: every edge is picked, so the weight order
+      // carries no information — emit the window as-is and skip the sort
+      // entirely (k == -1 semantics; ties with the CPU's weight-ordered
+      // output are not required, the edge SET is what matters).
+      if (select_all_ && num_picks == deg) {
+        offset += EmitRowDirect(out_start_ + offset, rid, off, deg);
+        continue;
+      }
+      if (deg <= window_elems_) {
         offset +=
             TopkRowThroughUb(out_start_ + offset, rid, off, deg, num_picks);
       } else {
@@ -118,8 +126,11 @@ class KernelCsrRowWiseTopk {
  private:
   __aicore__ inline uint32_t TopkRowThroughUb(
       uint32_t out_pos, IdT rid, IdT off, uint32_t deg, uint32_t num_picks) {
-    // The DMA pads the weight window to the full 32-element run in one
+    // The DMA pads the weight window to whole 32-element runs in one
     // copy (right padding carries -inf, which sorts to the run tail).
+    const uint32_t padded = (deg + kSortElemsPerRepeat - 1) /
+                            kSortElemsPerRepeat * kSortElemsPerRepeat;
+    const uint32_t pad_tail = padded - deg;
     LocalTensor<float> win_w;
     if (has_data_) {
       // Weight indices go through the eid mapping: copy the data window
@@ -130,7 +141,7 @@ class KernelCsrRowWiseTopk {
       // with one vectorized Duplicate and the head overwritten by the
       // deg scalar gathers.
       win_w = win_w_buf_.Get<float>();
-      Duplicate(win_w, kPadValue, kSortElemsPerRepeat);
+      Duplicate(win_w, kPadValue, padded);
       LocalTensor<IdT> win_e = win_e_q_.AllocTensor<IdT>();
       DataCopyPad(
           win_e, data_gm_[off],
@@ -145,25 +156,28 @@ class KernelCsrRowWiseTopk {
       win_e_q_.FreeTensor(win_e);
     } else {
       win_w = win_w_q_.AllocTensor<float>();
-      DataCopyPad(win_w, weight_gm_[off],
-                  DataCopyExtParams{1, deg * static_cast<uint32_t>(sizeof(float)),
-                                    0, 0, 0},
-                  DataCopyPadExtParams<float>{
-                      true, 0, static_cast<uint8_t>(kSortElemsPerRepeat - deg),
-                      kPadValue});
+      DataCopyPad(
+          win_w, weight_gm_[off],
+          DataCopyExtParams{
+              1, deg * static_cast<uint32_t>(sizeof(float)), 0, 0, 0},
+          DataCopyPadExtParams<float>{
+              true, 0, static_cast<uint8_t>(pad_tail), kPadValue});
       win_w_q_.EnQue(win_w);
       win_w = win_w_q_.DeQue<float>();
     }
 
-    // Sort the 32-element run with the hardware sort network in proposal
-    // format (8B per element: value u32 + index u32, descending by value).
-    // The index ramp is one vectorized progression.
-    LocalTensor<int32_t> index = index_buf_.Get<int32_t>();
-    ArithProgression(index, 0, 1, kSortElemsPerRepeat);
-    PipeBarrier<PIPE_V>();
-
+    // Sort the whole padded window with the hardware sort network in
+    // proposal format (8B per element: value u32 + index u32, descending
+    // by value): Sort32 runs merged in-UB by the high-level Sort. The
+    // merge scratch must hold repeatTimes * 64 floats (the in-UB
+    // full-sort contract, sized by formula since the tiling-side helper
+    // needs a PlatformAscendC the direct-invoke mode does not have).
     LocalTensor<float> sorted_a = sorted_buf_.Get<float>();
-    Sort32(sorted_a, win_w, index.ReinterpretCast<uint32_t>(), 1);
+    LocalTensor<float> sort_tmp = sort_tmp_buf_.Get<float>();
+    const uint32_t repeat_times = padded / kSortElemsPerRepeat;
+    Sort<float, true>(
+        sorted_a, win_w, index.ReinterpretCast<uint32_t>(), sort_tmp,
+        static_cast<int32_t>(repeat_times));
 
     // The network yields a DESCENDING list (device-verified: raw float
     // bits, no sign folding) with the -inf pads at its tail. The k
@@ -196,6 +210,25 @@ class KernelCsrRowWiseTopk {
     CopyOutStaged(out_r, out_rows_gm_[out_pos], num_picks);
     CopyOutStaged(out_c, out_cols_gm_[out_pos], num_picks);
     CopyOutStaged(out_e, out_idxs_gm_[out_pos], num_picks);
+  }
+
+  // select-all fast path: emit the row's edges in CSR order without
+  // sorting (all of them are picked).
+  __aicore__ inline uint32_t EmitRowDirect(
+      uint32_t out_pos, IdT rid, IdT off, uint32_t deg) {
+    LocalTensor<IdT> out_r = out_r_buf_.Get<IdT>();
+    LocalTensor<IdT> out_c = out_c_buf_.Get<IdT>();
+    LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
+    for (uint32_t j = 0; j < deg; ++j) {
+      const IdT picked = off + static_cast<IdT>(j);
+      out_r.SetValue(j, rid);
+      out_c.SetValue(j, indices_gm_.GetValue(picked));
+      out_e.SetValue(j, has_data_ ? data_gm_.GetValue(picked) : picked);
+    }
+    CopyOutStaged(out_r, out_rows_gm_[out_pos], deg);
+    CopyOutStaged(out_c, out_cols_gm_[out_pos], deg);
+    CopyOutStaged(out_e, out_idxs_gm_[out_pos], deg);
+    return deg;
   }
 
   // Fallback for rows whose degree overflows the UB window: scalar heap
