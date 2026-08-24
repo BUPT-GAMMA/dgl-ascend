@@ -116,7 +116,10 @@ class KernelFusedPrep {
 
     // Boundary resolution needs targets = total*part/block_dim, which
     // needs the full prefix — rescan picks from GM (sequential reads,
-    // single core, windowed).
+    // single core, windowed). The MTE3 writes above must drain before
+    // the scalar reads below see them (V-side read after MTE-side write
+    // needs the pipeline barrier; without it the rescan reads stale GM).
+    AscendC::PipeBarrier<PIPE_MTE3>();
     const uint32_t total = static_cast<uint32_t>(prefix);
     uint32_t boundary = 0;  // candidate row index
     uint64_t run2 = 0;      // second-pass prefix
