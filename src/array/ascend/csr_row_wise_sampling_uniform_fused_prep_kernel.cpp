@@ -51,11 +51,13 @@ class KernelFusedPrep {
     block_dim_ = tiling[4];
 
     deg_p_ = (const __gm__ uint32_t*)deg;
-    picks_p_ = (__gm__ uint32_t*)picks;
-    row_split_p_ = (__gm__ uint32_t*)row_split;
-    out_starts_p_ = (__gm__ uint32_t*)out_starts;
+    deg_gm_.SetGlobalBuffer((__gm__ uint32_t*)deg, num_rows_);
+    picks_gm_.SetGlobalBuffer((__gm__ uint32_t*)picks, num_rows_);
+    row_split_gm_.SetGlobalBuffer((__gm__ uint32_t*)row_split, block_dim_ + 1);
+    out_starts_gm_.SetGlobalBuffer(
+        (__gm__ uint32_t*)out_starts, block_dim_ + 1);
 
-    pipe->InitBuffer(win_buf_, kPrepWindow * sizeof(uint32_t));
+    pipe->InitBuffer(win_buf_, 2, kPrepWindow * sizeof(uint32_t));
     pipe->InitBuffer(pick_buf_, kPrepWindow * sizeof(uint32_t));
     pipe->InitBuffer(split_buf_, (kMaxBlocks + 1) * sizeof(uint32_t));
     pipe->InitBuffer(starts_buf_, (kMaxBlocks + 1) * sizeof(uint32_t));
@@ -82,7 +84,7 @@ class KernelFusedPrep {
       DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
       DataCopyPadExtParams<uint32_t> pad{false, 0, 0, 0};
       LocalTensor<uint32_t> deg_win = win_buf_.AllocTensor<uint32_t>();
-      DataCopyPad(deg_win, deg_p_[row], cp, pad);
+      DataCopyPad(deg_win, deg_gm_[row], cp, pad);
       win_buf_.EnQue(deg_win);
       deg_win = win_buf_.DeQue<uint32_t>();
 
@@ -101,7 +103,7 @@ class KernelFusedPrep {
       {
         const uint32_t write_bytes = count * sizeof(uint32_t);
         DataCopyExtParams wcp{1, write_bytes, 0, 0, 0};
-        DataCopyPad(picks_p_[row], pick_win, wcp);
+        DataCopyPad(picks_gm_[row], pick_win, wcp);
       }
       for (uint32_t j = 0; j < count; ++j) {
         prefix += pick_win.GetValue(j);
@@ -135,7 +137,7 @@ class KernelFusedPrep {
       }
       if (run2 < target) {
         // advance one row at a time until the prefix reaches the target
-        run2 += picks_p_[boundary];
+        run2 += picks_gm_.GetValue(boundary);
         ++boundary;
       } else {
         // boundary is the first index with prefix >= target
@@ -166,7 +168,7 @@ class KernelFusedPrep {
         ++sb;
         next_split = split_local.GetValue(sb);
       }
-      if (i < num_rows_) run3 += picks_p_[i];
+      if (i < num_rows_) run3 += picks_gm_.GetValue(i);
     }
     starts_local.SetValue(block_dim_, static_cast<uint32_t>(run3));
 
@@ -174,19 +176,17 @@ class KernelFusedPrep {
       const uint32_t bytes = (block_dim_ + 1) * sizeof(uint32_t);
       DataCopyExtParams cp1{1, bytes, 0, 0, 0};
       (void)cp1;
-      DataCopyPad(row_split_p_[0], split_local, cp1);
+      DataCopyPad(row_split_gm_[0], split_local, cp1);
       DataCopyExtParams cp2{1, bytes, 0, 0, 0};
-      DataCopyPad(out_starts_p_[0], starts_local, cp2);
+      DataCopyPad(out_starts_gm_[0], starts_local, cp2);
     }
   }
 
  private:
   static constexpr uint32_t kMaxBlocks = 64;  // row_split capacity guard
 
-  const __gm__ uint32_t* deg_p_ = nullptr;
-  __gm__ uint32_t* picks_p_ = nullptr;
-  __gm__ uint32_t* row_split_p_ = nullptr;
-  __gm__ uint32_t* out_starts_p_ = nullptr;
+  const __gm__ uint32_t* deg_p_ = nullptr;  // scalar reads (single core)
+  GlobalTensor<uint32_t> deg_gm_, picks_gm_, row_split_gm_, out_starts_gm_;
   uint32_t num_rows_ = 0, fanout_ = 0, replace_ = 0, select_all_ = 0,
            block_dim_ = 0;
   TQue<TPosition::VECIN, 2> win_buf_;
