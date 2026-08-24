@@ -498,3 +498,49 @@ def test_negative_zero_and_fltmax_pad_tie():
     u, _ = _uv(sg)
     assert sorted(u.tolist()) == list(range(m)), \
         "pad slots must never leak into the output"
+
+@pytest.mark.parametrize("deg", [33, 64, 100, 1000, 2000])
+def test_wide_row_vectorized_sort(deg):
+    """Degrees in (32, window] take the vectorized high-level-Sort path
+    (Sort32 runs merged in-UB); distinct f32 weights give an exact
+    edge-set oracle in both directions."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    n = 10
+    g = torch.Generator().manual_seed(deg)
+    src = torch.randint(0, n, (deg,), generator=g)
+    dst = torch.zeros(deg, dtype=torch.int64)
+    w = torch.rand(deg, generator=g)
+    g = dgl.graph((src, dst), num_nodes=n)
+    g.edata["w"] = w
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    for ascending in (False, True):
+        sg_npu = _select_topk(g_npu, nodes, 5, ascending=ascending)
+        sg_cpu = _select_topk(g, nodes.cpu(), 5, ascending=ascending)
+        assert _edge_set(sg_npu) == _edge_set(sg_cpu), \
+            f"deg={deg} ascending={ascending}"
+
+
+@pytest.mark.parametrize("fmt", ["csc", "coo"])
+def test_coo_assembly_and_select_all(fmt):
+    """The COO assembly route (COOToCSR -> CSR topk) matches CPU exactly,
+    and the k=-1 fast path (order-preserving direct emit) matches the CPU
+    edge set on both formats."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    torch.manual_seed(11)
+    n, m = 500, 5000
+    src = torch.randint(0, n, (m,))
+    dst = torch.randint(0, n, (m,))
+    w = torch.rand(m)
+    g = dgl.graph((src, dst), num_nodes=n)
+    g.edata["w"] = w
+    g_npu = g.to(device).formats(fmt)
+    nodes = torch.arange(n, dtype=torch.int64, device=device)
+    for k in (3, -1):
+        sg_npu = _select_topk(g_npu, nodes, k)
+        sg_cpu = _select_topk(g.formats(fmt), nodes.cpu(), k)
+        assert _edge_set(sg_npu) == _edge_set(sg_cpu), f"fmt={fmt} k={k}"
