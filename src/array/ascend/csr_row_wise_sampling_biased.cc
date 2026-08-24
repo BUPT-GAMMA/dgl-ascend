@@ -153,19 +153,26 @@ std::vector<uint32_t> BuildBalancedPartitions(
   return boundaries;
 }
 
-// Uploads a host uint32 table to device memory on the launch stream.
-// The stream is synchronized BEFORE the caller's stack buffers go out of
-// scope: an async copy only captures the source pointer, so returning
-// without a sync would upload stack garbage (spmm precedes its cached
-// uploads with the same sync).
+// Uploads a host uint32 table to device memory on the launch stream and
+// synchronizes before returning.
 void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
+  void* dev = UploadHostUInt32Async(host, stream);
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  return dev;
+}
+
+// Async variant: the caller keeps `host` alive until it synchronizes the
+// stream (or the launch completes). Batching uploads under one sync cuts
+// per-call stall — each sync costs ~1ms on this stack when the stream is
+// otherwise idle.
+void* UploadHostUInt32Async(
+    const std::vector<uint32_t>& host, aclrtStream stream) {
   void* dev = nullptr;
   ASCEND_CALL(aclrtMalloc(
       &dev, host.size() * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
   ASCEND_CALL(aclrtMemcpyAsync(
       dev, host.size() * sizeof(uint32_t), host.data(),
       host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
   return dev;
 }
 
@@ -445,8 +452,11 @@ COOMatrix CSRRowWiseSamplingBiased(
   // Main kernel launch.
   const bool has_data = aten::CSRHasData(mat);
   void* data_ptr = has_data ? mat.data->data : nullptr;
-  void* row_split_dev = UploadHostUInt32(row_split, stream);
-  void* out_starts_dev = UploadHostUInt32(out_starts, stream);
+  // Async uploads: row_split / out_starts live until after the main
+  // launch, so their copies ride under LaunchMainSampler's tiling sync
+  // instead of paying two extra stalls.
+  void* row_split_dev = UploadHostUInt32Async(row_split, stream);
+  void* out_starts_dev = UploadHostUInt32Async(out_starts, stream);
 
   aclError err = LaunchMainSampler(
       std::is_same<IdType, int32_t>::value, block_dim, stream, mat.indptr->data,
