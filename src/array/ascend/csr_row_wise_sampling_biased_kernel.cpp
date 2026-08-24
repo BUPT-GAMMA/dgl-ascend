@@ -97,8 +97,8 @@ class KernelCsrRowWiseSamplingBiasedNumPicks {
     const uint32_t block_num = AscendC::GetBlockNum();
     const uint32_t chunk = (num_rows_ + block_num - 1) / block_num;
     const uint32_t start = block_id * chunk;
-    const uint32_t end = (start + chunk > num_rows_) ? num_rows_
-                                                     : start + chunk;
+    const uint32_t end =
+        (start + chunk > num_rows_) ? num_rows_ : start + chunk;
     for (uint32_t base = start; base < end; base += kChunkElems) {
       const uint32_t count =
           (end - base < kChunkElems) ? (end - base) : kChunkElems;
@@ -116,16 +116,15 @@ class KernelCsrRowWiseSamplingBiasedNumPicks {
       const IdxT rid = rows_gm_.GetValue(base + j);
       uint32_t picks = 0;  // invalid row: consistent with the main kernel
       if (rid >= 0 && rid < static_cast<IdxT>(num_total_rows_)) {
-        const uint32_t row_base =
-            static_cast<uint32_t>(rid) * (num_tags_ + 1);
+        const uint32_t row_base = static_cast<uint32_t>(rid) * (num_tags_ + 1);
         uint32_t nnz = 0;
         for (uint32_t t = 0; t < num_tags_; ++t) {
           const float w = bias_gm_.GetValue(t);
           if (w > 0.0f) {
             // Clamp protects against corrupted offsets; a legit sorted
             // row has 0 <= lo <= hi <= deg.
-            uint32_t lo = static_cast<uint32_t>(
-                tag_offset_gm_.GetValue(row_base + t));
+            uint32_t lo =
+                static_cast<uint32_t>(tag_offset_gm_.GetValue(row_base + t));
             uint32_t hi = static_cast<uint32_t>(
                 tag_offset_gm_.GetValue(row_base + t + 1));
             if (lo > hi) continue;
@@ -158,7 +157,6 @@ class KernelCsrRowWiseSamplingBiasedNumPicks {
   uint32_t num_rows_ = 0, num_samples_ = 0, replace_ = 0, select_all_ = 0;
   uint32_t num_total_rows_ = 0, num_tags_ = 0;
 };
-
 
 // ---------------------------------------------------------------------------
 // Main kernel: biased row-wise sampling.
@@ -208,7 +206,6 @@ class KernelCsrRowWiseSamplingBiased {
     // output starts at the prefix of its first row, not at index b.
     out_start_ = out_starts_p_[row_begin_];
 
-
     // UB layout (total must fit the runtime-queried per-core UB budget):
     // Two double-buffered VECIN windows (indices + data edge ids), one
     // pick-scratch buffer, three VECCALC staging buffers for the output
@@ -218,15 +215,15 @@ class KernelCsrRowWiseSamplingBiased {
     // and charged to the budget first; the remainder is split across the
     // window instances:
     // 2*2 (VECIN db) + 2*2 (VECOUT db) + 1 (pick) + 3 (out r/c/e) = 12.
-    constexpr uint32_t kUbInstances = 2 * kQueueDepth   // win_idx_q_
+    constexpr uint32_t kUbInstances = 2 * kQueueDepth    // win_idx_q_
                                       + 2 * kQueueDepth  // win_data_q_
                                       + 2 * kQueueDepth  // out_q_
                                       + 1                // pick_buf_
                                       + 3;               // out_r/c/e bufs
     const uint32_t state_bytes =
-        kMaxTagCount * sizeof(uint32_t) +  // rem_buf_
-        kMaxTagCount * sizeof(float) +     // bias_buf_
-        0;                                 // dedup uses pick_buf_ instead
+        kMaxTagCount * sizeof(uint32_t) +      // rem_buf_
+        kMaxTagCount * sizeof(float) +         // bias_buf_
+        2 * (kMaxTagCount + 1) * sizeof(IdT);  // tag_q_ (db)
     uint32_t window_budget =
         (ub_available > state_bytes) ? (ub_available - state_bytes) : 0;
     window_elems_ = window_budget / kUbInstances / sizeof(IdT);
@@ -242,8 +239,15 @@ class KernelCsrRowWiseSamplingBiased {
     // rem/bias live in a single VECCALC TBuf sized for kMaxTagCount so the
     // buffer layout never depends on the launch's T.
     pipe->InitBuffer(
-        state_buf_, kMaxTagCount * sizeof(uint32_t) +
-                        kMaxTagCount * sizeof(float));
+        state_buf_,
+        kMaxTagCount * sizeof(uint32_t) + kMaxTagCount * sizeof(float));
+
+    // Tag-row staging: one row of tag_offset (T+1 values) is bulk-copied
+    // into UB per row via DataCopyPad instead of T+1 scalar GM reads
+    // (measured 26ns per scalar read on 910B3 — the dominant cost at
+    // large T). Double-buffered so the copy of row i+1 overlaps the
+    // sampling of row i.
+    pipe->InitBuffer(tag_q_, kQueueDepth, (kMaxTagCount + 1) * sizeof(IdT));
   }
 
   __aicore__ inline void Process() {
@@ -277,23 +281,37 @@ class KernelCsrRowWiseSamplingBiased {
 
       uint32_t state = seed_ ^ (i * kGoldenRatioHash + kGoldenRatioOffset);
       if (state == 0) state = kRngFallbackSeed;
-      const uint32_t written = SampleRow(out_pos, rid, off, deg, row_picks, state);
+      const uint32_t written =
+          SampleRow(out_pos, rid, off, deg, row_picks, state);
       offset += written;
     }
   }
 
  private:
-  // Loads tag bounds for one row into rem_[], clamped into [0, deg].
+  // Stages one row's tag_offset (T+1 values) into UB via DataCopyPad.
+  // Must be followed by a StageTagRowWait before tag_row_ is read.
+  __aicore__ inline void StageTagRow(IdT rid) {
+    const uint32_t row_base = static_cast<uint32_t>(rid) * (num_tags_ + 1);
+    const uint32_t copy_bytes = (num_tags_ + 1) * sizeof(IdT);
+    DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
+    DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
+    LocalTensor<IdT> t = tag_q_.AllocTensor<IdT>();
+    DataCopyPad(t, tag_offset_gm_[row_base], cp, pad);
+    tag_q_.EnQue(t);
+  }
+
+  __aicore__ inline void StageTagRowWait() { tag_row_ = tag_q_.DeQue<IdT>(); }
+
+  __aicore__ inline void StageTagRowRelease() { tag_q_.FreeTensor(tag_row_); }
+
+  // Loads tag bounds for the staged row into rem_[], clamped into [0, deg].
   // Returns the total positive-weight bucket population (biased nnz).
-  __aicore__ inline uint32_t LoadTagBounds(IdT rid, uint32_t deg) {
-    const uint32_t row_base =
-        static_cast<uint32_t>(rid) * (num_tags_ + 1);
+  // Call StageTagRow + StageTagRowWait first.
+  __aicore__ inline uint32_t LoadTagBounds(uint32_t deg) {
     uint32_t nnz = 0;
     for (uint32_t t = 0; t < num_tags_; ++t) {
-      uint32_t lo =
-          static_cast<uint32_t>(tag_offset_gm_.GetValue(row_base + t));
-      uint32_t hi =
-          static_cast<uint32_t>(tag_offset_gm_.GetValue(row_base + t + 1));
+      uint32_t lo = static_cast<uint32_t>(tag_row_.GetValue(t));
+      uint32_t hi = static_cast<uint32_t>(tag_row_.GetValue(t + 1));
       if (lo > deg) lo = deg;
       if (hi > deg) hi = deg;
       if (hi < lo) hi = lo;  // corrupted non-monotonic row: empty bucket
@@ -360,23 +378,23 @@ class KernelCsrRowWiseSamplingBiased {
       win_data = win_data_q_.DeQue<IdT>();
     }
 
-    const uint32_t nnz = LoadTagBounds(rid, deg);
+    StageTagRow(rid);
+    StageTagRowWait();
+    const uint32_t nnz = LoadTagBounds(deg);
     LocalTensor<IdT> out_r = out_r_buf_.Get<IdT>();
     LocalTensor<IdT> out_c = out_c_buf_.Get<IdT>();
     LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
 
-    const bool take_all =
-        select_all_ || (!replace_ && num_picks >= nnz);
+    const bool take_all = select_all_ || (!replace_ && num_picks >= nnz);
     if (take_all) {
       // Deterministic shortcut: every positive-weight edge, bucket order.
       uint32_t j = 0;
       for (uint32_t t = 0; t < num_tags_; ++t) {
         if (bias_buf_.GetValue(t) <= 0.0f) continue;
-        uint32_t lo = TagBucketHead(rid, t, deg);
+        uint32_t lo = TagBucketHead(t, deg);
         for (uint32_t k2 = 0; k2 < rem_buf_.GetValue(t); ++k2) {
           WritePickLocal(
-              out_r, out_c, out_e, j++, rid, win_idx, win_data,
-              lo + k2, off);
+              out_r, out_c, out_e, j++, rid, win_idx, win_data, lo + k2, off);
         }
       }
     } else {
@@ -385,7 +403,7 @@ class KernelCsrRowWiseSamplingBiased {
         if (tb < 0) break;  // total weight exhausted
         const uint32_t t = static_cast<uint32_t>(tb);
         const uint32_t r = rem_buf_.GetValue(t);
-        uint32_t lo = TagBucketHead(rid, t, deg);
+        uint32_t lo = TagBucketHead(t, deg);
         const uint32_t j = RandBelow(state, r);
         WritePickLocal(
             out_r, out_c, out_e, d, rid, win_idx, win_data, lo + j, off);
@@ -395,8 +413,7 @@ class KernelCsrRowWiseSamplingBiased {
           const uint32_t tail = lo + r - 1;
           if (j != r - 1) {
             const IdT tmp = win_idx.GetValue(lo + j);
-            win_idx.SetValue(
-                lo + j, win_idx.GetValue(tail));
+            win_idx.SetValue(lo + j, win_idx.GetValue(tail));
             win_idx.SetValue(tail, tmp);
           }
           rem_buf_.SetValue(t, r - 1);
@@ -408,6 +425,7 @@ class KernelCsrRowWiseSamplingBiased {
     CopyOutStaged(out_c, out_cols_gm_[out_pos], num_picks);
     CopyOutStaged(out_e, out_idxs_gm_[out_pos], num_picks);
 
+    StageTagRowRelease();
     win_idx_q_.FreeTensor(win_idx);
     if (has_data_) win_data_q_.FreeTensor(win_data);
     return num_picks;
@@ -418,16 +436,17 @@ class KernelCsrRowWiseSamplingBiased {
   __aicore__ inline uint32_t SampleRowDirectGm(
       uint32_t out_pos, IdT rid, IdT off, uint32_t deg, uint32_t num_picks,
       uint32_t& state) {
-    const uint32_t nnz = LoadTagBounds(rid, deg);
+    StageTagRow(rid);
+    StageTagRowWait();
+    const uint32_t nnz = LoadTagBounds(deg);
     LocalTensor<uint32_t> picked_local = pick_buf_.Get<uint32_t>();
 
-    const bool take_all =
-        select_all_ || (!replace_ && num_picks >= nnz);
+    const bool take_all = select_all_ || (!replace_ && num_picks >= nnz);
     if (take_all) {
       uint32_t j = 0;
       for (uint32_t t = 0; t < num_tags_; ++t) {
         if (bias_buf_.GetValue(t) <= 0.0f) continue;
-        const uint32_t lo = TagBucketHead(rid, t, deg);
+        const uint32_t lo = TagBucketHead(t, deg);
         for (uint32_t k2 = 0; k2 < rem_buf_.GetValue(t); ++k2) {
           WritePickGm(out_pos + j, rid, off + static_cast<IdT>(lo + k2));
           ++j;
@@ -441,7 +460,7 @@ class KernelCsrRowWiseSamplingBiased {
       if (tb < 0) break;
       const uint32_t t = static_cast<uint32_t>(tb);
       const uint32_t r = rem_buf_.GetValue(t);
-      const uint32_t lo = TagBucketHead(rid, t, deg);
+      const uint32_t lo = TagBucketHead(t, deg);
       uint32_t j = RandBelow(state, r);
       if (!replace_) {
         // Rejection sampling: redraw while the drawn edge was already
@@ -483,29 +502,27 @@ class KernelCsrRowWiseSamplingBiased {
       WritePickGm(out_pos + d, rid, off + static_cast<IdT>(lo + j));
       if (!replace_) rem_buf_.SetValue(t, r - 1);
     }
+    StageTagRowRelease();
     return num_picks;
   }
 
   // Clamped bucket head (local offset within the row) for tag t.
-  __aicore__ inline uint32_t TagBucketHead(IdT rid, uint32_t t, uint32_t deg) {
-    const uint32_t row_base =
-        static_cast<uint32_t>(rid) * (num_tags_ + 1);
-    uint32_t lo = static_cast<uint32_t>(
-        tag_offset_gm_.GetValue(row_base + t));
+  // Clamped bucket head (local offset within the staged row) for tag t.
+  __aicore__ inline uint32_t TagBucketHead(uint32_t t, uint32_t deg) {
+    uint32_t lo = static_cast<uint32_t>(tag_row_.GetValue(t));
     if (lo > deg) lo = deg;
     return lo;
   }
 
   __aicore__ inline void WritePickLocal(
       LocalTensor<IdT>& out_r, LocalTensor<IdT>& out_c, LocalTensor<IdT>& out_e,
-      uint32_t j, IdT rid, LocalTensor<IdT>& win_idx, LocalTensor<IdT>& win_data,
-      uint32_t local, IdT off) {
+      uint32_t j, IdT rid, LocalTensor<IdT>& win_idx,
+      LocalTensor<IdT>& win_data, uint32_t local, IdT off) {
     out_r.SetValue(j, rid);
     out_c.SetValue(j, win_idx.GetValue(local));
     out_e.SetValue(
         j,
-        has_data_ ? win_data.GetValue(local)
-                  : static_cast<IdT>(off + local));
+        has_data_ ? win_data.GetValue(local) : static_cast<IdT>(off + local));
   }
 
   __aicore__ inline void WritePickGm(uint32_t pos, IdT rid, IdT picked) {
@@ -514,8 +531,7 @@ class KernelCsrRowWiseSamplingBiased {
         pos, indices_gm_.GetValue(static_cast<uint32_t>(picked)));
     out_idxs_gm_.SetValue(
         pos,
-        has_data_ ? data_gm_.GetValue(static_cast<uint32_t>(picked))
-                  : picked);
+        has_data_ ? data_gm_.GetValue(static_cast<uint32_t>(picked)) : picked);
   }
 
   static constexpr uint32_t kQueueDepth = 2;  // double buffering
@@ -547,8 +563,11 @@ class KernelCsrRowWiseSamplingBiased {
   TBuf<TPosition::VECCALC> pick_buf_;
   TBuf<TPosition::VECCALC> out_r_buf_, out_c_buf_, out_e_buf_;
   TBuf<TPosition::VECCALC> state_buf_;
+  TQue<TPosition::VECIN, kQueueDepth> tag_q_;
   LocalTensor<uint32_t> rem_buf_;
   LocalTensor<float> bias_buf_;
+  // Staged copy of the current row's tag_offset (T+1 values, in UB).
+  LocalTensor<IdT> tag_row_;
   uint32_t num_rows_ = 0, replace_ = 0, has_data_ = 0;
   uint32_t seed_ = 0, select_all_ = 0, num_total_rows_ = 0, num_tags_ = 0;
   uint32_t out_start_ = 0;
