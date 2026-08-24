@@ -71,7 +71,7 @@ class KernelCsrRowWiseSamplingBiasedNumPicks {
 
   __aicore__ inline void Init(
       GM_ADDR rows, GM_ADDR tag_offset, GM_ADDR bias, GM_ADDR out,
-      GM_ADDR tiling_ptr) {
+      GM_ADDR tiling_ptr, TPipe* pipe) {
     const __gm__ CsrRowWiseSamplingBiasedTiling* tiling =
         (const __gm__ CsrRowWiseSamplingBiasedTiling*)tiling_ptr;
     num_rows_ = tiling->num_rows;
@@ -85,6 +85,11 @@ class KernelCsrRowWiseSamplingBiasedNumPicks {
     tag_offset_gm_.SetGlobalBuffer((__gm__ IdxT*)tag_offset);
     bias_gm_.SetGlobalBuffer((__gm__ float*)bias, num_tags_);
     out_gm_.SetGlobalBuffer((__gm__ uint32_t*)out, num_rows_);
+
+    // Results are staged in UB and flushed per chunk through the VECOUT
+    // queue: direct GM scalar stores from concurrent blocks are not
+    // reliable (measured on 910B3: writes from some blocks never land).
+    pipe->InitBuffer(out_q_, kQueueDepth, kChunkElems * sizeof(uint32_t));
   }
 
   __aicore__ inline void Process() {
@@ -94,47 +99,66 @@ class KernelCsrRowWiseSamplingBiasedNumPicks {
     const uint32_t start = block_id * chunk;
     const uint32_t end = (start + chunk > num_rows_) ? num_rows_
                                                      : start + chunk;
-    for (uint32_t i = start; i < end; ++i) {
-      const IdxT rid = rows_gm_.GetValue(i);
-      if (rid < 0 || rid >= static_cast<IdxT>(num_total_rows_)) {
-        out_gm_.SetValue(i, 0);  // invalid row: consistent with main kernel
-        continue;
-      }
-      const uint32_t row_base =
-          static_cast<uint32_t>(rid) * (num_tags_ + 1);
-      uint32_t nnz = 0;
-      for (uint32_t t = 0; t < num_tags_; ++t) {
-        const float w = bias_gm_.GetValue(t);
-        if (w > 0.0f) {
-          // Clamp protects against corrupted offsets; a legit sorted row
-          // has 0 <= lo <= hi <= deg.
-          uint32_t lo = static_cast<uint32_t>(
-              tag_offset_gm_.GetValue(row_base + t));
-          uint32_t hi = static_cast<uint32_t>(
-              tag_offset_gm_.GetValue(row_base + t + 1));
-          if (lo > hi) continue;
-          nnz += hi - lo;
-        }
-      }
-      uint32_t picks;
-      if (select_all_) {
-        picks = nnz;
-      } else if (replace_) {
-        picks = (nnz == 0) ? 0 : num_samples_;
-      } else {
-        picks = (nnz < num_samples_) ? nnz : num_samples_;
-      }
-      out_gm_.SetValue(i, picks);
+    for (uint32_t base = start; base < end; base += kChunkElems) {
+      const uint32_t count =
+          (end - base < kChunkElems) ? (end - base) : kChunkElems;
+      ProcessChunk(base, count);
     }
   }
 
  private:
+  static constexpr uint32_t kQueueDepth = 2;     // double buffering
+  static constexpr uint32_t kChunkElems = 2048;  // rows staged per flush
+
+  __aicore__ inline void ProcessChunk(uint32_t base, uint32_t count) {
+    LocalTensor<uint32_t> out = out_q_.AllocTensor<uint32_t>();
+    for (uint32_t j = 0; j < count; ++j) {
+      const IdxT rid = rows_gm_.GetValue(base + j);
+      uint32_t picks = 0;  // invalid row: consistent with the main kernel
+      if (rid >= 0 && rid < static_cast<IdxT>(num_total_rows_)) {
+        const uint32_t row_base =
+            static_cast<uint32_t>(rid) * (num_tags_ + 1);
+        uint32_t nnz = 0;
+        for (uint32_t t = 0; t < num_tags_; ++t) {
+          const float w = bias_gm_.GetValue(t);
+          if (w > 0.0f) {
+            // Clamp protects against corrupted offsets; a legit sorted
+            // row has 0 <= lo <= hi <= deg.
+            uint32_t lo = static_cast<uint32_t>(
+                tag_offset_gm_.GetValue(row_base + t));
+            uint32_t hi = static_cast<uint32_t>(
+                tag_offset_gm_.GetValue(row_base + t + 1));
+            if (lo > hi) continue;
+            nnz += hi - lo;
+          }
+        }
+        if (select_all_) {
+          picks = nnz;
+        } else if (replace_) {
+          picks = (nnz == 0) ? 0 : num_samples_;
+        } else {
+          picks = (nnz < num_samples_) ? nnz : num_samples_;
+        }
+      }
+      out.SetValue(j, picks);
+    }
+    DataCopyExtParams cp{
+        1, static_cast<uint32_t>(count * sizeof(uint32_t)), 0, 0, 0};
+    DataCopyPadExtParams<uint32_t> pad{false, 0, 0, 0};
+    out_q_.EnQue(out);
+    LocalTensor<uint32_t> ready = out_q_.DeQue<uint32_t>();
+    DataCopyPad(out_gm_[base], ready, cp);
+    out_q_.FreeTensor(ready);
+  }
+
   GlobalTensor<IdxT> rows_gm_, tag_offset_gm_;
   GlobalTensor<float> bias_gm_;
   GlobalTensor<uint32_t> out_gm_;
+  TQue<TPosition::VECOUT, kQueueDepth> out_q_;
   uint32_t num_rows_ = 0, num_samples_ = 0, replace_ = 0, select_all_ = 0;
   uint32_t num_total_rows_ = 0, num_tags_ = 0;
 };
+
 
 // ---------------------------------------------------------------------------
 // Main kernel: biased row-wise sampling.
@@ -564,7 +588,8 @@ csr_row_wise_sampling_biased_num_picks_int32(
     GM_ADDR rows, GM_ADDR tag_offset, GM_ADDR bias, GM_ADDR out,
     GM_ADDR tiling_ptr) {
   KernelCsrRowWiseSamplingBiasedNumPicks<int32_t> op;
-  op.Init(rows, tag_offset, bias, out, tiling_ptr);
+  TPipe pipe;
+  op.Init(rows, tag_offset, bias, out, tiling_ptr, &pipe);
   op.Process();
 }
 
@@ -573,6 +598,7 @@ csr_row_wise_sampling_biased_num_picks_int64(
     GM_ADDR rows, GM_ADDR tag_offset, GM_ADDR bias, GM_ADDR out,
     GM_ADDR tiling_ptr) {
   KernelCsrRowWiseSamplingBiasedNumPicks<int64_t> op;
-  op.Init(rows, tag_offset, bias, out, tiling_ptr);
+  TPipe pipe;
+  op.Init(rows, tag_offset, bias, out, tiling_ptr, &pipe);
   op.Process();
 }
