@@ -1404,6 +1404,19 @@ COOMatrix COORowWisePerEtypeSampling(
 COOMatrix COORowWiseTopk(
     COOMatrix mat, IdArray rows, int64_t k, FloatArray weight, bool ascending) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.row->ctx.device_type == kDGLAscend) {
+    CHECK_VALID_CONTEXT(weight, rows);
+    // Assembly route (ADR-0001 pattern): the Ascend launcher converts the
+    // full graph to CSR and runs the native CSR topk kernel; the weight
+    // dtype normalization to f32 happens inside that kernel's launcher.
+    ATEN_ID_TYPE_SWITCH(mat.row->dtype, IdType, {
+      ret = impl::COORowWiseTopk<kDGLAscend, IdType, float>(
+          mat, rows, k, weight, ascending);
+    });
+    return ret;
+  }
+#endif  // DGL_USE_ASCEND
   ATEN_COO_SWITCH(mat, XPU, IdType, "COORowWiseTopk", {
     ATEN_DTYPE_SWITCH(weight->dtype, DType, "weight", {
       ret = impl::COORowWiseTopk<XPU, IdType, DType>(
