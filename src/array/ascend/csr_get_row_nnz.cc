@@ -70,21 +70,11 @@ NDArray CSRGetRowNNZ(CSRMatrix csr, NDArray rows) {
 
   uint32_t n = static_cast<uint32_t>(len);
   uint32_t orig_rows = static_cast<uint32_t>(csr.num_rows);
-  // Multi-core launch: the kernel chunks rows across blocks. The first
-  // attempt failed because the kernel read the tiling words through
-  // per-word GetValue (not consistently visible across blocks); with
-  // typed __gm__ pointer reads the multi-block path is sound.
-  uint32_t block_dim = 40;
-  {
-    int64_t core_num = 0;
-    if (aclrtGetDeviceInfo(
-            ctx.device_id, ACL_DEV_ATTR_VECTOR_CORE_NUM, &core_num) ==
-            ACL_SUCCESS &&
-        core_num > 0 && core_num <= 4096) {
-      block_dim = static_cast<uint32_t>(core_num);
-    }
-  }
-  if (block_dim > n) block_dim = n;
+  // Single-core launch: two multi-core attempts both corrupted the
+  // degrees on the real machine (per-word tiling GetValue first, then
+  // typed __gm__ pointer reads — the corruption is NOT the tiling read).
+  // Root cause still open; ~4ms on 100k rows stays on the backlog.
+  uint32_t block_dim = 1;
   uint32_t tiling_data[2] = {n, orig_rows};
   void* tiling_dev = nullptr;
   ASCEND_CALL(
