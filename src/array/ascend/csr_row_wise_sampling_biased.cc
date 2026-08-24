@@ -244,6 +244,12 @@ std::vector<uint32_t> ComputeRowPicks(
 
   ASCEND_CALL(aclrtMalloc(
       picks_dev, num_rows * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+  // Zero the pick counts before the launch: idle blocks (when block_dim
+  // exceeds the row count) never write their slots, and the allocator does
+  // not zero fresh device memory.
+  ASCEND_CALL(aclrtMemsetAsync(
+      *picks_dev, num_rows * sizeof(uint32_t), 0, num_rows * sizeof(uint32_t),
+      stream));
   // The pick-count kernel partitions rows evenly across ALL vector cores
   // (csr_get_row_nnz pattern). Launching it with blockDim=1 left ~97% of
   // the device idle and dominated the device time at larger tag counts
