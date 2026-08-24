@@ -77,9 +77,14 @@ def test_degrees_int32_npu(idtype):
     on CPU then move)."""
     src = torch.tensor([e[0] for e in EDGES], dtype=idtype)
     dst = torch.tensor([e[1] for e in EDGES], dtype=idtype)
-    g = dgl.graph((src, dst), num_nodes=5).formats(["csr"]).to("npu")
+    # Build the CSR view on CPU, then move: aclnnMaxDim/MinDim (used in
+    # DGL's num_nodes/format inference) reject int32 on device — the
+    # same workaround the sampler tests use.
+    g_cpu = dgl.graph((src, dst), num_nodes=5).formats(["csr"])
+    expected = g_cpu.out_degrees().tolist()
+    g = g_cpu.to("npu")
     ids = torch.arange(5, dtype=idtype, device="npu")
-    assert g.out_degrees(ids).cpu().tolist() == OUT_DEG
+    assert g.out_degrees(ids).cpu().tolist() == expected
 
 
 @pytest.mark.skipif(not _check_npu_available(), reason="NPU not available")
@@ -90,8 +95,9 @@ def test_degrees_multi_block_boundary_npu():
     n = 43
     src = torch.arange(n, dtype=torch.int64) % 7
     dst = torch.arange(n, dtype=torch.int64)
-    g = dgl.graph((src, dst), num_nodes=7).formats(["csc"]).to("npu")
-    degs = g.in_degrees().cpu().tolist()
-    # count dst occurrences per node: dst == node id
-    for v in range(7):
-        assert degs[v] == int((dst == v).sum()), f"node {v}: {degs[v]}"
+    # CPU-first build (aclnnMinDim rejects on-device inference), and
+    # the expectation comes from the CPU graph itself.
+    g_cpu = dgl.graph((src, dst), num_nodes=7).formats(["csc"])
+    expected = g_cpu.in_degrees().tolist()
+    g = g_cpu.to("npu")
+    assert g.in_degrees().cpu().tolist() == expected
