@@ -78,6 +78,11 @@ class KernelFusedPrep {
     uint32_t split_idx = 0;  // rows consumed by resolved boundaries
     split_local.SetValue(0, 0);
 
+    // TODO(tmp-probe): remove — dump the first few degrees/picks.
+    for (uint32_t q = 0; q < 5 && q < num_rows_; ++q) {
+      AscendC::printf("[prep-probe] deg[%u]=%u\n", q,
+                      (uint32_t)deg_gm_.GetValue(q));
+    }
     uint32_t row = 0;
     while (row < num_rows_) {
       const uint32_t avail = num_rows_ - row;
