@@ -472,18 +472,20 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
 
   // No output zeroing on the main path: every slot is provably written.
   // out_ptr gets one entry per row (invalid rids included); the three
-  // edge arrays are covered exactly because out_starts is the prefix sum
-  of the same pick counts the kernel recomputes (host/kernel formulas
-  verified identical, and the segmented paths return exact counts);
-  seed_pairs emits one pair per row including sentinel pairs for invalid
-  rids. The degenerate paths (EmptyResult / ZeroOutputResult) still
-  zero the indptr explicitly. The memset chain cost ~9ms of launcher
-  wall time and serialized ahead of the launch on the same stream.
-  // (Allocator-reuse ghost data only ever mattered for UNwritten slots.)
+  // edge arrays are covered exactly because out_starts is the prefix
+  // sum of the same pick counts the kernel recomputes (host/kernel
+  // formulas verified identical, and the segmented paths return exact
+  // counts); seed_pairs emits one pair per row including sentinel
+  // pairs for invalid
+  rids.The degenerate paths(EmptyResult / ZeroOutputResult)
+      still zero the indptr explicitly
+          .The memset chain cost ~9ms of launcher wall time and serialized ahead
+              of the launch on the same stream.
+      // (Allocator-reuse ghost data only ever mattered for UNwritten slots.)
 
-  // One packed upload replaces three malloc+copy+sync round-trips (the
-  // sync chain dominated the host-side profile; the kernels are fine).
-  const PackedLaunchTables tables = UploadLaunchTablesFused(
+      // One packed upload replaces three malloc+copy+sync round-trips (the
+      // sync chain dominated the host-side profile; the kernels are fine).
+      const PackedLaunchTables tables = UploadLaunchTablesFused(
       tiling_data, kTilingHeaderWordsFused, row_split, out_starts, stream);
 
   if (std::is_same<IdType, int32_t>::value) {
@@ -507,9 +509,12 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   ASCEND_CALL(aclrtSynchronizeStream(stream));
   ASCEND_CALL(aclrtFree(tables.dev));
   auto tp3 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
-  LOG(INFO) << "[ftiming] picks=" << std::chrono::duration<double, std::milli>(tp1 - tp0).count()
-            << " split=" << std::chrono::duration<double, std::milli>(tp2 - tp1b).count()
-            << " memset+upload+launch+sync=" << std::chrono::duration<double, std::milli>(tp3 - tp2).count();
+  LOG(INFO) << "[ftiming] picks="
+            << std::chrono::duration<double, std::milli>(tp1 - tp0).count()
+            << " split="
+            << std::chrono::duration<double, std::milli>(tp2 - tp1b).count()
+            << " memset+upload+launch+sync="
+            << std::chrono::duration<double, std::milli>(tp3 - tp2).count();
 
   // ADR-0014 A1 closure: scatter the compact (rid, pos) pairs into
   // seed_mapping on the host, then write the mapping back. The kernel is
