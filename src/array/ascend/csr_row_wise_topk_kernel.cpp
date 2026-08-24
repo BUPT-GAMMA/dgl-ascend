@@ -69,8 +69,9 @@ class KernelCsrRowWiseTopk {
     //    1 x 8B : proposal buffer       (sorted_buf_)
     //    1 x 8B : heap scratch          (sort_tmp_buf_, GM fallback)
     //    3 x 4B : output triple staging (out_r/c/e)
-    //  = 80 bytes per window element.
-    constexpr uint32_t kUbBytesPerWindowElem = 80;
+    //  = 68 bytes per window element (queue-free emission dropped the
+    //  double-buffered VECOUT queue).
+    constexpr uint32_t kUbBytesPerWindowElem = 68;
     window_elems_ = ub_available / kUbBytesPerWindowElem;
     // The staged sort pads to 32; rows up to the window take the UB path.
     window_elems_ = window_elems_ / kSortElemsPerRepeat * kSortElemsPerRepeat;
@@ -86,7 +87,6 @@ class KernelCsrRowWiseTopk {
     pipe->InitBuffer(out_r_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_c_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_e_buf_, window_elems_ * sizeof(IdT));
-    pipe->InitBuffer(out_q_, kQueueDepth, window_elems_ * sizeof(IdT));
   }
 
   __aicore__ inline void Process() {
@@ -293,8 +293,7 @@ class KernelCsrRowWiseTopk {
   // Boundary heap over the kept entries. Descending rows keep the k
   // largest as a min-heap (root = weakest kept); ascending rows keep the
   // k smallest as a max-heap (root = strongest kept).
-  __aicore__ inline bool HeapOrdered(
-      float parent, float child, bool max_heap) {
+  __aicore__ inline bool HeapOrdered(float parent, float child, bool max_heap) {
     return max_heap ? (parent >= child) : (parent <= child);
   }
 
@@ -354,17 +353,18 @@ class KernelCsrRowWiseTopk {
 
   __aicore__ inline void CopyOutStaged(
       LocalTensor<IdT>& staging, GlobalTensor<IdT> dst, uint32_t count) {
-    LocalTensor<IdT> out = out_q_.AllocTensor<IdT>();
-    for (uint32_t j = 0; j < count; ++j) {
-      out.SetValue(j, staging.GetValue(j));
-    }
+    // Queue-free emission (profiler-driven, scalar bound at 88%): the
+    // staging tensor is a plain VECCALC buffer, so the queue cycle here
+    // was pure overhead — AllocTensor + count scalar copies + EnQue/DeQue
+    // events + FreeTensor per array, three arrays per row. The V->MTE3
+    // visibility the queue provided becomes one explicit event pair.
+    event_t eid =
+        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
+    SetFlag<HardEvent::V_MTE3>(eid);
+    WaitFlag<HardEvent::V_MTE3>(eid);
     DataCopyExtParams cp{
         1, static_cast<uint32_t>(count * sizeof(IdT)), 0, 0, 0};
-    DataCopyPadExtParams<IdT> pad{false, 0, 0, 0};
-    out_q_.EnQue(out);
-    LocalTensor<IdT> ready = out_q_.DeQue<IdT>();
-    DataCopyPad(dst, ready, cp);
-    out_q_.FreeTensor(ready);
+    DataCopyPad(dst, staging, cp);
   }
 
   GlobalTensor<IdT> indptr_gm_, indices_gm_, data_gm_, rows_gm_;
@@ -372,7 +372,6 @@ class KernelCsrRowWiseTopk {
   GlobalTensor<IdT> out_rows_gm_, out_cols_gm_, out_idxs_gm_;
   TQue<TPosition::VECIN, kQueueDepth> win_w_q_, win_e_q_;
   TBuf<TPosition::VECCALC> win_w_buf_;
-  TQue<TPosition::VECOUT, kQueueDepth> out_q_;
   TBuf<TPosition::VECCALC> sort_tmp_buf_, sorted_buf_;
   TBuf<TPosition::VECCALC> index_buf_;
   TBuf<TPosition::VECCALC> out_r_buf_, out_c_buf_, out_e_buf_;

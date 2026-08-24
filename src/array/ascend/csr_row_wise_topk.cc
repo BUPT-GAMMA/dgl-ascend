@@ -276,7 +276,7 @@ COOMatrix CSRRowWiseTopk(
   // inside a single Sort call's capacity (repeatTimes <= 255). Rows beyond
   // the window take the GM fallback path in the kernel.
   const uint32_t ub_available = QueryUbAvailableBytes(ctx.device_id);
-  constexpr uint32_t kUbBytesPerWindowElem = 80;  // kernel's UB layout
+  constexpr uint32_t kUbBytesPerWindowElem = 68;  // kernel's UB layout
   const uint32_t window =
       std::min(ub_available / kUbBytesPerWindowElem, kSortMaxElemsPerCall);
   CHECK(window >= 32) << "UB budget too small for the topk window";
