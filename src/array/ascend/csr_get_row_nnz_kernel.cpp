@@ -19,7 +19,7 @@ class KernelCsrGetRowNNZ {
     // cache-coherent path.
     indptr_p_ = (const __gm__ IdxT *)indptr;
     rows_p_ = (const __gm__ IdxT *)rows;
-    out_p_ = (__gm__ IdxT *)out;
+    out_gm_.SetGlobalBuffer((__gm__ IdxT *)out, n);
     n_ = n;
     orig_rows_ = orig_rows;
     pipe->InitBuffer(out_buf_, kFlushElems * sizeof(IdxT));
@@ -56,14 +56,14 @@ class KernelCsrGetRowNNZ {
       LocalTensor<IdxT>& staging, uint32_t out_index, uint32_t count) {
     const uint32_t copy_bytes = count * sizeof(IdxT);
     DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
-    DataCopyPad(out_p_ + out_index, staging, cp);
+    DataCopyPad(out_gm_[out_index], staging, cp);
   }
 
   static constexpr uint32_t kFlushElems = 1024;
 
   const __gm__ IdxT *indptr_p_ = nullptr;
   const __gm__ IdxT *rows_p_ = nullptr;
-  __gm__ IdxT *out_p_ = nullptr;
+  GlobalTensor<IdxT> out_gm_;
   uint32_t n_;
   uint32_t orig_rows_;
   TBuf<TPosition::VECCALC> out_buf_;
