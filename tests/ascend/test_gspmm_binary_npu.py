@@ -20,8 +20,8 @@ from dgl._sparse_ops import _gspmm
 
 try:
     import torch_npu  # noqa: F401
-    has_npu = True
-except ImportError:
+    has_npu = torch.npu.is_available()
+except (ImportError, AttributeError):
     has_npu = False
 
 
