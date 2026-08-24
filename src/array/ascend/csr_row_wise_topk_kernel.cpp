@@ -172,6 +172,10 @@ class KernelCsrRowWiseTopk {
     // merge scratch must hold repeatTimes * 64 floats (the in-UB
     // full-sort contract, sized by formula since the tiling-side helper
     // needs a PlatformAscendC the direct-invoke mode does not have).
+    LocalTensor<int32_t> index = index_buf_.Get<int32_t>();
+    ArithProgression(index, 0, 1, padded);
+    PipeBarrier<PIPE_V>();
+
     LocalTensor<float> sorted_a = sorted_buf_.Get<float>();
     LocalTensor<float> sort_tmp = sort_tmp_buf_.Get<float>();
     const uint32_t repeat_times = padded / kSortElemsPerRepeat;
