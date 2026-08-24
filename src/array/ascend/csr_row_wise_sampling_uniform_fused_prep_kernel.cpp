@@ -35,6 +35,7 @@ constexpr uint32_t kPrepWindow = 8192;  // degrees staged per GM read
 
 }  // namespace
 
+template <typename DegT>
 class KernelFusedPrep {
  public:
   __aicore__ inline KernelFusedPrep() {}
@@ -50,14 +51,15 @@ class KernelFusedPrep {
     select_all_ = tiling[3];
     block_dim_ = tiling[4];
 
-    deg_p_ = (const __gm__ uint32_t*)deg;
-    deg_gm_.SetGlobalBuffer((__gm__ uint32_t*)deg, num_rows_);
+    // Degrees arrive with the graph's idtype (int32/int64) — read them
+    // through the matching type or every other word is garbage.
+    deg_gm_.SetGlobalBuffer((__gm__ DegT*)deg, num_rows_);
     picks_gm_.SetGlobalBuffer((__gm__ uint32_t*)picks, num_rows_);
     row_split_gm_.SetGlobalBuffer((__gm__ uint32_t*)row_split, block_dim_ + 1);
     out_starts_gm_.SetGlobalBuffer(
         (__gm__ uint32_t*)out_starts, block_dim_ + 1);
 
-    pipe->InitBuffer(win_buf_, 2, kPrepWindow * sizeof(uint32_t));
+    pipe->InitBuffer(win_buf_, 2, kPrepWindow * sizeof(DegT));
     pipe->InitBuffer(pick_buf_, kPrepWindow * sizeof(uint32_t));
     pipe->InitBuffer(split_buf_, (kMaxBlocks + 1) * sizeof(uint32_t));
     pipe->InitBuffer(starts_buf_, (kMaxBlocks + 1) * sizeof(uint32_t));
@@ -82,14 +84,14 @@ class KernelFusedPrep {
       const uint32_t count = avail < kPrepWindow ? avail : kPrepWindow;
       const uint32_t copy_bytes = count * sizeof(uint32_t);
       DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
-      DataCopyPadExtParams<uint32_t> pad{false, 0, 0, 0};
-      LocalTensor<uint32_t> deg_win = win_buf_.AllocTensor<uint32_t>();
+      DataCopyPadExtParams<DegT> pad{false, 0, 0, 0};
+      LocalTensor<DegT> deg_win = win_buf_.AllocTensor<DegT>();
       DataCopyPad(deg_win, deg_gm_[row], cp, pad);
       win_buf_.EnQue(deg_win);
-      deg_win = win_buf_.DeQue<uint32_t>();
+      deg_win = win_buf_.DeQue<DegT>();
 
       for (uint32_t j = 0; j < count; ++j) {
-        const uint32_t d = deg_win.GetValue(j);
+        const uint32_t d = static_cast<uint32_t>(deg_win.GetValue(j));
         const uint32_t p = select_all_ ? d
                            : replace_  ? (d == 0 ? 0u : fanout_)
                                        : (d < fanout_ ? d : fanout_);
@@ -186,7 +188,8 @@ class KernelFusedPrep {
   static constexpr uint32_t kMaxBlocks = 64;  // row_split capacity guard
 
   const __gm__ uint32_t* deg_p_ = nullptr;  // scalar reads (single core)
-  GlobalTensor<uint32_t> deg_gm_, picks_gm_, row_split_gm_, out_starts_gm_;
+  GlobalTensor<DegT> deg_gm_;
+  GlobalTensor<uint32_t> picks_gm_, row_split_gm_, out_starts_gm_;
   uint32_t num_rows_ = 0, fanout_ = 0, replace_ = 0, select_all_ = 0,
            block_dim_ = 0;
   TQue<TPosition::VECIN, 2> win_buf_;
@@ -197,7 +200,7 @@ extern "C" __global__ __aicore__ void
 csr_row_wise_sampling_uniform_fused_prep_int32(
     GM_ADDR deg, GM_ADDR picks, GM_ADDR row_split, GM_ADDR out_starts,
     GM_ADDR tiling_ptr) {
-  KernelFusedPrep op;
+  KernelFusedPrep<int32_t> op;
   TPipe pipe;
   op.Init(deg, picks, row_split, out_starts, tiling_ptr, &pipe);
   op.Process();
@@ -207,7 +210,7 @@ extern "C" __global__ __aicore__ void
 csr_row_wise_sampling_uniform_fused_prep_int64(
     GM_ADDR deg, GM_ADDR picks, GM_ADDR row_split, GM_ADDR out_starts,
     GM_ADDR tiling_ptr) {
-  KernelFusedPrep op;
+  KernelFusedPrep<int64_t> op;
   TPipe pipe;
   op.Init(deg, picks, row_split, out_starts, tiling_ptr, &pipe);
   op.Process();
