@@ -66,7 +66,6 @@ class KernelFusedPrep {
     // batched write, and track the running prefix. row_split/out_starts
     // are small (< 42 entries) and written once at the end through the
     // MTE path (multi-word GM scalar stores are banned family-wide).
-    LocalTensor<uint32_t> deg_win = win_buf_.Get<uint32_t>();
     LocalTensor<uint32_t> pick_win = pick_buf_.Get<uint32_t>();
     LocalTensor<uint32_t> split_local = split_buf_.Get<uint32_t>();
 
@@ -77,10 +76,12 @@ class KernelFusedPrep {
 
     uint32_t row = 0;
     while (row < num_rows_) {
-      const uint32_t count =
-          (num_rows_ - row) < kPrepWindow ? (num_rows_ - row) : kPrepWindow;
-      DataCopyExtParams cp{1, count * sizeof(uint32_t), 0, 0, 0};
+      const uint32_t avail = num_rows_ - row;
+      const uint32_t count = avail < kPrepWindow ? avail : kPrepWindow;
+      const uint32_t copy_bytes = count * sizeof(uint32_t);
+      DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
       DataCopyPadExtParams<uint32_t> pad{false, 0, 0, 0};
+      LocalTensor<uint32_t> deg_win = win_buf_.AllocTensor<uint32_t>();
       DataCopyPad(deg_win, deg_p_[row], cp, pad);
       win_buf_.EnQue(deg_win);
       deg_win = win_buf_.DeQue<uint32_t>();
@@ -98,7 +99,8 @@ class KernelFusedPrep {
 
       // Batched picks write (MTE path for cross-block consistency).
       {
-        DataCopyExtParams wcp{1, count * sizeof(uint32_t), 0, 0, 0};
+        const uint32_t write_bytes = count * sizeof(uint32_t);
+        DataCopyExtParams wcp{1, write_bytes, 0, 0, 0};
         DataCopyPad(picks_p_[row], pick_win, wcp);
       }
       for (uint32_t j = 0; j < count; ++j) {
@@ -171,6 +173,7 @@ class KernelFusedPrep {
     {
       const uint32_t bytes = (block_dim_ + 1) * sizeof(uint32_t);
       DataCopyExtParams cp1{1, bytes, 0, 0, 0};
+      (void)cp1;
       DataCopyPad(row_split_p_[0], split_local, cp1);
       DataCopyExtParams cp2{1, bytes, 0, 0, 0};
       DataCopyPad(out_starts_p_[0], starts_local, cp2);
