@@ -456,10 +456,15 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
       ACL_MEMCPY_HOST_TO_DEVICE, stream));
   ASCEND_CALL(aclrtSynchronizeStream(stream));  // stack-backed upload
   {
+    // Degrees carry the graph idtype — dispatch the matching variant.
     const aclError err =
-        aclrtlaunch_csr_row_wise_sampling_uniform_fused_prep_int64(
-            1, stream, deg->data, picks_arr->data, row_split_arr->data,
-            out_starts_arr->data, prep_tiling_dev);
+        std::is_same<IdType, int32_t>::value
+            ? aclrtlaunch_csr_row_wise_sampling_uniform_fused_prep_int32(
+                  1, stream, deg->data, picks_arr->data, row_split_arr->data,
+                  out_starts_arr->data, prep_tiling_dev)
+            : aclrtlaunch_csr_row_wise_sampling_uniform_fused_prep_int64(
+                  1, stream, deg->data, picks_arr->data, row_split_arr->data,
+                  out_starts_arr->data, prep_tiling_dev);
     CHECK(err == ACL_SUCCESS) << "fused prep kernel launch failed: " << err;
   }
   ASCEND_CALL(aclrtSynchronizeStream(stream));
