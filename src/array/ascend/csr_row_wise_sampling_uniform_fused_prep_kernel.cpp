@@ -182,6 +182,10 @@ class KernelFusedPrep {
     }
     starts_local.SetValue(block_dim_, static_cast<uint32_t>(run3));
 
+    // TODO(tmp-probe): remove — dump the final tables.
+    AscendC::printf("[prep-probe] total=%u out_starts[bd]=%u split1=%u\n",
+                    (uint32_t)prefix, starts_local.GetValue(block_dim_),
+                    split_local.GetValue(1));
     {
       const uint32_t bytes = (block_dim_ + 1) * sizeof(uint32_t);
       DataCopyExtParams cp1{1, bytes, 0, 0, 0};
