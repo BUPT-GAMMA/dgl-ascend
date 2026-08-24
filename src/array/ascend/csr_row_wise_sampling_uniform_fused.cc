@@ -41,6 +41,14 @@ extern "C" uint32_t aclrtlaunch_csr_row_wise_sampling_uniform_fused_int32(
     void* out_idxs, void* seed_pairs, void* row_split, void* out_starts,
     void* tiling);
 
+extern "C" uint32_t aclrtlaunch_csr_row_wise_sampling_uniform_fused_prep_int32(
+    uint32_t blockDim, aclrtStream stream, void* deg, void* picks,
+    void* row_split, void* out_starts, void* tiling);
+
+extern "C" uint32_t aclrtlaunch_csr_row_wise_sampling_uniform_fused_prep_int64(
+    uint32_t blockDim, aclrtStream stream, void* deg, void* picks,
+    void* row_split, void* out_starts, void* tiling);
+
 extern "C" uint32_t aclrtlaunch_csr_row_wise_sampling_uniform_fused_int64(
     uint32_t blockDim, aclrtStream stream, void* indptr, void* indices,
     void* data, void* rows, void* out_ptr, void* out_rows, void* out_cols,
@@ -417,22 +425,54 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
         << " exceeds the per-core window of " << window_elems
         << " (with-replace draws that many picks into UB scratch)";
   }
-  std::vector<uint32_t> picks =
-      ComputeRowPicks<IdType>(mat, rows, num_rows, fanout, select_all, replace);
-
-  // nnz-balanced row partitions across all vector cores (spmm pattern).
+  // PERF-DEBT-4 (done): the pick/partition chain runs on the DEVICE.
+  // CSRGetRowNNZ leaves the degrees in GM; a single-core prep kernel
+  // turns them into picks + row_split + out_starts in one scan, so the
+  // degree D2H, the host-side partition arithmetic, and the table
+  // upload all disappear. The host still needs max_output to size the
+  // output arrays — one scalar D2H after the prep kernel syncs.
   const uint32_t block_dim = QueryVectorCoreCountFused(ctx.device_id);
-  const std::vector<uint32_t> row_split =
-      BuildBalancedPartitionsFused(picks, block_dim);
-
-  // Per-block output offsets as prefix sums of picks over row ranges.
-  std::vector<uint32_t> out_starts =
-      BlockOutputStarts(picks, row_split, block_dim);
-  const int64_t max_output = out_starts[block_dim];
-  CHECK(max_output <= static_cast<int64_t>(std::numeric_limits<IdType>::max()))
-      << "Output size " << max_output << " exceeds IdType range";
 
   auto stream = dgl::runtime::getCurrentAscendStream();
+  NDArray deg = CSRGetRowNNZ<kDGLAscend, IdType>(mat, rows);
+  IdArray picks_arr = aten::NewIdArray(num_rows, ctx, 8 * sizeof(uint32_t));
+  IdArray row_split_arr =
+      aten::NewIdArray(block_dim + 1, ctx, 8 * sizeof(uint32_t));
+  IdArray out_starts_arr =
+      aten::NewIdArray(block_dim + 1, ctx, 8 * sizeof(uint32_t));
+
+  uint32_t prep_tiling[5] = {
+      static_cast<uint32_t>(num_rows),
+      fanout,
+      static_cast<uint32_t>(replace ? 1 : 0),
+      static_cast<uint32_t>(select_all ? 1 : 0),
+      block_dim,
+  };
+  void* prep_tiling_dev = nullptr;
+  ASCEND_CALL(aclrtMalloc(
+      &prep_tiling_dev, sizeof(prep_tiling), ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(aclrtMemcpyAsync(
+      prep_tiling_dev, sizeof(prep_tiling), prep_tiling, sizeof(prep_tiling),
+      ACL_MEMCPY_HOST_TO_DEVICE, stream));
+  ASCEND_CALL(aclrtSynchronizeStream(stream));  // stack-backed upload
+  {
+    const aclError err =
+        aclrtlaunch_csr_row_wise_sampling_uniform_fused_prep_int64(
+            1, stream, deg->data, picks_arr->data, row_split_arr->data,
+            out_starts_arr->data, prep_tiling_dev);
+    CHECK(err == ACL_SUCCESS) << "fused prep kernel launch failed: " << err;
+  }
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  ASCEND_CALL(aclrtFree(prep_tiling_dev));
+
+  uint32_t max_output_u32 = 0;
+  ASCEND_CALL(aclrtMemcpy(
+      &max_output_u32, sizeof(uint32_t),
+      static_cast<char*>(out_starts_arr->data) + block_dim * sizeof(uint32_t),
+      sizeof(uint32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+  const int64_t max_output = max_output_u32;
+  CHECK(max_output <= static_cast<int64_t>(std::numeric_limits<IdType>::max()))
+      << "Output size " << max_output << " exceeds IdType range";
   const bool has_data = aten::CSRHasData(mat);
   void* data_ptr = has_data ? mat.data->data : nullptr;
 
@@ -477,17 +517,22 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   // launch on the same stream; allocator-reuse ghost data only ever
   // mattered for UNwritten slots.
 
-  // One packed upload replaces three malloc+copy+sync round-trips (the
-  // sync chain dominated the host-side profile; the kernels are fine).
-  const PackedLaunchTables tables = UploadLaunchTablesFused(
-      tiling_data, kTilingHeaderWordsFused, row_split, out_starts, stream);
+  // The prep kernel already produced row_split/out_starts in device
+  // memory — only the small tiling header uploads now.
+  void* tiling_dev = nullptr;
+  ASCEND_CALL(
+      aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
+  ASCEND_CALL(aclrtMemcpyAsync(
+      tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
+      ACL_MEMCPY_HOST_TO_DEVICE, stream));
+  ASCEND_CALL(aclrtSynchronizeStream(stream));  // stack-backed upload
 
   if (std::is_same<IdType, int32_t>::value) {
     aclError err = aclrtlaunch_csr_row_wise_sampling_uniform_fused_int32(
         block_dim, stream, mat.indptr->data, mat.indices->data, data_ptr,
         rows->data, block_csr_indptr->data, picked_coo_rows->data,
         picked_col->data, picked_idx->data, seed_pairs->data,
-        tables.row_split_ptr, tables.out_starts_ptr, tables.tiling_ptr);
+        row_split_arr->data, out_starts_arr->data, tiling_dev);
     CHECK(err == ACL_SUCCESS)
         << "csr_row_wise_sampling_uniform_fused_int32 launch failed: " << err;
   } else {
@@ -495,13 +540,13 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
         block_dim, stream, mat.indptr->data, mat.indices->data, data_ptr,
         rows->data, block_csr_indptr->data, picked_coo_rows->data,
         picked_col->data, picked_idx->data, seed_pairs->data,
-        tables.row_split_ptr, tables.out_starts_ptr, tables.tiling_ptr);
+        row_split_arr->data, out_starts_arr->data, tiling_dev);
     CHECK(err == ACL_SUCCESS)
         << "csr_row_wise_sampling_uniform_fused_int64 launch failed: " << err;
   }
 
   ASCEND_CALL(aclrtSynchronizeStream(stream));
-  ASCEND_CALL(aclrtFree(tables.dev));
+  ASCEND_CALL(aclrtFree(tiling_dev));
 
   // ADR-0014 A1 closure: scatter the compact (rid, pos) pairs into
   // seed_mapping on the host, then write the mapping back. The kernel is
