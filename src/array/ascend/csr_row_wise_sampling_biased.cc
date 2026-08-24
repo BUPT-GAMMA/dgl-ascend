@@ -222,7 +222,7 @@ std::vector<float> BiasToHostClamped(const FloatArray& bias) {
 std::vector<uint32_t> ComputeRowPicks(
     const IdArray& rows, const void* tag_offset_ptr, void* bias_dev,
     bool is_int32, int64_t num_rows, uint32_t fanout, bool replace,
-    bool select_all, int64_t num_total_rows, int64_t num_tags,
+    bool select_all, int64_t num_total_rows, int64_t num_tags, int device_id,
     aclrtStream stream, void** picks_dev, void** picks_tiling_dev) {
   uint32_t tiling_data[kTilingHeaderWords] = {
       static_cast<uint32_t>(num_rows),
@@ -244,15 +244,20 @@ std::vector<uint32_t> ComputeRowPicks(
 
   ASCEND_CALL(aclrtMalloc(
       picks_dev, num_rows * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+  // The pick-count kernel partitions rows evenly across ALL vector cores
+  // (csr_get_row_nnz pattern). Launching it with blockDim=1 left ~97% of
+  // the device idle and dominated the device time at larger tag counts
+  // (measured: 26ns per scalar tag read x O(n*T) on a single core).
+  const uint32_t picks_block_dim = QueryVectorCoreCount(device_id);
   aclError err;
   if (is_int32) {
     err = aclrtlaunch_csr_row_wise_sampling_biased_num_picks_int32(
-        1, stream, rows->data, const_cast<void*>(tag_offset_ptr), bias_dev,
-        *picks_dev, *picks_tiling_dev);
+        picks_block_dim, stream, rows->data, const_cast<void*>(tag_offset_ptr),
+        bias_dev, *picks_dev, *picks_tiling_dev);
   } else {
     err = aclrtlaunch_csr_row_wise_sampling_biased_num_picks_int64(
-        1, stream, rows->data, const_cast<void*>(tag_offset_ptr), bias_dev,
-        *picks_dev, *picks_tiling_dev);
+        picks_block_dim, stream, rows->data, const_cast<void*>(tag_offset_ptr),
+        bias_dev, *picks_dev, *picks_tiling_dev);
   }
   CHECK(err == ACL_SUCCESS)
       << "csr_row_wise_sampling_biased_num_picks launch failed: " << err;
@@ -400,8 +405,8 @@ COOMatrix CSRRowWiseSamplingBiased(
   void* picks_tiling_dev = nullptr;
   const std::vector<uint32_t> picks = ComputeRowPicks(
       rows, tag_offset->data, bias_dev, std::is_same<IdType, int32_t>::value,
-      num_rows, fanout, replace, select_all, mat.num_rows, num_tags, stream,
-      &picks_dev, &picks_tiling_dev);
+      num_rows, fanout, replace, select_all, mat.num_rows, num_tags,
+      ctx.device_id, stream, &picks_dev, &picks_tiling_dev);
 
   // nnz-balanced row partitions across all vector cores (spmm pattern).
   const uint32_t block_dim = QueryVectorCoreCount(ctx.device_id);
