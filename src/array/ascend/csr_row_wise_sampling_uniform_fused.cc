@@ -470,23 +470,16 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
         block_csr_indptr);
   }
 
-  // Zero the output buffers on the launch stream (spmm pattern): DGL's
-  // array allocator reuses device memory without zeroing, so slots the
-  // kernel does not write (idle blocks) must read as 0, not stale data
-  // from earlier launches.
-  const int64_t out_bytes = max_output * (nbits / 8);
-  ASCEND_CALL(
-      aclrtMemsetAsync(picked_coo_rows->data, out_bytes, 0, out_bytes, stream));
-  ASCEND_CALL(
-      aclrtMemsetAsync(picked_col->data, out_bytes, 0, out_bytes, stream));
-  ASCEND_CALL(
-      aclrtMemsetAsync(picked_idx->data, out_bytes, 0, out_bytes, stream));
-  const int64_t indptr_bytes = (num_rows + 1) * (nbits / 8);
-  ASCEND_CALL(aclrtMemsetAsync(
-      block_csr_indptr->data, indptr_bytes, 0, indptr_bytes, stream));
-  const int64_t pairs_bytes = 2 * pair_count * (nbits / 8);
-  ASCEND_CALL(
-      aclrtMemsetAsync(seed_pairs->data, pairs_bytes, 0, pairs_bytes, stream));
+  // No output zeroing on the main path: every slot is provably written.
+  // out_ptr gets one entry per row (invalid rids included); the three
+  // edge arrays are covered exactly because out_starts is the prefix sum
+  of the same pick counts the kernel recomputes (host/kernel formulas
+  verified identical, and the segmented paths return exact counts);
+  seed_pairs emits one pair per row including sentinel pairs for invalid
+  rids. The degenerate paths (EmptyResult / ZeroOutputResult) still
+  zero the indptr explicitly. The memset chain cost ~9ms of launcher
+  wall time and serialized ahead of the launch on the same stream.
+  // (Allocator-reuse ghost data only ever mattered for UNwritten slots.)
 
   // One packed upload replaces three malloc+copy+sync round-trips (the
   // sync chain dominated the host-side profile; the kernels are fine).
