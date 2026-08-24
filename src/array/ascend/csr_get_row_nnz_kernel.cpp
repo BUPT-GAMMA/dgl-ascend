@@ -20,6 +20,16 @@ class KernelCsrGetRowNNZ {
   __aicore__ inline void Process() {
     uint32_t block_id = GetBlockIdx();
     uint32_t block_num = GetBlockNum();
+    // TODO(tmp-probe): remove — dump per-block chunking to see whether
+    // blocks disagree on n_/block_num or overlap ranges.
+    AscendC::printf("[nnz-probe] blk=%u/%u n=%u chunk=%u range=[%u,%u)\n",
+                    block_id, block_num, n_,
+                    (n_ + block_num - 1) / block_num,
+                    block_id * ((n_ + block_num - 1) / block_num),
+                    (block_id * ((n_ + block_num - 1) / block_num) +
+                             ((n_ + block_num - 1) / block_num) > n_)
+                        ? n_
+                        : 0);
     uint32_t chunk = (n_ + block_num - 1) / block_num;
     uint32_t start = block_id * chunk;
     uint32_t end = (start + chunk > n_) ? n_ : start + chunk;
