@@ -471,21 +471,19 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   }
 
   // No output zeroing on the main path: every slot is provably written.
-  // out_ptr gets one entry per row (invalid rids included); the three
-  // edge arrays are covered exactly because out_starts is the prefix
-  // sum of the same pick counts the kernel recomputes (host/kernel
-  // formulas verified identical, and the segmented paths return exact
-  // counts); seed_pairs emits one pair per row including sentinel
-  // pairs for invalid
-  rids.The degenerate paths(EmptyResult / ZeroOutputResult)
-      still zero the indptr explicitly
-          .The memset chain cost ~9ms of launcher wall time and serialized ahead
-              of the launch on the same stream.
-      // (Allocator-reuse ghost data only ever mattered for UNwritten slots.)
+  // out_ptr gets one entry per row (invalid rids included); the edge
+  // arrays are covered exactly because out_starts is the prefix sum of
+  // the same pick counts the kernel recomputes (host/kernel formulas
+  // verified identical, segmented paths return exact counts); and
+  // seed_pairs emits one pair per row (sentinels for invalid rids).
+  // The degenerate paths still zero their indptr explicitly. The memset
+  // chain cost ~9ms of launcher wall time and serialized ahead of the
+  // launch on the same stream; allocator-reuse ghost data only ever
+  // mattered for UNwritten slots.
 
-      // One packed upload replaces three malloc+copy+sync round-trips (the
-      // sync chain dominated the host-side profile; the kernels are fine).
-      const PackedLaunchTables tables = UploadLaunchTablesFused(
+  // One packed upload replaces three malloc+copy+sync round-trips (the
+  // sync chain dominated the host-side profile; the kernels are fine).
+  const PackedLaunchTables tables = UploadLaunchTablesFused(
       tiling_data, kTilingHeaderWordsFused, row_split, out_starts, stream);
 
   if (std::is_same<IdType, int32_t>::value) {
