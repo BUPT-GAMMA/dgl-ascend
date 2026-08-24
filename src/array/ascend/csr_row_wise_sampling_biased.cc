@@ -153,15 +153,7 @@ std::vector<uint32_t> BuildBalancedPartitions(
   return boundaries;
 }
 
-// Uploads a host uint32 table to device memory on the launch stream and
-// synchronizes before returning.
-void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
-  void* dev = UploadHostUInt32Async(host, stream);
-  ASCEND_CALL(aclrtSynchronizeStream(stream));
-  return dev;
-}
-
-// Async variant: the caller keeps `host` alive until it synchronizes the
+// Async upload: the caller keeps `host` alive until it synchronizes the
 // stream (or the launch completes). Batching uploads under one sync cuts
 // per-call stall — each sync costs ~1ms on this stack when the stream is
 // otherwise idle.
@@ -173,6 +165,14 @@ void* UploadHostUInt32Async(
   ASCEND_CALL(aclrtMemcpyAsync(
       dev, host.size() * sizeof(uint32_t), host.data(),
       host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
+  return dev;
+}
+
+// Uploads a host uint32 table to device memory on the launch stream and
+// synchronizes before returning.
+void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
+  void* dev = UploadHostUInt32Async(host, stream);
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
   return dev;
 }
 
