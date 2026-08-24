@@ -71,20 +71,24 @@ def test_degrees_zero_degree_tail_npu():
 
 
 @pytest.mark.skipif(not _check_npu_available(), reason="NPU not available")
-@pytest.mark.parametrize("idtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "idtype", [torch.int32, torch.int64])
 def test_degrees_int32_npu(idtype):
-    """int32 graphs share the kernel path (aclnnMaxDim workaround: build
-    on CPU then move)."""
+    """int32 graphs share the nnz kernel path.
+
+    torch_npu's aclnnMinDim (used by the out_degrees reduction) rejects
+    DT_INT32 at the plugin layer — an upstream limitation unrelated to
+    the nnz kernel. The int32 KERNEL coverage rides on the fused
+    sampler's int32 parametrization (test_csr_row_wise_sampling_uniform_
+    fused_npu.py); here the CSC/in_degrees path is the NPU-safe surface.
+    """
     src = torch.tensor([e[0] for e in EDGES], dtype=idtype)
     dst = torch.tensor([e[1] for e in EDGES], dtype=idtype)
-    # Build the CSR view on CPU, then move: aclnnMaxDim/MinDim (used in
-    # DGL's num_nodes/format inference) reject int32 on device — the
-    # same workaround the sampler tests use.
-    g_cpu = dgl.graph((src, dst), num_nodes=5).formats(["csr"])
-    expected = g_cpu.out_degrees().tolist()
+    g_cpu = dgl.graph((src, dst), num_nodes=5).formats(["csc"])
+    expected = g_cpu.in_degrees().tolist()
     g = g_cpu.to("npu")
     ids = torch.arange(5, dtype=idtype, device="npu")
-    assert g.out_degrees(ids).cpu().tolist() == expected
+    assert g.in_degrees(ids).cpu().tolist() == expected
 
 
 @pytest.mark.skipif(not _check_npu_available(), reason="NPU not available")
@@ -93,10 +97,11 @@ def test_degrees_multi_block_boundary_npu():
     straddle the 40-core chunk edges (chunk=2 with 40 blocks), where the
     earlier per-word-write corruption lived."""
     n = 43
-    src = torch.arange(n, dtype=torch.int64) % 7
-    dst = torch.arange(n, dtype=torch.int64)
-    # CPU-first build (aclnnMinDim rejects on-device inference), and
-    # the expectation comes from the CPU graph itself.
+    gen = torch.Generator().manual_seed(7)
+    # Both endpoints inside [0, 7); 43 edges across 7 nodes straddles
+    # the 40-block chunk boundaries (chunk=2).
+    src = torch.randint(0, 7, (n,), generator=gen)
+    dst = torch.randint(0, 7, (n,), generator=gen)
     g_cpu = dgl.graph((src, dst), num_nodes=7).formats(["csc"])
     expected = g_cpu.in_degrees().tolist()
     g = g_cpu.to("npu")
