@@ -417,13 +417,17 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
         << " exceeds the per-core window of " << window_elems
         << " (with-replace draws that many picks into UB scratch)";
   }
+  auto tp0 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
   std::vector<uint32_t> picks =
       ComputeRowPicks<IdType>(mat, rows, num_rows, fanout, select_all, replace);
+  auto tp1 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
 
+  auto tp1b = std::chrono::steady_clock::now();  // TODO(tmp-probe)
   // nnz-balanced row partitions across all vector cores (spmm pattern).
   const uint32_t block_dim = QueryVectorCoreCountFused(ctx.device_id);
   const std::vector<uint32_t> row_split =
       BuildBalancedPartitionsFused(picks, block_dim);
+  auto tp2 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
 
   // Per-block output offsets as prefix sums of picks over row ranges.
   std::vector<uint32_t> out_starts =
@@ -509,6 +513,10 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
 
   ASCEND_CALL(aclrtSynchronizeStream(stream));
   ASCEND_CALL(aclrtFree(tables.dev));
+  auto tp3 = std::chrono::steady_clock::now();  // TODO(tmp-probe)
+  LOG(INFO) << "[ftiming] picks=" << std::chrono::duration<double, std::milli>(tp1 - tp0).count()
+            << " split=" << std::chrono::duration<double, std::milli>(tp2 - tp1b).count()
+            << " memset+upload+launch+sync=" << std::chrono::duration<double, std::milli>(tp3 - tp2).count();
 
   // ADR-0014 A1 closure: scatter the compact (rid, pos) pairs into
   // seed_mapping on the host, then write the mapping back. The kernel is
