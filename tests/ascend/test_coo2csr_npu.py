@@ -282,6 +282,231 @@ def test_coo_to_csr_npu_graph_path():
     assert g_npu.device == device
 
 
+# ─── Unified-path anchor: sorted vs unsorted produce identical CSR ────────
+# The counting-sort rewrite must produce bit-identical output for row_sorted
+# and unsorted inputs of the same logical edge set (stable semantics). The
+# unsorted case is the sorted case's edges permuted; CPU COOToCSR's stable
+# sort guarantees equal rows keep their original relative order, so feeding
+# the SAME order in both flags must give identical output. We feed the same
+# edge order twice with only the row_sorted flag flipped: for an actually
+# sorted input both runs are semantically identical, and for an unsorted
+# input the flag is a caller assertion (garbage-in), so we test the
+# meaningful direction: sorted-order edges must render identically whether
+# the flag says sorted or not.
+
+def test_coo_to_csr_npu_sorted_flag_invariance():
+    """Same edge order, row_sorted flag flipped: output must be identical."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    torch.manual_seed(7)
+    num_rows, nnz = 200, 4000
+    rows = torch.sort(torch.randint(0, num_rows, (nnz,)))[0]
+    cols = torch.randint(0, num_rows, (nnz,))
+
+    outs = []
+    for dtype in (torch.int32, torch.int64):
+        for flag in (True, False):
+            # int32 graphs must be built on CPU then moved (aclnnMaxDim
+            # rejects NPU int32 max at construction time).
+            g = dgl.graph(
+                (rows.to(dtype), cols.to(dtype)),
+                num_nodes=num_rows, row_sorted=flag).to(device)
+            adj = g.adjacency_matrix()
+            indptr, indices, data = adj.csr()
+            outs.append((indptr.cpu(), indices.cpu(), data.cpu()))
+        assert torch.equal(outs[-2][0], outs[-1][0]), f"{dtype}: indptr differs by flag"
+        assert torch.equal(outs[-2][1], outs[-1][1]), f"{dtype}: indices differ by flag"
+        assert torch.equal(outs[-2][2], outs[-1][2]), f"{dtype}: data differs by flag"
+
+
+# ─── Cache semantics ───────────────────────────────────────────────────────
+# These tests fail on an implementation without a cache only in the sense of
+# "not applicable"; they target the cache that the rewrite introduces:
+#   1. repeated conversion on the same graph must return correct results
+#      (the cache must not corrupt the second call);
+#   2. tensor-address reuse (free old tensor, allocate a different-content
+#      tensor that lands on the same address) must NOT hit the old entry.
+
+def _graph_csr(graph):
+    adj = graph.adjacency_matrix()
+    return adj.csr()
+
+
+def test_coo_to_csr_npu_repeat_call_consistency():
+    """Converting the same graph repeatedly must stay correct (cache path)."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    src = torch.tensor([0, 1, 2, 0, 1, 3], dtype=torch.int64)
+    dst = torch.tensor([1, 2, 3, 2, 0, 1], dtype=torch.int64)
+    g_npu = dgl.graph((src.to(device), dst.to(device))).formats("coo")
+    g_cpu = dgl.graph((src, dst)).formats("coo")
+
+    for i in range(3):
+        indptr_n, indices_n, data_n = _graph_csr(g_npu)
+        indptr_c, indices_c, data_c = _graph_csr(g_cpu)
+        assert torch.equal(indptr_n.cpu(), indptr_c), f"call {i}: indptr mismatch"
+        assert torch.equal(indices_n.cpu(), indices_c), f"call {i}: indices mismatch"
+        assert torch.equal(data_n.cpu(), data_c), f"call {i}: data mismatch"
+
+
+def test_coo_to_csr_npu_address_reuse_no_stale_hit():
+    """Free a converted COO, build a different one that reuses the device
+    memory: the conversion result must reflect the NEW content, not a stale
+    cache entry keyed on the recycled pointer."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    torch.manual_seed(1)
+    n, m = 64, 512
+    src = torch.randint(0, n, (m,), dtype=torch.int64)
+    dst = torch.randint(0, n, (m,), dtype=torch.int64)
+
+    g1 = dgl.graph((src.to(device), dst.to(device))).formats("coo")
+    indptr1, indices1, _ = _graph_csr(g1)
+    del g1  # release the graph; its COO arrays are freed
+
+    # Different content, same shapes and dtype: the NPU caching allocator is
+    # likely to hand back the same addresses. A pointer-keyed cache without
+    # input retention would return the old CSR here.
+    src2 = (src + 1) % n
+    g2 = dgl.graph((src2.to(device), dst.to(device))).formats("coo")
+    indptr2, indices2, _ = _graph_csr(g2)
+
+    g2_cpu = dgl.graph((src2, dst)).formats("coo")
+    indptr_c, indices_c, _ = _graph_csr(g2_cpu)
+
+    assert torch.equal(indptr2.cpu(), indptr_c), \
+        "stale cache hit on address reuse: indptr is from the OLD graph"
+    assert torch.equal(indices2.cpu(), indices_c), \
+        "stale cache hit on address reuse: indices is from the OLD graph"
+
+
+def test_coo_to_csr_npu_graph_content_change_same_object():
+    """A graph whose COO content differs must never reuse another graph's
+    CSR even when shapes match (distinct tensors → distinct keys)."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    torch.manual_seed(2)
+    n, m = 50, 300
+    a_src = torch.randint(0, n, (m,), dtype=torch.int64)
+    a_dst = torch.randint(0, n, (m,), dtype=torch.int64)
+    b_src = torch.randint(0, n, (m,), dtype=torch.int64)
+    b_dst = torch.randint(0, n, (m,), dtype=torch.int64)
+
+    g_a = dgl.graph((a_src.to(device), a_dst.to(device))).formats("coo")
+    g_b = dgl.graph((b_src.to(device), b_dst.to(device))).formats("coo")
+
+    indptr_a, indices_a, _ = _graph_csr(g_a)
+    indptr_b, indices_b, _ = _graph_csr(g_b)
+
+    cpu_a = dgl.graph((a_src, a_dst)).formats("coo")
+    cpu_b = dgl.graph((b_src, b_dst)).formats("coo")
+    indptr_ca, indices_ca, _ = _graph_csr(cpu_a)
+    indptr_cb, indices_cb, _ = _graph_csr(cpu_b)
+
+    assert torch.equal(indptr_a.cpu(), indptr_ca), "graph A indptr wrong"
+    assert torch.equal(indptr_b.cpu(), indptr_cb), "graph B indptr wrong"
+    assert torch.equal(indices_a.cpu(), indices_ca), "graph A indices wrong"
+    assert torch.equal(indices_b.cpu(), indices_cb), "graph B indices wrong"
+    # And the two graphs must not collide with each other.
+    assert not torch.equal(indptr_a.cpu(), indptr_b.cpu()) or \
+        not torch.equal(indices_a.cpu(), indices_b.cpu()), \
+        "distinct graphs collided to the same CSR (cache key collision)"
+
+
+# ─── Defense: out-of-range row ids must fail loudly ────────────────────────
+
+def test_coo_to_csr_npu_row_out_of_range():
+    """A row id >= num_rows must trigger an error (kernel-side clamping is
+    NOT acceptable; host-side CHECK from the min/max reduction is)."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    rows = torch.tensor([0, 1, 999], dtype=torch.int64)  # 999 >= num_rows=3
+    cols = torch.tensor([0, 1, 2], dtype=torch.int64)
+    with pytest.raises(Exception):
+        dgl.graph((rows.to(device), cols.to(device)), num_nodes=3).formats("csr")
+
+
+# ─── Large-scale smoke: multi-band path (rows beyond single-band capacity) ─
+
+def test_coo_to_csr_npu_multi_band_large():
+    """num_rows large enough that the counting-sort bands split: correctness
+    against CPU on a random sparse matrix."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    torch.manual_seed(3)
+    # 2M rows / 500k edges: rows span far beyond a 192KB band (~48k int32
+    # slots), forcing multiple bands in Pass 1/2.
+    num_rows, nnz = 2_000_000, 500_000
+    rows = torch.randint(0, num_rows, (nnz,), dtype=torch.int64)
+    cols = torch.randint(0, 1000, (nnz,), dtype=torch.int64)
+
+    g_npu = dgl.graph((rows.to(device), cols.to(device)),
+                      num_nodes=num_rows).formats("coo")
+    g_cpu = dgl.graph((rows, cols), num_nodes=num_rows).formats("coo")
+
+    indptr_n, indices_n, data_n = _graph_csr(g_npu)
+    indptr_c, indices_c, data_c = _graph_csr(g_cpu)
+
+    assert torch.equal(indptr_n.cpu(), indptr_c), "multi-band indptr mismatch"
+    assert torch.equal(indices_n.cpu(), indices_c), "multi-band indices mismatch"
+    assert torch.equal(data_n.cpu(), data_c), "multi-band data mismatch"
+
+
+# ─── Sampling integration (the DEBT-01 user story) ─────────────────────────
+
+def test_coo_to_csr_npu_sampling_integration():
+    """COO-restricted graph sampling (the 0.43x scenario) must stay correct
+    while the conversion is cached/recomputed."""
+    device, cpu = _setup()
+    if device is None:
+        return
+
+    torch.manual_seed(4)
+    n, m = 200, 2000
+    src = torch.randint(0, n, (m,), dtype=torch.int64)
+    dst = torch.randint(0, n, (m,), dtype=torch.int64)
+    g_npu = dgl.graph((src.to(device), dst.to(device)),
+                      num_nodes=n).formats("coo")
+    g_cpu = dgl.graph((src, dst), num_nodes=n).formats("coo")
+
+    nodes = torch.arange(n)
+    for fanout in (10, -1):
+        sg_npu = dgl.sampling.sample_neighbors(
+            g_npu, nodes.to(device), fanout, edge_dir="out")
+        sg_cpu = dgl.sampling.sample_neighbors(
+            g_cpu, nodes, fanout, edge_dir="out")
+        # Sampled subgraphs come back as CSR (eid order); compare per-SRC
+        # sampled degrees (bincount over the SOURCE tensor — counting dst
+        # measures in-degree pattern and mismatches randomly): both sides
+        # must pick exactly min(fanout, out_deg) edges per source node.
+        sn, _ = sg_npu.cpu().edges()
+        sc, _ = sg_cpu.edges()
+        npu_deg = torch.bincount(sn.long(), minlength=n)
+        cpu_deg = torch.bincount(sc.long(), minlength=n)
+        out_deg = torch.bincount(src, minlength=n)
+        cap = n if fanout == -1 else fanout  # select-all: no cap
+        expect = torch.minimum(out_deg, torch.full_like(out_deg, cap))
+        assert torch.equal(npu_deg, expect), \
+            f"fanout={fanout}: NPU per-source degree != min(fanout, out_deg)"
+        assert torch.equal(cpu_deg, expect), \
+            f"fanout={fanout}: CPU per-source degree != min(fanout, out_deg)"
+        # select-all: total sampled edges must equal total edges
+        if fanout == -1:
+            assert sn.numel() == m, f"select-all: {sn.numel()} != {m} edges"
+
+
 if __name__ == "__main__":
     failures = 0
     named_tests = [
@@ -307,6 +532,13 @@ if __name__ == "__main__":
                 test_coo_to_csr_npu_data_field(n, r, c, s, dt)))
     named_tests.append(("in_edges_eid", test_coo_to_csr_npu_in_edges_eid))
     named_tests.append(("data_field_random_large", test_coo_to_csr_npu_data_field_random_large))
+    named_tests.append(("sorted_flag_invariance", test_coo_to_csr_npu_sorted_flag_invariance))
+    named_tests.append(("repeat_call_consistency", test_coo_to_csr_npu_repeat_call_consistency))
+    named_tests.append(("address_reuse_no_stale_hit", test_coo_to_csr_npu_address_reuse_no_stale_hit))
+    named_tests.append(("graph_content_change_same_object", test_coo_to_csr_npu_graph_content_change_same_object))
+    named_tests.append(("row_out_of_range", test_coo_to_csr_npu_row_out_of_range))
+    named_tests.append(("multi_band_large", test_coo_to_csr_npu_multi_band_large))
+    named_tests.append(("sampling_integration", test_coo_to_csr_npu_sampling_integration))
     for name, test in named_tests:
         try:
             test()
