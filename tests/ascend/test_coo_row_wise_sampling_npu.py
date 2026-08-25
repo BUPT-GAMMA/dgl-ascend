@@ -418,6 +418,66 @@ def test_uniform_statistical():
         assert 120 < counts[succ] < 280, f"succ {succ}: {counts}"
 
 
+def test_uniform_statistical_replace():
+    """With-replacement sampling must also be uniform over many trials.
+
+    The no-replace variant is covered by test_uniform_statistical; the
+    replace=True RNG path (fanout draws with repetition allowed) is a
+    distinct code path in the kernel and gets its own frequency check.
+    """
+    device, cpu = _setup()
+    if device is None:
+        return
+    g = _build_graph(5, EDGES_5, device)
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    fanout = 1
+    trials = 600
+    from collections import Counter
+    counts = Counter()
+    for _ in range(trials):
+        sg = dgl.sampling.sample_neighbors(
+            g, nodes, fanout, replace=True, edge_dir="out")
+        u, v = _uv(sg)
+        counts[v.item()] += 1
+    assert sum(counts.values()) == trials, counts
+    for succ in (1, 2, 3):
+        assert 120 < counts[succ] < 280, f"succ {succ}: {counts}"
+
+
+def test_wide_degree_random_graph_parity():
+    """Random graph with wide degree spread: per-node sampled degree must
+    equal min(fanout, true degree) for every node (multigraph counting:
+    parallel edge instances count separately).
+
+    Existing large-graph cases use dense uniform degrees; this exercises
+    the skewed tail (hubs vs single-edge nodes) against both multigraph
+    and unique-(u,v) oracles, which agree on this generator's output.
+    """
+    device, cpu = _setup()
+    if device is None:
+        return
+    torch.manual_seed(7)
+    n, m, fanout = 3000, 30000, 3
+    src = torch.randint(0, n, (m,))
+    dst = torch.randint(0, n, (m,))
+    g = dgl.graph((src.to(device), dst.to(device)),
+                  num_nodes=n).formats("coo")
+    nodes = torch.arange(n, device=device)
+    sg = dgl.sampling.sample_neighbors(g, nodes, fanout, edge_dir="out")
+    u, _ = _uv(sg)
+    deg_n = torch.bincount(u.long(), minlength=n)
+    # Multigraph oracle: parallel edges are distinct instances.
+    deg_true = torch.bincount(src, minlength=n).clamp(max=fanout)
+    assert torch.equal(deg_n, deg_true), (
+        f"degree mismatch on {(deg_n != deg_true).sum()} nodes; "
+        f"max diff {(deg_n - deg_true).abs().max()}")
+    # Unique-(u,v) oracle must agree for this generator (no duplicate
+    # edges at this density; guards the oracle itself).
+    uv = src * n + dst
+    deg_uq = torch.bincount(torch.unique(uv) // n, minlength=n).clamp(max=fanout)
+    assert torch.equal(deg_n, deg_uq)
+
+
 # ---------------------------------------------------------------------------
 # Larger / stress
 # ---------------------------------------------------------------------------
