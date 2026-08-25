@@ -47,14 +47,16 @@ IdArray Range(int64_t low, int64_t high, uint8_t nbits, DGLContext ctx) {
   IdArray ret;
 #ifdef DGL_USE_ASCEND
   if (ctx.device_type == kDGLAscend) {
-    DGLContext cpu_ctx;
-    cpu_ctx.device_type = kDGLCPU;
-    cpu_ctx.device_id = 0;
-    ret = Range(low, high, nbits, cpu_ctx);
-    IdArray npu_ret = NewIdArray(ret->shape[0], ctx, nbits);
-    if (ret->shape[0] == 0) return npu_ret;
-    npu_ret.CopyFrom(ret);
-    return npu_ret;
+    if (nbits == 32) {
+      ret = impl::Range<kDGLAscend, int32_t>(
+          static_cast<int32_t>(low), static_cast<int32_t>(high), ctx);
+    } else if (nbits == 64) {
+      ret = impl::Range<kDGLAscend, int64_t>(
+          static_cast<int64_t>(low), static_cast<int64_t>(high), ctx);
+    } else {
+      LOG(FATAL) << "Only int32 or int64 is supported.";
+    }
+    return ret;
   }
 #endif
   ATEN_XPU_SWITCH_CUDA(ctx.device_type, XPU, "Range", {
