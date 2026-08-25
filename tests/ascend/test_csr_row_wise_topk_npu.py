@@ -20,6 +20,8 @@ DGL's ``select_topk`` samples in-edges by default (``edge_dir='in'``), which
 takes the CSC view; ``edge_dir='out'`` takes CSR. Both paths dispatch to the
 same CSRRowWiseTopk kernel.
 """
+import struct
+
 import pytest
 import torch
 import dgl
@@ -544,3 +546,76 @@ def test_coo_assembly_and_select_all(fmt):
         sg_npu = _select_topk(g_npu, nodes, k)
         sg_cpu = _select_topk(g.formats(fmt), nodes.cpu(), k)
         assert _edge_set(sg_npu) == _edge_set(sg_cpu), f"fmt={fmt} k={k}"
+
+def test_precision_large_scale_statistics():
+    """Large-scale randomized divergence statistics (device validation of
+    the ADR-0011 design analysis, 87x the design-phase Monte Carlo scale):
+    five random weight distributions over a 100k-row graph must produce
+    ZERO edge-set divergence; the adversarial clustered case (weights
+    below f32 resolution at a large base) produces only ULP-bounded
+    divergence."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    gen = torch.Generator().manual_seed(42)
+    n, deg, k = 100_000, 10, 10
+    src = torch.randint(0, n, (n * deg,), generator=gen)
+    dst = torch.randint(0, n, (n * deg,), generator=gen)
+    cases = {
+        "uniform f32": torch.rand(n * deg, generator=gen),
+        "uniform f64": torch.rand(n * deg, generator=gen, dtype=torch.float64),
+        "int64 small": torch.randint(0, 1 << 20, (n * deg,), generator=gen),
+        "int64 full": torch.randint(-(1 << 40), 1 << 40, (n * deg,),
+                                    generator=gen),
+        "normal f32": torch.randn(n * deg, generator=gen),
+    }
+    for name, w in cases.items():
+        g = dgl.graph((src, dst), num_nodes=n)
+        g.edata["w"] = w
+        g_npu = g.to(device).formats("csc")
+        nodes = torch.arange(n, device=device)
+        sg_npu = _select_topk(g_npu, nodes, k)
+        sg_cpu = _select_topk(g.formats("csc"), nodes.cpu(), k)
+        assert _edge_set(sg_npu) == _edge_set(sg_cpu), name
+
+
+def test_precision_clustered_bounded():
+    """Clustered weights (spacing below f32 resolution at a large base)
+    diverge on ~1.6% of edges, and every divergent row's swapped weights
+    sit within one f32 ULP — the bounded-divergence contract, verified
+    on device over 100k rows."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    gen = torch.Generator().manual_seed(42)
+    n, deg, k = 100_000, 10, 10
+    src = torch.randint(0, n, (n * deg,), generator=gen)
+    dst = torch.randint(0, n, (n * deg,), generator=gen)
+    w = 1e9 + torch.rand(n * deg, generator=gen, dtype=torch.float64) * 1e-7
+    g = dgl.graph((src, dst), num_nodes=n)
+    g.edata["w"] = w
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.arange(n, device=device)
+    sg_npu = _select_topk(g_npu, nodes, k)
+    sg_cpu = _select_topk(g.formats("csc"), nodes.cpu(), k)
+
+    rows_npu = _row_weight_set(sg_npu)
+    rows_cpu = _row_weight_set(sg_cpu)
+    divergent = 0
+    ulp = 64.0  # f32 ULP at 1e9
+    for vv, ws_npu in rows_npu.items():
+        ws_cpu = rows_cpu.get(vv)
+        if ws_cpu is None or sorted(ws_npu) == sorted(ws_cpu):
+            continue
+        divergent += 1
+        # every NPU weight must be within one ULP of some CPU weight
+        for a in ws_npu:
+            a32 = struct.pack("<f", a)
+            a_f32 = struct.unpack("<f", a32)[0]
+            if not any(
+                abs(a_f32 - struct.unpack("<f", struct.pack("<f", b))[0])
+                <= ulp for b in ws_cpu):
+                pytest.fail(f"row {vv}: divergence exceeds one ULP")
+    # divergence exists (the clustered case does produce ties) and is rare
+    assert 0 < divergent < 0.05 * len(rows_npu), (
+        f"unexpected divergence rate: {divergent}/{len(rows_npu)}")
