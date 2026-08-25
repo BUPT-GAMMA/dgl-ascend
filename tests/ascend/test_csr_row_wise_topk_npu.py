@@ -617,7 +617,8 @@ def test_precision_clustered_bounded():
     # Divergence exists (the clustered case produces ties) but stays rare
     # at the edge level — measured as the edge-set symmetric difference,
     # the same oracle the exact tests use.
-    set_npu, set_cpu = _edge_set(sg_npu), _edge_set(sg_cpu)
+    set_npu = set(_edge_set(sg_npu))
+    set_cpu = set(_edge_set(sg_cpu))
     divergent_edges = len(set_npu ^ set_cpu)
     total_edges = len(set_cpu)
     assert 0 < divergent_edges < 0.05 * total_edges, (
