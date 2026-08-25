@@ -602,12 +602,9 @@ def test_precision_clustered_bounded():
     rows_npu = _row_weight_set(sg_npu)
     rows_cpu = _row_weight_set(sg_cpu)
     ulp = 64.0  # f32 ULP at 1e9
-    total_edges = 0
-    divergent_edges = 0
     for vv, ws_npu in rows_npu.items():
         ws_cpu = rows_cpu.get(vv)
         assert ws_cpu is not None
-        total_edges += len(ws_cpu)
         if sorted(ws_npu) == sorted(ws_cpu):
             continue
         # every NPU weight must be within one ULP of some CPU weight
@@ -617,10 +614,11 @@ def test_precision_clustered_bounded():
                 abs(a_f32 - struct.unpack("<f", struct.pack("<f", b))[0])
                 <= ulp for b in ws_cpu):
                 pytest.fail(f"row {vv}: divergence exceeds one ULP")
-            divergent_edges += 1
-    # divergence exists (the clustered case produces ties) but stays rare
-    # at the EDGE level: every row's 10 edges nearly all tie under f32,
-    # so most ROWS contain at least one swap, yet only a small share of
-    # EDGES actually differ.
+    # Divergence exists (the clustered case produces ties) but stays rare
+    # at the edge level — measured as the edge-set symmetric difference,
+    # the same oracle the exact tests use.
+    set_npu, set_cpu = _edge_set(sg_npu), _edge_set(sg_cpu)
+    divergent_edges = len(set_npu ^ set_cpu)
+    total_edges = len(set_cpu)
     assert 0 < divergent_edges < 0.05 * total_edges, (
         f"unexpected edge divergence rate: {divergent_edges}/{total_edges}")
