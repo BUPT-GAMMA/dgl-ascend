@@ -887,6 +887,23 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingFused(
     std::vector<IdType>* new_seed_nodes, int64_t num_samples,
     NDArray prob_or_mask, bool replace) {
   std::pair<CSRMatrix, IdArray> ret;
+#ifdef DGL_USE_ASCEND
+  if (rows->ctx.device_type == kDGLAscend) {
+    if (IsNullArray(prob_or_mask)) {
+      ret = impl::CSRRowWiseSamplingUniformFused<
+          kDGLAscend, IdType, map_seed_nodes>(
+          mat, rows, seed_mapping, new_seed_nodes, num_samples, replace);
+    } else {
+      CHECK_VALID_CONTEXT(prob_or_mask, rows);
+      // Weighted fused sampling has no CUDA reference either; explicit
+      // named gap on NPU (see the fused operator docs in the process
+      // repository). CHECK raises a catchable DGL error; LOG(FATAL)
+      // would abort the process out from under Python.
+      CHECK(false) << "Weighted fused sampling (prob/mask) is not supported "
+                      "on NPU yet";
+    }
+  } else
+#endif  // DGL_USE_ASCEND
   if (IsNullArray(prob_or_mask)) {
     ATEN_XPU_SWITCH(
         rows->ctx.device_type, XPU, "CSRRowWiseSamplingUniformFused", {
