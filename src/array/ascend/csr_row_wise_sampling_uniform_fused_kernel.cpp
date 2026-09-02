@@ -76,7 +76,6 @@ class KernelCsrRowWiseSamplingUniformFused {
       GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
       GM_ADDR seed_pairs, GM_ADDR row_split, GM_ADDR out_starts,
       GM_ADDR tiling_ptr, TPipe* pipe) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 
     // Struct-pointer tiling access (spmm pattern): field loads through a
     // typed __gm__ pointer are consistently visible across blocks.

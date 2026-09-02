@@ -56,7 +56,6 @@ class KernelCooToCsrCount {
   __aicore__ inline void Init(
       GM_ADDR rows, GM_ADDR counts, GM_ADDR reduces, GM_ADDR row_split,
       GM_ADDR tiling_ptr, TPipe* pipe) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const __gm__ CooToCsrTiling* t = (const __gm__ CooToCsrTiling*)tiling_ptr;
     nnz_ = t->nnz;
     num_rows_ = t->num_rows;
@@ -181,7 +180,6 @@ class KernelCooToCsrScatter {
       GM_ADDR rows, GM_ADDR cols, GM_ADDR data, GM_ADDR indptr,
       GM_ADDR out_indices, GM_ADDR out_data, GM_ADDR row_split,
       GM_ADDR tiling_ptr, TPipe* pipe) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const __gm__ CooToCsrTiling* t = (const __gm__ CooToCsrTiling*)tiling_ptr;
     nnz_ = t->nnz;
     num_rows_ = t->num_rows;

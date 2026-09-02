@@ -47,7 +47,6 @@ class KernelFusedPrep {
   __aicore__ inline void Init(
       GM_ADDR deg, GM_ADDR picks, GM_ADDR row_split, GM_ADDR out_starts,
       GM_ADDR tiling_ptr, TPipe* pipe) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     const __gm__ uint32_t* tiling = (const __gm__ uint32_t*)tiling_ptr;
     num_rows_ = tiling[0];
     fanout_ = tiling[1];
