@@ -49,7 +49,7 @@ class KernelFusedPrep {
     fanout_ = tiling[1];
     replace_ = tiling[2];
     select_all_ = tiling[3];
-    block_dim_ = tiling[4];
+    block_dim_ = tiling[4] <= kMaxBlocks ? tiling[4] : kMaxBlocks;
 
     // Degrees arrive with the graph's idtype (int32/int64) — read them
     // through the matching type or every other word is garbage.
@@ -188,7 +188,11 @@ class KernelFusedPrep {
   }
 
  private:
-  static constexpr uint32_t kMaxBlocks = 64;  // row_split capacity guard
+  // row_split capacity guard, shared with the host launcher (which
+  // clamps the launched block count to it). The kernel-side clamp below
+  // is belt-and-braces: the UB tables hold kMaxSamplingBlocksFused + 1
+  // entries, so a hostile tiling could otherwise overflow them silently.
+  static constexpr uint32_t kMaxBlocks = kMaxSamplingBlocksFused;
 
   const __gm__ uint32_t* deg_p_ = nullptr;  // scalar reads (single core)
   GlobalTensor<DegT> deg_gm_;
