@@ -94,11 +94,7 @@ class KernelFusedPrep {
 
       LocalTensor<uint32_t> pick_win = pick_q_.AllocTensor<uint32_t>();
       for (uint32_t j = 0; j < count; ++j) {
-        const uint32_t d = static_cast<uint32_t>(deg_win.GetValue(j));
-        const uint32_t p = select_all_ ? d
-                           : replace_  ? (d == 0 ? 0u : fanout_)
-                                       : (d < fanout_ ? d : fanout_);
-        pick_win.SetValue(j, p);
+        pick_win.SetValue(j, PickOf(deg_win.GetValue(j)));
       }
 
       // Boundaries resolve in the second pass below (targets need the
@@ -130,11 +126,14 @@ class KernelFusedPrep {
     }
 
     // Boundary resolution needs targets = total*part/block_dim, which
-    // needs the full prefix — rescan picks from GM (sequential reads,
-    // single core, windowed). The MTE3 writes above must drain before
-    // the scalar reads below see them (V-side read after MTE-side write
-    // needs the pipeline barrier; without it the rescan reads stale GM).
-    AscendC::PipeBarrier<PIPE_MTE3>();
+    // needs the full prefix. The pick count is a pure function of the
+    // degree, so this pass recomputes it from deg_gm_ instead of reading
+    // back the picks_gm_ image the MTE3 copies above just started
+    // writing: a scalar GM read of an in-flight MTE3 target has no
+    // inter-pipe ordering guarantee (PipeBarrier<PIPE_MTE3> orders the
+    // MTE3 pipe against itself, not the scalar unit against it), and the
+    // read-back was observed returning stale words — zero tails that
+    // collapsed out_starts, wrong boundaries that overlapped row ranges.
     const uint32_t total = static_cast<uint32_t>(prefix);
     uint32_t boundary = 0;  // candidate row index
     uint64_t run2 = 0;      // second-pass prefix
@@ -157,7 +156,7 @@ class KernelFusedPrep {
       }
       if (run2 < target) {
         // advance one row at a time until the prefix reaches the target
-        run2 += picks_gm_.GetValue(boundary);
+        run2 += PickOf(static_cast<uint32_t>(deg_gm_.GetValue(boundary)));
         ++boundary;
       } else {
         // boundary is the first index with prefix >= target
@@ -188,7 +187,9 @@ class KernelFusedPrep {
         ++sb;
         next_split = split_local.GetValue(sb);
       }
-      if (i < num_rows_) run3 += picks_gm_.GetValue(i);
+      if (i < num_rows_) {
+        run3 += PickOf(static_cast<uint32_t>(deg_gm_.GetValue(i)));
+      }
     }
     starts_local.SetValue(block_dim_, static_cast<uint32_t>(run3));
 
@@ -203,13 +204,22 @@ class KernelFusedPrep {
   }
 
  private:
+  // Pick count for one row, a pure function of its degree. The staging
+  // pass and both scans below recompute it from the same degree word,
+  // so every consumer sees bit-identical values without ever reading
+  // back the picks_gm_ image while its MTE3 copy is in flight.
+  __aicore__ inline uint32_t PickOf(uint32_t d) const {
+    if (select_all_) return d;
+    if (replace_) return d == 0 ? 0u : fanout_;
+    return d < fanout_ ? d : fanout_;
+  }
+
   // row_split capacity guard, shared with the host launcher (which
   // clamps the launched block count to it). The kernel-side clamp below
   // is belt-and-braces: the UB tables hold kMaxSamplingBlocksFused + 1
   // entries, so a hostile tiling could otherwise overflow them silently.
   static constexpr uint32_t kMaxBlocks = kMaxSamplingBlocksFused;
 
-  const __gm__ uint32_t* deg_p_ = nullptr;  // scalar reads (single core)
   GlobalTensor<DegT> deg_gm_;
   GlobalTensor<uint32_t> picks_gm_, row_split_gm_, out_starts_gm_;
   uint32_t num_rows_ = 0, fanout_ = 0, replace_ = 0, select_all_ = 0,
