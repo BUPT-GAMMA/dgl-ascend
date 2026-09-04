@@ -31,7 +31,11 @@ using namespace AscendC;
 
 namespace {
 
-constexpr uint32_t kPrepWindow = 8192;  // degrees staged per GM read
+// Degrees staged per GM read. Sized so that, together with the
+// double-buffered pick queue below, the kernel stays within the AIV UB
+// budget for the int64 degree instantiation (2 deg windows + 2 pick
+// windows + the two block tables).
+constexpr uint32_t kPrepWindow = 4096;
 
 }  // namespace
 
@@ -60,7 +64,7 @@ class KernelFusedPrep {
         (__gm__ uint32_t*)out_starts, block_dim_ + 1);
 
     pipe->InitBuffer(win_buf_, 2, kPrepWindow * sizeof(DegT));
-    pipe->InitBuffer(pick_buf_, kPrepWindow * sizeof(uint32_t));
+    pipe->InitBuffer(pick_q_, 2, kPrepWindow * sizeof(uint32_t));
     pipe->InitBuffer(split_buf_, (kMaxBlocks + 1) * sizeof(uint32_t));
     pipe->InitBuffer(starts_buf_, (kMaxBlocks + 1) * sizeof(uint32_t));
   }
@@ -70,7 +74,6 @@ class KernelFusedPrep {
     // batched write, and track the running prefix. row_split/out_starts
     // are small (< 42 entries) and written once at the end through the
     // MTE path (multi-word GM scalar stores are banned family-wide).
-    LocalTensor<uint32_t> pick_win = pick_buf_.Get<uint32_t>();
     LocalTensor<uint32_t> split_local = split_buf_.Get<uint32_t>();
 
     uint64_t prefix = 0;     // running pick total
@@ -90,6 +93,7 @@ class KernelFusedPrep {
       win_buf_.EnQue(deg_win);
       deg_win = win_buf_.DeQue<DegT>();
 
+      LocalTensor<uint32_t> pick_win = pick_q_.AllocTensor<uint32_t>();
       for (uint32_t j = 0; j < count; ++j) {
         const uint32_t d = static_cast<uint32_t>(deg_win.GetValue(j));
         const uint32_t p = select_all_ ? d
@@ -101,15 +105,27 @@ class KernelFusedPrep {
       // Boundaries resolve in the second pass below (targets need the
       // final total); this loop is a pure scan.
 
-      // Batched picks write (MTE path for cross-block consistency).
-      {
-        const uint32_t write_bytes = count * sizeof(uint32_t);
-        DataCopyExtParams wcp{1, write_bytes, 0, 0, 0};
-        DataCopyPad(picks_gm_[row], pick_win, wcp);
-      }
+      // Consume pick_win on the vector side while the buffer is still
+      // V-owned: the running prefix must be accumulated before the
+      // buffer is handed to MTE3.
       for (uint32_t j = 0; j < count; ++j) {
         prefix += pick_win.GetValue(j);
       }
+      // Batched picks write (MTE path for cross-block consistency).
+      // Staged through the VECOUT queue (same idiom as CopyOutStaged in
+      // the sampling kernel): the EnQue/DeQue pair orders the V-side
+      // SetValue stores before the MTE-side read, and the depth-2 pool
+      // hands out a different buffer each window, so a still-in-flight
+      // copy from the previous window is never overwritten (DataCopyPad
+      // is asynchronous).
+      pick_q_.EnQue(pick_win);
+      LocalTensor<uint32_t> ready = pick_q_.DeQue<uint32_t>();
+      {
+        const uint32_t write_bytes = count * sizeof(uint32_t);
+        DataCopyExtParams wcp{1, write_bytes, 0, 0, 0};
+        DataCopyPad(picks_gm_[row], ready, wcp);
+      }
+      pick_q_.FreeTensor(ready);
       row += count;
       win_buf_.FreeTensor(deg_win);
     }
@@ -200,7 +216,8 @@ class KernelFusedPrep {
   uint32_t num_rows_ = 0, fanout_ = 0, replace_ = 0, select_all_ = 0,
            block_dim_ = 0;
   TQue<TPosition::VECIN, 2> win_buf_;
-  TBuf<TPosition::VECCALC> pick_buf_, split_buf_, starts_buf_;
+  TQue<TPosition::VECOUT, 2> pick_q_;
+  TBuf<TPosition::VECCALC> split_buf_, starts_buf_;
 };
 
 extern "C" __global__ __aicore__ void
