@@ -85,7 +85,10 @@ namespace {
 // Returns the device's vector-core count, queried at runtime so the
 // launch adapts to any SoC (910B family: 40 AIV; other families or
 // trimmed vNPU instances differ). Falls back to the arch default when
-// the query is unavailable.
+// the query is unavailable. Clamped to kMaxSamplingBlocksFused: the prep
+// kernel's UB boundary tables hold that many entries plus one, and the
+// tiling hand-off has no way to grow them — beyond the cap the op
+// simply uses fewer blocks than there are cores.
 uint32_t QueryVectorCoreCountFused(int device_id) {
   int64_t core_num = 0;
   aclError err =
@@ -93,7 +96,8 @@ uint32_t QueryVectorCoreCountFused(int device_id) {
   if (err != ACL_SUCCESS || core_num <= 0 || core_num > 4096) {
     return kDefaultVectorCoreCountFused;
   }
-  return static_cast<uint32_t>(core_num);
+  uint32_t dim = static_cast<uint32_t>(core_num);
+  return dim <= kMaxSamplingBlocksFused ? dim : kMaxSamplingBlocksFused;
 }
 
 // Returns the per-vector-core unified-buffer budget in bytes (minus the

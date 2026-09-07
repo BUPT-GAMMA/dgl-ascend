@@ -35,6 +35,15 @@ constexpr uint32_t kDefaultVectorCoreCountFused = 40;  // fallback, 910B
 constexpr uint32_t kDefaultUbBytesFused = 192 * 1024;  // fallback, 910B
 constexpr uint32_t kUbReservedBytesFused = 2 * 1024;   // runtime reserved
 
+// Upper bound on launched blocks. The prep kernel stages row_split /
+// out_starts in UB tables of kMaxSamplingBlocksFused + 1 entries each
+// (single allocation, no dynamic growth), so the host must clamp the
+// queried vector-core count to this cap: launching more blocks than the
+// tables hold would leave the excess cores reading uninitialized
+// boundaries. Past the cap the op degrades gracefully — it simply uses
+// fewer blocks than there are cores.
+constexpr uint32_t kMaxSamplingBlocksFused = 64;
+
 // RNG constants (xorshift32 with Knuth golden-ratio row hashing) — twin of
 // the uniform kernel's constants; keep the two in sync.
 constexpr uint32_t kGoldenRatioHashFused = 2654435761u;    // 2^32 / phi

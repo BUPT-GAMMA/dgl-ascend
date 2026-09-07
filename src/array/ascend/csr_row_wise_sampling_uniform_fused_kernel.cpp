@@ -76,7 +76,6 @@ class KernelCsrRowWiseSamplingUniformFused {
       GM_ADDR out_ptr, GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_idxs,
       GM_ADDR seed_pairs, GM_ADDR row_split, GM_ADDR out_starts,
       GM_ADDR tiling_ptr, TPipe* pipe) {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 
     // Struct-pointer tiling access (spmm pattern): field loads through a
     // typed __gm__ pointer are consistently visible across blocks.
@@ -483,6 +482,9 @@ class KernelCsrRowWiseSamplingUniformFused {
     const uint32_t copy_bytes = count * sizeof(IdT);
     DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
     DataCopyPad(out_ptr_gm_[row_begin_ + out_ptr_flushed_], staging, cp);
+    // DataCopyPad is asynchronous: drain MTE3 before the next row
+    // overwrites the staging buffer it is still reading from.
+    AscendC::PipeBarrier<PIPE_MTE3>();
     out_ptr_flushed_ += count;
   }
 
@@ -495,6 +497,8 @@ class KernelCsrRowWiseSamplingUniformFused {
     const uint32_t copy_bytes = 2 * count * sizeof(IdT);
     DataCopyExtParams cp{1, copy_bytes, 0, 0, 0};
     DataCopyPad(seed_pairs_gm_[2 * (row_begin_ + pairs_flushed_)], staging, cp);
+    // Same drain requirement as FlushOutPtr above.
+    AscendC::PipeBarrier<PIPE_MTE3>();
     pairs_flushed_ += count;
   }
 
