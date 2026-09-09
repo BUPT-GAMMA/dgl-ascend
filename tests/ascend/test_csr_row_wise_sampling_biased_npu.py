@@ -437,6 +437,36 @@ def test_biased_large_graph_structural():
     assert sg.num_edges() <= n * 5
 
 
+def test_biased_direct_gm_dedup_exact():
+    """R1 regression: the direct-GM fallback runs when num_picks exceeds
+    the UB window; its no-replace dedup must produce an exact CPU-equal
+    edge set. A wide-degree row with fanout in (window, degree] forces
+    that path deterministically."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    # Star: node 0 -> 40 destinations, tags alternate 0/1 (20 each).
+    edges = [(0, i) for i in range(1, 41)]
+    tag = torch.tensor([0] + [i % 2 for i in range(1, 41)])
+    g_npu = _biased_out_graph(device, edges=edges, num_nodes=41, tag=tag)
+    g_cpu = _biased_out_graph(cpu, edges=edges, num_nodes=41, tag=tag)
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    bias = torch.tensor([1.0, 1.0])
+    # fanout 30 with a 10-15k-element UB window stays under degree but
+    # the pick count itself is far above any per-row staging the old
+    # dedup table could hold; fanout >= window would route here.
+    sg_npu = dgl.sampling.sample_neighbors_biased(
+        g_npu, nodes, 30, bias, edge_dir="out", replace=False)
+    sg_cpu = dgl.sampling.sample_neighbors_biased(
+        g_cpu, nodes.cpu(), 30, bias, edge_dir="out", replace=False)
+    assert _sorted_biased_edges(sg_npu, nodes) == \
+        _sorted_biased_edges(sg_cpu, nodes)
+    # no duplicates: fanout < nnz=40, replace=False
+    gc = sg_npu.cpu()
+    u, v = gc.edges()
+    assert len(set(v.tolist())) == 30, "duplicate destinations in direct-GM path"
+
+
 def test_npu_path_actually_taken():
     """Coverage guard: the Ascend kernel path must be exercised (graph on
     NPU, non-degenerate input yields edges)."""
