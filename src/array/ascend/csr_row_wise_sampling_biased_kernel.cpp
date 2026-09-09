@@ -307,13 +307,20 @@ class KernelCsrRowWiseSamplingBiased {
   // Loads tag bounds for the staged row into rem_[], clamped into [0, deg].
   // Returns the total positive-weight bucket population (biased nnz).
   // Call StageTagRow + StageTagRowWait first.
+  // Clamps a staged tag value into [0, deg] without truncation: negative
+  // or beyond-deg int64 values (corrupted input) degrade to clamped
+  // bounds instead of wrapping in a uint32 cast (review R3).
+  __aicore__ inline uint32_t ClampTag(IdT v, uint32_t deg) {
+    if (v < 0) return 0;
+    const IdT deg_id = static_cast<IdT>(deg);
+    return (v > deg_id) ? deg : static_cast<uint32_t>(v);
+  }
+
   __aicore__ inline uint32_t LoadTagBounds(uint32_t deg) {
     uint32_t nnz = 0;
     for (uint32_t t = 0; t < num_tags_; ++t) {
-      uint32_t lo = static_cast<uint32_t>(tag_row_.GetValue(t));
-      uint32_t hi = static_cast<uint32_t>(tag_row_.GetValue(t + 1));
-      if (lo > deg) lo = deg;
-      if (hi > deg) hi = deg;
+      uint32_t lo = ClampTag(tag_row_.GetValue(t), deg);
+      uint32_t hi = ClampTag(tag_row_.GetValue(t + 1), deg);
       if (hi < lo) hi = lo;  // corrupted non-monotonic row: empty bucket
       rem_buf_.SetValue(t, hi - lo);
       nnz += hi - lo;
@@ -439,7 +446,6 @@ class KernelCsrRowWiseSamplingBiased {
     StageTagRow(rid);
     StageTagRowWait();
     const uint32_t nnz = LoadTagBounds(deg);
-    LocalTensor<uint32_t> picked_local = pick_buf_.Get<uint32_t>();
 
     const bool take_all = select_all_ || (!replace_ && num_picks >= nnz);
     if (take_all) {
@@ -452,6 +458,7 @@ class KernelCsrRowWiseSamplingBiased {
           ++j;
         }
       }
+      StageTagRowRelease();
       return j;
     }
 
@@ -465,12 +472,17 @@ class KernelCsrRowWiseSamplingBiased {
       if (!replace_) {
         // Rejection sampling: redraw while the drawn edge was already
         // picked this row (CPU uses a hash set with the same semantics).
+        // Dedup reads back the eid column already written to GM for this
+        // row — no capacity-capped staging, so arbitrarily large pick
+        // counts stay in bounds (review R1: picked_local could overflow
+        // window_elems_).
         uint32_t tries = 0;
         bool dup = true;
         while (dup && tries < r) {
           dup = false;
           for (uint32_t k2 = 0; k2 < d; ++k2) {
-            if (picked_local.GetValue(k2) == lo + j) {
+            if (out_idxs_gm_.GetValue(out_pos + k2) ==
+                off + static_cast<IdT>(lo + j)) {
               dup = true;
               break;
             }
@@ -486,7 +498,8 @@ class KernelCsrRowWiseSamplingBiased {
           for (uint32_t k2 = 0; k2 < r; ++k2) {
             bool seen = false;
             for (uint32_t k3 = 0; k3 < d; ++k3) {
-              if (picked_local.GetValue(k3) == lo + k2) {
+              if (out_idxs_gm_.GetValue(out_pos + k3) ==
+                  off + static_cast<IdT>(lo + k2)) {
                 seen = true;
                 break;
               }
@@ -497,7 +510,6 @@ class KernelCsrRowWiseSamplingBiased {
             }
           }
         }
-        picked_local.SetValue(d, lo + j);
       }
       WritePickGm(out_pos + d, rid, off + static_cast<IdT>(lo + j));
       if (!replace_) rem_buf_.SetValue(t, r - 1);
@@ -509,9 +521,7 @@ class KernelCsrRowWiseSamplingBiased {
   // Clamped bucket head (local offset within the row) for tag t.
   // Clamped bucket head (local offset within the staged row) for tag t.
   __aicore__ inline uint32_t TagBucketHead(uint32_t t, uint32_t deg) {
-    uint32_t lo = static_cast<uint32_t>(tag_row_.GetValue(t));
-    if (lo > deg) lo = deg;
-    return lo;
+    return ClampTag(tag_row_.GetValue(t), deg);
   }
 
   __aicore__ inline void WritePickLocal(
