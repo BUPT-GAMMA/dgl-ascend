@@ -457,13 +457,12 @@ def test_biased_direct_gm_dedup_exact():
     # dedup table could hold; fanout >= window would route here.
     sg_npu = dgl.sampling.sample_neighbors_biased(
         g_npu, nodes, 30, bias, edge_dir="out", replace=False)
-    sg_cpu = dgl.sampling.sample_neighbors_biased(
-        g_cpu, nodes.cpu(), 30, bias, edge_dir="out", replace=False)
-    assert _sorted_biased_edges(sg_npu, nodes) == \
-        _sorted_biased_edges(sg_cpu, nodes)
-    # no duplicates: fanout < nnz=40, replace=False
     gc = sg_npu.cpu()
     u, v = gc.edges()
+    # Stochastic case (fanout 30 < nnz 40): CPU picks a different random
+    # subset, so the assertion is structural, not set-equal.
+    for vv in v.tolist():
+        assert 1 <= vv <= 40, f"sampled destination {vv} is not a neighbor"
     assert len(set(v.tolist())) == 30, "duplicate destinations in direct-GM path"
 
 
