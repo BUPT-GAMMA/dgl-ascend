@@ -981,6 +981,18 @@ COOMatrix CSRRowWiseSamplingBiased(
     CSRMatrix mat, IdArray rows, int64_t num_samples, NDArray tag_offset,
     FloatArray bias, bool replace) {
   COOMatrix ret;
+#ifdef DGL_USE_ASCEND
+  if (mat.indptr->ctx.device_type == kDGLAscend) {
+    // The AscendC biased kernel operates in float32 (double is forbidden
+    // in __aicore__). The launcher normalizes float64 bias to float32 on
+    // the host side; the sampling itself runs natively on the NPU kernel.
+    ATEN_ID_TYPE_SWITCH(mat.indptr->dtype, IdType, {
+      ret = impl::CSRRowWiseSamplingBiased<kDGLAscend, IdType, float>(
+          mat, rows, num_samples, tag_offset, bias, replace);
+    });
+    return ret;
+  }
+#endif  // DGL_USE_ASCEND
   ATEN_CSR_SWITCH(mat, XPU, IdType, "CSRRowWiseSamplingBiased", {
     ATEN_FLOAT_TYPE_SWITCH(bias->dtype, FloatType, "bias", {
       ret = impl::CSRRowWiseSamplingBiased<XPU, IdType, FloatType>(
