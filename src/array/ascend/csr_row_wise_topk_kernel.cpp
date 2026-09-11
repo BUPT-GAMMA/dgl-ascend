@@ -289,9 +289,14 @@ class KernelCsrRowWiseTopk {
           heap_idx.SetValue(size, j);
           SiftUp(heap_val, heap_idx, size, max_heap);
           ++size;
-        } else if (HeapChildBetter(
-                       w, j, heap_val.GetValue(0), heap_idx.GetValue(0),
+        } else if (HeapOrdered(
+                       heap_val.GetValue(0), heap_idx.GetValue(0), w, j,
                        max_heap)) {
+          // Root is weaker than the candidate (HeapOrdered = "parent
+          // correctly sits above child"), so the candidate displaces it.
+          // The former HeapChildBetter test had the polarity flipped:
+          // it evicted on candidate-weaker, keeping the WRONG k entries
+          // (device-visible as top-1 picking the minimum weight).
           heap_val.SetValue(0, w);
           heap_idx.SetValue(0, j);
           SiftDown(heap_val, heap_idx, 0, size, max_heap);
