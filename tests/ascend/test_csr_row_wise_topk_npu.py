@@ -530,17 +530,18 @@ def test_gm_heap_multi_round_beyond_window(k):
     """k larger than the kernel's UB window (~2.8k elems on 910B) with a
     row wider still: the GM fallback must run in rounds and return the
     exact edge set — the pre-fix heap capped the kept set at window_elems_
-    and read the staging buffer out of bounds (PR #42 review). 12k edges
-    with all-equal weights also forces every round boundary to be resolved
-    by the (weight, index) tie-break: any re-admission or skip would
-    duplicate or drop an edge and break the set equality."""
+    and read the staging buffer out of bounds (PR #42 review). Distinct
+    weights keep the edge-set oracle exact; an all-tie companion run
+    checks the structural contract (k distinct in-row edges, no
+    duplicates), because tie selection among equal weights is
+    NPU-defined (ADR-0012: the CPU std::sort order is not stable)."""
     device, cpu = _setup()
     if device is None:
         return
     deg = 12000
     src = torch.randint(0, 10, (deg,))
     dst = torch.zeros(deg, dtype=torch.int64)
-    w = torch.ones(deg)
+    w = torch.arange(deg, dtype=torch.float32) / deg
     g = dgl.graph((src, dst), num_nodes=10)
     g.edata["w"] = w
     g_npu = g.to(device).formats("csc")
@@ -550,6 +551,14 @@ def test_gm_heap_multi_round_beyond_window(k):
         sg_cpu = _select_topk(g, nodes.cpu(), k, ascending=ascending)
         assert _edge_set(sg_npu) == _edge_set(sg_cpu), \
             f"k={k} ascending={ascending}"
+    # All-tie companion: structural only.
+    g_tie = dgl.graph((src, dst), num_nodes=10)
+    g_tie.edata["w"] = torch.ones(deg)
+    g_tie_npu = g_tie.to(device).formats("csc")
+    sg_tie = _select_topk(g_tie_npu, nodes, k)
+    _, _, eids = sg_tie.edges("all")
+    assert eids.numel() == k
+    assert len(set(eids.cpu().tolist())) == k, "tie run must not duplicate edges"
 
 
 def test_select_all_wide_row_chunked_emit():
