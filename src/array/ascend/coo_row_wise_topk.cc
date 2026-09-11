@@ -48,7 +48,7 @@ COOMatrix COORowWiseTopk(
   // gathers weights through the same eid mapping the CPU path uses.
   CSRMatrix csr = COOToCSR(mat);
 
-  return CSRRowWiseTopk<kDGLAscend, IdType, float>(
+  return CSRRowWiseTopk<kDGLAscend, IdType, DType>(
       csr, rows, k, weight, ascending);
 #else
   LOG(FATAL) << "Ascend support is not compiled. "
@@ -60,6 +60,18 @@ COOMatrix COORowWiseTopk(
 template COOMatrix COORowWiseTopk<kDGLAscend, int32_t, float>(
     COOMatrix, IdArray, int64_t, NDArray, bool);
 template COOMatrix COORowWiseTopk<kDGLAscend, int64_t, float>(
+    COOMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix COORowWiseTopk<kDGLAscend, int32_t, double>(
+    COOMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix COORowWiseTopk<kDGLAscend, int64_t, double>(
+    COOMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix COORowWiseTopk<kDGLAscend, int32_t, int32_t>(
+    COOMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix COORowWiseTopk<kDGLAscend, int64_t, int32_t>(
+    COOMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix COORowWiseTopk<kDGLAscend, int32_t, int64_t>(
+    COOMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix COORowWiseTopk<kDGLAscend, int64_t, int64_t>(
     COOMatrix, IdArray, int64_t, NDArray, bool);
 
 }  // namespace impl
