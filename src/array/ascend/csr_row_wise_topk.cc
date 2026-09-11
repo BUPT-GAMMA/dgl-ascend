@@ -376,6 +376,18 @@ template COOMatrix CSRRowWiseTopk<kDGLAscend, int32_t, float>(
     CSRMatrix, IdArray, int64_t, NDArray, bool);
 template COOMatrix CSRRowWiseTopk<kDGLAscend, int64_t, float>(
     CSRMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix CSRRowWiseTopk<kDGLAscend, int32_t, double>(
+    CSRMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix CSRRowWiseTopk<kDGLAscend, int64_t, double>(
+    CSRMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix CSRRowWiseTopk<kDGLAscend, int32_t, int32_t>(
+    CSRMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix CSRRowWiseTopk<kDGLAscend, int64_t, int32_t>(
+    CSRMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix CSRRowWiseTopk<kDGLAscend, int32_t, int64_t>(
+    CSRMatrix, IdArray, int64_t, NDArray, bool);
+template COOMatrix CSRRowWiseTopk<kDGLAscend, int64_t, int64_t>(
+    CSRMatrix, IdArray, int64_t, NDArray, bool);
 
 }  // namespace impl
 }  // namespace aten
