@@ -90,6 +90,7 @@ class KernelCsrRowWiseTopk {
     pipe_ = pipe;
     evtVmte3_ = pipe->AllocEventID<HardEvent::V_MTE3>();
     evtMte3v_ = pipe->AllocEventID<HardEvent::MTE3_V>();
+    SetFlag<HardEvent::MTE3_V>(evtMte3v_);  // prime: first Wait passes
   }
 
   __aicore__ inline void Process() {
@@ -444,8 +445,8 @@ class KernelCsrRowWiseTopk {
     // hazard; multi-round / chunked paths crash the vector core on it).
     // Both event ids are allocated once (Init) and reused — fetching a
     // fresh id per call would pair Set and Wait on different flags and
-    // hang the pipe.
-    SetFlag<HardEvent::MTE3_V>(evtMte3v_);
+    // hang the pipe. The MTE3_V flag is primed in Init: a Wait on a
+    // never-set flag would block the first call forever.
     WaitFlag<HardEvent::MTE3_V>(evtMte3v_);
     SetFlag<HardEvent::V_MTE3>(evtVmte3_);
     WaitFlag<HardEvent::V_MTE3>(evtVmte3_);
