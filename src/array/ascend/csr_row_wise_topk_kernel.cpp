@@ -87,10 +87,17 @@ class KernelCsrRowWiseTopk {
     pipe->InitBuffer(out_r_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_c_buf_, window_elems_ * sizeof(IdT));
     pipe->InitBuffer(out_e_buf_, window_elems_ * sizeof(IdT));
+    pipe_ = pipe;
+    evtVmte3_ = pipe->AllocEventID<HardEvent::V_MTE3>();
+    evtMte3v_ = pipe->AllocEventID<HardEvent::MTE3_V>();
   }
 
   __aicore__ inline void Process() {
-    if (row_begin_ >= row_end_) return;
+    if (row_begin_ >= row_end_) {
+      pipe_->ReleaseEventID<HardEvent::V_MTE3>(evtVmte3_);
+      pipe_->ReleaseEventID<HardEvent::MTE3_V>(evtMte3v_);
+      return;
+    }
     uint32_t offset = 0;
     for (uint32_t i = row_begin_; i < row_end_; ++i) {
       IdT rid = rows_gm_.GetValue(i);
@@ -121,6 +128,8 @@ class KernelCsrRowWiseTopk {
             TopkRowDirectGm(out_start_ + offset, rid, off, deg, num_picks);
       }
     }
+    pipe_->ReleaseEventID<HardEvent::V_MTE3>(evtVmte3_);
+    pipe_->ReleaseEventID<HardEvent::MTE3_V>(evtMte3v_);
   }
 
  private:
@@ -433,18 +442,17 @@ class KernelCsrRowWiseTopk {
     // must be observed before the next round of scalar writes (the old
     // one-emit-per-row form never re-entered quickly enough to see the
     // hazard; multi-round / chunked paths crash the vector core on it).
-    event_t wid =
-        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
-    SetFlag<HardEvent::MTE3_V>(wid);
-    WaitFlag<HardEvent::MTE3_V>(wid);
-    event_t eid =
-        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
-    SetFlag<HardEvent::V_MTE3>(eid);
-    WaitFlag<HardEvent::V_MTE3>(eid);
+    // Both event ids are allocated once (Init) and reused — fetching a
+    // fresh id per call would pair Set and Wait on different flags and
+    // hang the pipe.
+    SetFlag<HardEvent::MTE3_V>(evtMte3v_);
+    WaitFlag<HardEvent::MTE3_V>(evtMte3v_);
+    SetFlag<HardEvent::V_MTE3>(evtVmte3_);
+    WaitFlag<HardEvent::V_MTE3>(evtVmte3_);
     DataCopyExtParams cp{
         1, static_cast<uint32_t>(count * sizeof(IdT)), 0, 0, 0};
     DataCopyPad(dst, staging, cp);
-    SetFlag<HardEvent::MTE3_V>(wid);  // release: next reuse waits above
+    SetFlag<HardEvent::MTE3_V>(evtMte3v_);  // release: next reuse waits
   }
 
   GlobalTensor<IdT> indptr_gm_, indices_gm_, data_gm_, rows_gm_;
@@ -459,6 +467,8 @@ class KernelCsrRowWiseTopk {
   uint32_t has_data_ = 0, num_total_rows_ = 0;
   uint32_t out_start_ = 0, row_begin_ = 0, row_end_ = 0, window_elems_ = 0;
   uint32_t block_idx_ = 0;
+  int32_t evtVmte3_ = 0, evtMte3v_ = 0;  // emit-staging hazard events
+  TPipe* pipe_ = nullptr;
 };
 
 extern "C" __global__ __aicore__ void csr_row_wise_topk_int32(
