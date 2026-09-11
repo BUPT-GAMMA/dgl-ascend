@@ -525,6 +525,55 @@ def test_wide_row_vectorized_sort(deg):
             f"deg={deg} ascending={ascending}"
 
 
+@pytest.mark.parametrize("k", [10, 3000, 5000, 12000])
+def test_gm_heap_multi_round_beyond_window(k):
+    """k larger than the kernel's UB window (~2.8k elems on 910B) with a
+    row wider still: the GM fallback must run in rounds and return the
+    exact edge set — the pre-fix heap capped the kept set at window_elems_
+    and read the staging buffer out of bounds (PR #42 review). 12k edges
+    with all-equal weights also forces every round boundary to be resolved
+    by the (weight, index) tie-break: any re-admission or skip would
+    duplicate or drop an edge and break the set equality."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    deg = 12000
+    src = torch.randint(0, 10, (deg,))
+    dst = torch.zeros(deg, dtype=torch.int64)
+    w = torch.ones(deg)
+    g = dgl.graph((src, dst), num_nodes=10)
+    g.edata["w"] = w
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    for ascending in (False, True):
+        sg_npu = _select_topk(g_npu, nodes, k, ascending=ascending)
+        sg_cpu = _select_topk(g, nodes.cpu(), k, ascending=ascending)
+        assert _edge_set(sg_npu) == _edge_set(sg_cpu), \
+            f"k={k} ascending={ascending}"
+
+
+def test_select_all_wide_row_chunked_emit():
+    """k = -1 on a row wider than the UB window: the select-all fast path
+    must emit in window-sized chunks — the pre-fix form staged the whole
+    row into the staging buffer and overflowed it (out-of-bounds WRITE,
+    PR #42 review follow-up). All 20k edges must come back exactly once."""
+    device, cpu = _setup()
+    if device is None:
+        return
+    m = 20000
+    src = torch.randint(0, 100, (m,))
+    dst = torch.zeros(m, dtype=torch.int64)
+    w = torch.rand(m)
+    g = dgl.graph((src, dst), num_nodes=100)
+    g.edata["w"] = w
+    g_npu = g.to(device).formats("csc")
+    nodes = torch.tensor([0], dtype=torch.int64, device=device)
+    sg_npu = _select_topk(g_npu, nodes, -1)
+    sg_cpu = _select_topk(g, nodes.cpu(), -1)
+    assert _edge_set(sg_npu) == _edge_set(sg_cpu)
+    assert sg_npu.num_edges() == m, "select-all must keep every edge"
+
+
 @pytest.mark.parametrize("fmt", ["csc", "coo"])
 def test_coo_assembly_and_select_all(fmt):
     """The COO assembly route (COOToCSR -> CSR topk) matches CPU exactly,
