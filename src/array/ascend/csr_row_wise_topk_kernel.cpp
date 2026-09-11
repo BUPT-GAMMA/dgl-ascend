@@ -428,6 +428,15 @@ class KernelCsrRowWiseTopk {
     // was pure overhead — AllocTensor + count scalar copies + EnQue/DeQue
     // events + FreeTensor per array, three arrays per row. The V->MTE3
     // visibility the queue provided becomes one explicit event pair.
+    // Chunked emission reuses the staging buffer while the previous
+    // chunk's MTE3 copy may still be in flight, so the MTE3 completion
+    // must be observed before the next round of scalar writes (the old
+    // one-emit-per-row form never re-entered quickly enough to see the
+    // hazard; multi-round / chunked paths crash the vector core on it).
+    event_t wid =
+        static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_V));
+    SetFlag<HardEvent::MTE3_V>(wid);
+    WaitFlag<HardEvent::MTE3_V>(wid);
     event_t eid =
         static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
     SetFlag<HardEvent::V_MTE3>(eid);
@@ -435,6 +444,7 @@ class KernelCsrRowWiseTopk {
     DataCopyExtParams cp{
         1, static_cast<uint32_t>(count * sizeof(IdT)), 0, 0, 0};
     DataCopyPad(dst, staging, cp);
+    SetFlag<HardEvent::MTE3_V>(wid);  // release: next reuse waits above
   }
 
   GlobalTensor<IdT> indptr_gm_, indices_gm_, data_gm_, rows_gm_;
