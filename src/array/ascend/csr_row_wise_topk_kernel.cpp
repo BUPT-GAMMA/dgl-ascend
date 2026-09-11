@@ -262,15 +262,15 @@ class KernelCsrRowWiseTopk {
     LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
     const bool max_heap = ascending_;  // ascending keeps the k smallest
     uint32_t emitted = 0;
+    // Round boundary carried from the previous round (its weakest kept
+    // entry in the (weight, index) order): only strictly-beyond entries
+    // are eligible in later rounds, which is exactly what previous
+    // rounds left un-emitted. Round 1 admits everything.
+    float thr_val = 0.0f;
+    uint32_t thr_idx = 0;
     while (emitted < num_picks) {
       const uint32_t want = num_picks - emitted;
       const uint32_t capacity = want < window_elems_ ? want : window_elems_;
-      // Round boundary carried from the previous round (its weakest kept
-      // entry in the (weight, index) order): only strictly-weaker entries
-      // are eligible here, which is exactly what previous rounds left
-      // un-emitted. First round admits everything.
-      float thr_val = 0.0f;
-      uint32_t thr_idx = 0;
       uint32_t size = 0;
       for (uint32_t j = 0; j < deg; ++j) {
         const IdT eid = has_data_ ? data_gm_.GetValue(off + static_cast<IdT>(j))
