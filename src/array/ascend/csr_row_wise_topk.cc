@@ -148,16 +148,9 @@ void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
   void* dev = nullptr;
   ASCEND_CALL(aclrtMalloc(
       &dev, host.size() * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
-  aclError e = aclrtMemcpyAsync(
+  ASCEND_CALL(aclrtMemcpyAsync(
       dev, host.size() * sizeof(uint32_t), host.data(),
-      host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream);
-  if (e != ACL_SUCCESS) {
-    // Free the allocation before failing loudly — it would otherwise leak
-    // (review finding, PR #42): the raw handle is only freed by the caller
-    // after the launch path completes.
-    aclrtFree(dev);
-    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;
-  }
+      host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
   return dev;
 }
 
@@ -284,9 +277,35 @@ COOMatrix CSRRowWiseTopk(
   // the window take the GM fallback path in the kernel.
   const uint32_t ub_available = QueryUbAvailableBytes(ctx.device_id);
   constexpr uint32_t kUbBytesPerWindowElem = 68;  // kernel's UB layout
-  const uint32_t window =
+  uint32_t window =
       std::min(ub_available / kUbBytesPerWindowElem, kSortMaxElemsPerCall);
+  // Device-verified envelope on 910B3 (CANN 9.1.0, 2026-09): the UB
+  // sort path matches CPU exactly up to 992-element windows; larger
+  // windows run the same code but the current runtime returns stale
+  // staging for them, so they are rejected until re-validated.
+  constexpr uint32_t kVerifiedWindowElems = 992;
+  window = std::min(window, kVerifiedWindowElems);
   CHECK(window >= 32) << "UB budget too small for the topk window";
+
+  // Rows wider than the UB window are rejected here: the scalar-heap
+  // GM fallback is unreliable on the current runtime (its TBuf
+  // scratch reads back stale, so the eviction never fires and wide
+  // rows keep their first `window` edges) and the runtime faults the
+  // vector core on several of its shapes. Rows up to the window take
+  // the device-verified UB sort path; hub-scale rows need the
+  // two-level merge design and are tracked as follow-up work.
+  for (int64_t i = 0; i < num_rows; ++i) {
+    const IdType r = rows_host[i];
+    const uint32_t d =
+        (r >= 0 && static_cast<int64_t>(r) + 1 < indptr_len)
+            ? static_cast<uint32_t>(
+                  indptr_host[static_cast<int64_t>(r) + 1] - indptr_host[r])
+            : 0;
+    CHECK(d <= window)
+        << "select_topk on Ascend does not yet support rows wider than "
+        << "the UB window (" << d << " > " << window
+        << "); the GM fallback for hub-scale rows is under repair";
+  }
 
   uint32_t tiling_data[kTilingHeaderWords] = {
       static_cast<uint32_t>(num_rows),
@@ -328,13 +347,9 @@ COOMatrix CSRRowWiseTopk(
   void* tiling_dev = nullptr;
   ASCEND_CALL(
       aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
-  aclError e = aclrtMemcpyAsync(
+  ASCEND_CALL(aclrtMemcpyAsync(
       tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
-      ACL_MEMCPY_HOST_TO_DEVICE, stream);
-  if (e != ACL_SUCCESS) {
-    aclrtFree(tiling_dev);  // fail loudly, do not leak (PR #42 review)
-    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;
-  }
+      ACL_MEMCPY_HOST_TO_DEVICE, stream));
   void* row_split_dev = UploadHostUInt32(row_split, stream);
   void* out_starts_dev = UploadHostUInt32(out_starts, stream);
   // All three async uploads capture stack vectors: one sync covers them

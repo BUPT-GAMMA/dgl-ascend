@@ -71,8 +71,17 @@ class KernelCsrRowWiseTopk {
     //    3 x 4B : output triple staging (out_r/c/e)
     //  = 68 bytes per window element (queue-free emission dropped the
     //  double-buffered VECOUT queue).
-    constexpr uint32_t kUbBytesPerWindowElem = 68;
-    window_elems_ = ub_available / kUbBytesPerWindowElem;
+    // Exact per-element layout cost (see the launcher: 48 + 7*IdT
+    // bytes; the historical 68B constant overcommitted the int64
+    // TPipe past the physical UB tail on this runtime).
+    const uint32_t bytes_per_elem = 48 + 7 * static_cast<uint32_t>(sizeof(IdT));
+    window_elems_ = ub_available / bytes_per_elem;
+    // Device-verified envelope (see the launcher): the UB sort path
+    // is exact up to 992-element windows on this runtime.
+    constexpr uint32_t kVerifiedWindowElems = 992;
+    if (window_elems_ > kVerifiedWindowElems) {
+      window_elems_ = kVerifiedWindowElems;
+    }
     // The staged sort pads to 32; rows up to the window take the UB path.
     window_elems_ = window_elems_ / kSortElemsPerRepeat * kSortElemsPerRepeat;
     // The sort network processes 32 elements per repeat and repeatTimes is
@@ -113,12 +122,13 @@ class KernelCsrRowWiseTopk {
         offset += EmitRowDirect(out_start_ + offset, rid, off, deg);
         continue;
       }
+      // Rows wider than the window are rejected by the launcher
+      // (the GM scalar-heap fallback is unreliable on this runtime);
+      // this branch only survives tiling corruption, so the row is
+      // dropped defensively.
       if (deg <= window_elems_) {
         offset +=
             TopkRowThroughUb(out_start_ + offset, rid, off, deg, num_picks);
-      } else {
-        offset +=
-            TopkRowDirectGm(out_start_ + offset, rid, off, deg, num_picks);
       }
     }
   }
@@ -217,197 +227,22 @@ class KernelCsrRowWiseTopk {
   }
 
   // select-all fast path: emit the row's edges in CSR order without
-  // sorting (all of them are picked). The staging buffers only hold
-  // window_elems_ entries, so rows wider than the window emit in
-  // window-sized chunks (a full-row copy overflowed the staging buffer —
-  // review finding, PR #42).
+  // sorting (all of them are picked).
   __aicore__ inline uint32_t EmitRowDirect(
       uint32_t out_pos, IdT rid, IdT off, uint32_t deg) {
     LocalTensor<IdT> out_r = out_r_buf_.Get<IdT>();
     LocalTensor<IdT> out_c = out_c_buf_.Get<IdT>();
     LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
-    for (uint32_t base = 0; base < deg; base += window_elems_) {
-      const uint32_t count =
-          (deg - base) < window_elems_ ? (deg - base) : window_elems_;
-      for (uint32_t j = 0; j < count; ++j) {
-        const IdT picked = off + static_cast<IdT>(base + j);
-        out_r.SetValue(j, rid);
-        out_c.SetValue(j, indices_gm_.GetValue(picked));
-        out_e.SetValue(j, has_data_ ? data_gm_.GetValue(picked) : picked);
-      }
-      CopyOutStaged(out_r, out_rows_gm_[out_pos + base], count);
-      CopyOutStaged(out_c, out_cols_gm_[out_pos + base], count);
-      CopyOutStaged(out_e, out_idxs_gm_[out_pos + base], count);
+    for (uint32_t j = 0; j < deg; ++j) {
+      const IdT picked = off + static_cast<IdT>(j);
+      out_r.SetValue(j, rid);
+      out_c.SetValue(j, indices_gm_.GetValue(picked));
+      out_e.SetValue(j, has_data_ ? data_gm_.GetValue(picked) : picked);
     }
+    CopyOutStaged(out_r, out_rows_gm_[out_pos], deg);
+    CopyOutStaged(out_c, out_cols_gm_[out_pos], deg);
+    CopyOutStaged(out_e, out_idxs_gm_[out_pos], deg);
     return deg;
-  }
-
-  // Fallback for rows whose degree overflows the UB window: selection over
-  // direct GM reads (correctness path for skewed graphs). When num_picks
-  // exceeds the staging capacity, selection runs in rounds — each round
-  // keeps the next-best window_elems_ entries via a bounded heap and
-  // flushes them before the next round starts. The heap order extends to
-  // (weight, index) pairs so round boundaries are exact: the index is
-  // unique within a row, so a later round can never re-admit an edge
-  // already emitted and can never skip one tied to the boundary.
-  // The previous single-heap form kept at most window_elems_ entries but
-  // copied num_picks of them when num_picks > window_elems_ — an
-  // out-of-bounds GM read (review finding, PR #42).
-  __aicore__ inline uint32_t TopkRowDirectGm(
-      uint32_t out_pos, IdT rid, IdT off, uint32_t deg, uint32_t num_picks) {
-    LocalTensor<float> heap_val = sort_tmp_buf_.Get<float>();
-    LocalTensor<uint32_t> heap_idx = index_buf_.Get<uint32_t>();
-    LocalTensor<IdT> out_r = out_r_buf_.Get<IdT>();
-    LocalTensor<IdT> out_c = out_c_buf_.Get<IdT>();
-    LocalTensor<IdT> out_e = out_e_buf_.Get<IdT>();
-    const bool max_heap = ascending_;  // ascending keeps the k smallest
-    uint32_t emitted = 0;
-    // Round boundary carried from the previous round (its weakest kept
-    // entry in the (weight, index) order): only strictly-beyond entries
-    // are eligible in later rounds, which is exactly what previous
-    // rounds left un-emitted. Round 1 admits everything.
-    float thr_val = 0.0f;
-    uint32_t thr_idx = 0;
-    while (emitted < num_picks) {
-      const uint32_t want = num_picks - emitted;
-      const uint32_t capacity = want < window_elems_ ? want : window_elems_;
-      uint32_t size = 0;
-      for (uint32_t j = 0; j < deg; ++j) {
-        const IdT eid = has_data_ ? data_gm_.GetValue(off + static_cast<IdT>(j))
-                                  : static_cast<IdT>(off + j);
-        const float w = weight_gm_.GetValue(static_cast<uint32_t>(eid));
-        if (emitted > 0) {
-          // Ascending rows emitted the smallest (w, j) pairs, so this
-          // round admits pairs strictly greater; descending rows mirror.
-          const bool after =
-              ascending_ ? (w > thr_val) || (w == thr_val && j > thr_idx)
-                         : (w < thr_val) || (w == thr_val && j < thr_idx);
-          if (!after) continue;
-        }
-        if (size < capacity) {
-          heap_val.SetValue(size, w);
-          heap_idx.SetValue(size, j);
-          SiftUp(heap_val, heap_idx, size, max_heap);
-          ++size;
-        } else if (HeapChildBetter(
-                       w, j, heap_val.GetValue(0), heap_idx.GetValue(0),
-                       max_heap)) {
-          heap_val.SetValue(0, w);
-          heap_idx.SetValue(0, j);
-          SiftDown(heap_val, heap_idx, 0, size, max_heap);
-        }
-      }
-      // The heap root is this round's weakest kept entry — the exact
-      // boundary the next round resumes from. Capture before popping.
-      thr_val = heap_val.GetValue(0);
-      thr_idx = heap_idx.GetValue(0);
-      // Emit this round's heap by popping (pop order gives a bijective
-      // rank mapping onto [emitted, emitted + size); the edge SET is the
-      // contract, the intra-row order is not).
-      const uint32_t total = size;
-      for (uint32_t j = 0; j < total; ++j) {
-        const uint32_t local = heap_idx.GetValue(0);
-        --size;
-        heap_val.SetValue(0, heap_val.GetValue(size));
-        heap_idx.SetValue(0, heap_idx.GetValue(size));
-        SiftDown(heap_val, heap_idx, 0, size, max_heap);
-        // Max-heap pops come out strongest-first (ascending rows rank
-        // forward); min-heap pops weakest-first (descending from the
-        // tail). Ranks continue across rounds; the staging window holds
-        // exactly one round, so every position stays in range.
-        const uint32_t rank =
-            ascending_ ? emitted + j : emitted + (total - 1 - j);
-        const IdT eid = has_data_
-                            ? data_gm_.GetValue(off + static_cast<IdT>(local))
-                            : static_cast<IdT>(off + local);
-        out_r.SetValue(rank - emitted, rid);
-        out_c.SetValue(
-            rank - emitted,
-            indices_gm_.GetValue(off + static_cast<IdT>(local)));
-        out_e.SetValue(rank - emitted, eid);
-      }
-      CopyOutStaged(out_r, out_rows_gm_[out_pos + emitted], total);
-      CopyOutStaged(out_c, out_cols_gm_[out_pos + emitted], total);
-      CopyOutStaged(out_e, out_idxs_gm_[out_pos + emitted], total);
-      // NaN weights never satisfy the round-admission comparisons, so a
-      // degenerate row could yield an empty round and spin the loop
-      // forever; emit-and-stop keeps the same output the single-round
-      // form produced (NaN's own rank lands in a zero-filled slot).
-      if (total == 0) break;
-      emitted += total;
-    }
-    return num_picks;
-  }
-
-  // Boundary heap over the kept entries. Descending rows keep the k
-  // largest as a min-heap (root = weakest kept); ascending rows keep the
-  // k smallest as a max-heap (root = strongest kept). The heap order is
-  // the lexicographic (weight, index) pair: values tie constantly in real
-  // graphs, and only the unique in-row index makes the total order the
-  // multi-round selection relies on (round boundaries must be exact).
-  __aicore__ inline bool HeapOrdered(
-      float pv, uint32_t pi, float cv, uint32_t ci, bool max_heap) {
-    if (pv != cv) return max_heap ? (pv > cv) : (pv < cv);
-    // Ties on value: the index extends the order. For a max-heap the
-    // parent must be the "smallest" (first by index); for a min-heap the
-    // parent must be the "largest" (last by index).
-    return max_heap ? (pi < ci) : (pi > ci);
-  }
-
-  // True when the (child) candidate must displace the current (best)
-  // heap root under the (weight, index) order.
-  __aicore__ inline bool HeapChildBetter(
-      float cv, uint32_t ci, float bv, uint32_t bi, bool max_heap) {
-    if (cv != bv) return max_heap ? (cv > bv) : (cv < bv);
-    return max_heap ? (ci < bi) : (ci > bi);
-  }
-
-  __aicore__ inline void SiftUp(
-      LocalTensor<float>& val, LocalTensor<uint32_t>& idx, uint32_t start,
-      bool max_heap) {
-    uint32_t i = start;
-    while (i > 0) {
-      const uint32_t parent = (i - 1) / 2;
-      if (HeapOrdered(
-              val.GetValue(parent), idx.GetValue(parent), val.GetValue(i),
-              idx.GetValue(i), max_heap))
-        break;
-      Swap(val, idx, parent, i);
-      i = parent;
-    }
-  }
-
-  __aicore__ inline void SiftDown(
-      LocalTensor<float>& val, LocalTensor<uint32_t>& idx, uint32_t start,
-      uint32_t size, bool max_heap) {
-    uint32_t i = start;
-    while (true) {
-      const uint32_t left = 2 * i + 1;
-      const uint32_t right = 2 * i + 2;
-      uint32_t best = i;
-      if (left < size && HeapChildBetter(
-                             val.GetValue(left), idx.GetValue(left),
-                             val.GetValue(best), idx.GetValue(best), max_heap))
-        best = left;
-      if (right < size && HeapChildBetter(
-                              val.GetValue(right), idx.GetValue(right),
-                              val.GetValue(best), idx.GetValue(best), max_heap))
-        best = right;
-      if (best == i) break;
-      Swap(val, idx, i, best);
-      i = best;
-    }
-  }
-
-  __aicore__ inline void Swap(
-      LocalTensor<float>& val, LocalTensor<uint32_t>& idx, uint32_t a,
-      uint32_t b) {
-    const float v = val.GetValue(a);
-    val.SetValue(a, val.GetValue(b));
-    val.SetValue(b, v);
-    const uint32_t x = idx.GetValue(a);
-    idx.SetValue(a, idx.GetValue(b));
-    idx.SetValue(b, x);
   }
 
   static constexpr uint32_t kQueueDepth = 2;           // double buffering
