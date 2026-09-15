@@ -485,6 +485,17 @@ std::pair<CSRMatrix, IdArray> CSRRowWiseSamplingUniformFused(
   const bool has_data = aten::CSRHasData(mat);
   void* data_ptr = has_data ? mat.data->data : nullptr;
 
+  // The tiling block carries 32-bit fields; a seed set beyond uint32
+  // would silently truncate and corrupt every row boundary below.
+  CHECK(num_rows <= std::numeric_limits<uint32_t>::max())
+      << "fused sampling supports at most "
+      << std::numeric_limits<uint32_t>::max() << " seed rows, got " << num_rows;
+  CHECK(
+      mat.num_rows <=
+      static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))
+      << "fused sampling supports at most "
+      << std::numeric_limits<uint32_t>::max() << " CSR rows, got "
+      << mat.num_rows;
   uint32_t tiling_data[kTilingHeaderWordsFused] = {
       static_cast<uint32_t>(num_rows),
       fanout,
