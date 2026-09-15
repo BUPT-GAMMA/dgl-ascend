@@ -148,9 +148,16 @@ void* UploadHostUInt32(const std::vector<uint32_t>& host, aclrtStream stream) {
   void* dev = nullptr;
   ASCEND_CALL(aclrtMalloc(
       &dev, host.size() * sizeof(uint32_t), ACL_MEM_MALLOC_HUGE_FIRST));
-  ASCEND_CALL(aclrtMemcpyAsync(
+  aclError e = aclrtMemcpyAsync(
       dev, host.size() * sizeof(uint32_t), host.data(),
-      host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
+      host.size() * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream);
+  if (e != ACL_SUCCESS) {
+    // Free the allocation before failing loudly — the raw handle is
+    // only freed by the caller after the launch path completes, so a
+    // failed copy would leak it (review finding, PR #42).
+    aclrtFree(dev);
+    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;
+  }
   return dev;
 }
 
@@ -347,9 +354,13 @@ COOMatrix CSRRowWiseTopk(
   void* tiling_dev = nullptr;
   ASCEND_CALL(
       aclrtMalloc(&tiling_dev, sizeof(tiling_data), ACL_MEM_MALLOC_HUGE_FIRST));
-  ASCEND_CALL(aclrtMemcpyAsync(
+  aclError e = aclrtMemcpyAsync(
       tiling_dev, sizeof(tiling_data), tiling_data, sizeof(tiling_data),
-      ACL_MEMCPY_HOST_TO_DEVICE, stream));
+      ACL_MEMCPY_HOST_TO_DEVICE, stream);
+  if (e != ACL_SUCCESS) {
+    aclrtFree(tiling_dev);  // do not leak on the failure path (PR #42)
+    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e;
+  }
   void* row_split_dev = UploadHostUInt32(row_split, stream);
   void* out_starts_dev = UploadHostUInt32(out_starts, stream);
   // All three async uploads capture stack vectors: one sync covers them
