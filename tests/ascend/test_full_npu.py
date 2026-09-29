@@ -102,11 +102,17 @@ def test_full_heterograph():
 
 
 def test_full_boundary_sizes():
-    """Boundary cases: n=0, 1, TILE_LENGTH boundary (8191/8192/8193), large."""
+    """Boundary cases around tile/multi-core splits of the AscendC kernel.
+
+    kFullTileLength = 8192; 40 vector cores on 910B3 -> 40 * 8192 = 327680
+    is the all-cores-exactly-one-tile point, +1/-1 exercise the remainder
+    (`extra`) distribution of the contiguous per-core partition.
+    """
     device, cpu = _setup()
     if device is None:
         return
-    for n in [0, 1, 8191, 8192, 8193, 50000, 200000, 1000000]:
+    for n in [0, 1, 8191, 8192, 8193, 16383, 16384, 16385, 50000, 200000,
+              327679, 327680, 327681, 1000000, 8192000]:
         s = torch.arange(n, dtype=torch.int64) % 1000
         d = (s + 1) % 1000
         g_cpu = dgl.graph((s, d), num_nodes=1000)

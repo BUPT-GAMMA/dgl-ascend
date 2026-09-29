@@ -1,117 +1,135 @@
 #include "kernel_operator.h"
 
+#include "full_tiling.h"
+
 using namespace AscendC;
 
-// Tiling buffer layout (16 bytes):
-//   [0..4)  uint32_t n   (element count)
-//   [4..8)  padding
-//   [8..16) val          (scalar fill value, typed per kernel)
+// AscendC Full kernel — fills a 1-D GM buffer with a scalar value.
 //
-// 混合方案（受 Duplicate API dtype 限制，见 ascendc-api-best-practices）：
-//  - int32 / float32 : B档向量化（Duplicate 广播 + DataCopyPad 块搬出）
-//  - int64 / double  : A档标量直写（DAV_2201 的 Duplicate 不支持 64-bit 类型）
+// Design (addresses PR #37 review comments):
+//   1. Multi-core: each AIV core fills a contiguous element range. Ranges are
+//      derived on device from GetBlockIdx()/GetBlockNum() (blockDim is
+//      computed on host from the runtime Vector Core count, never hardcoded).
+//   2. Stamp pattern: the tile content is identical for every tile, so the
+//      UB stamp is built ONCE per core and then streamed out repeatedly —
+//      no per-tile Duplicate, no TQue, no double buffering (the previous
+//      TQue<VECOUT, 2> pipeline never actually overlapped).
+//   3. No scalar GM access: GlobalTensor::SetValue/GetValue loops are
+//      restricted to debug usage; all GM traffic goes through MTE3
+//      (DataCopyPad). This also covers the 64-bit dtypes.
 //
-// 保持 block_dim=1（对齐 DGL-Ascend 既有约定；核数须运行时 GetCoreNumAiv()
-// 查询，禁止硬编码）。
+// Stamp construction per dtype:
+//   - 32-bit (int32/float): Duplicate<T> — supported on DAV_2201 for
+//     int16/uint16/int32/uint32/float.
+//   - 64-bit (int64/double): Duplicate<T> is a static_assert failure on
+//     DAV_2201 (verified against CANN 9.0 headers), so the 8-byte pattern is
+//     seeded as 32 bytes of interleaved uint32 (lo, hi, lo, hi, ...) and
+//     amplified to a full tile with log2-stage UB->UB DataCopy doubling.
 
 namespace {
-constexpr uint32_t FULL_TILE_LENGTH = 8192;
-constexpr uint32_t FULL_DOUBLE_BUFFER = 2;
 
-// B档：向量化路径（仅用于 Duplicate 支持的类型：int32/uint32/float 等 32-bit）
+// Build the kFullTileLength-element UB stamp for `bits`.
 template <typename T>
-__aicore__ inline void FullVectorKernel(GM_ADDR dst, uint32_t n, T val) {
+__aicore__ inline void BuildStamp(LocalTensor<T> stamp, uint64_t bits) {
+  if constexpr (sizeof(T) <= sizeof(uint32_t)) {
+    // Bit-cast the low 32 bits to T (two's complement / IEEE pattern kept).
+    union {
+      uint32_t u;
+      T t;
+    } caster;
+    caster.u = static_cast<uint32_t>(bits);
+    Duplicate<T>(stamp, caster.t, kFullTileLength);
+  } else {
+    LocalTensor<uint32_t> u32 = stamp.template ReinterpretCast<uint32_t>();
+    const uint32_t lo = static_cast<uint32_t>(bits & 0xFFFFFFFFULL);
+    const uint32_t hi = static_cast<uint32_t>(bits >> 32);
+    // 32-byte seed: 8 interleaved uint32 so every following DataCopy stage
+    // moves a whole 32-byte block.
+    for (uint32_t i = 0; i < 8; i++) {
+      u32.SetValue(i, ((i & 1u) != 0) ? hi : lo);
+    }
+    // Scalar-pipe seed writes must land before the first MTE2 copy reads them.
+    PipeBarrier<PIPE_ALL>();
+    constexpr uint32_t kTotalU32 = kFullTileLength * 2u;
+    uint32_t len = 8;
+    while (len < kTotalU32) {
+      const uint32_t copyLen = (kTotalU32 - len) < len ? (kTotalU32 - len) : len;
+      DataCopy(u32[len], u32[0], copyLen);
+      len += copyLen;
+    }
+    // MTE2 doubling is asynchronous w.r.t. the MTE3 copy-out stream; force
+    // completion of the stamp build before it is streamed to GM (once per
+    // core, cost negligible).
+    PipeBarrier<PIPE_ALL>();
+  }
+}
+
+// Stream `elems` elements of the stamp to dstGm[start .. start+elems).
+template <typename T>
+__aicore__ inline void CopyOut(GlobalTensor<T>& dstGm, LocalTensor<T> stamp,
+                               uint64_t start, uint64_t elems) {
+  uint64_t offset = 0;
+  for (; offset + kFullTileLength <= elems; offset += kFullTileLength) {
+    DataCopyExtParams copyParams{1,
+                                 static_cast<uint32_t>(kFullTileLength *
+                                                       sizeof(T)),
+                                 0, 0, 0};
+    DataCopyPad(dstGm[start + offset], stamp, copyParams);
+  }
+  if (offset < elems) {
+    DataCopyExtParams padParams{1,
+                                static_cast<uint32_t>((elems - offset) *
+                                                      sizeof(T)),
+                                0, 0, 0};
+    DataCopyPad(dstGm[start + offset], stamp, padParams);
+  }
+}
+
+template <typename T>
+__aicore__ inline void FullProcess(GM_ADDR dst, FullTilingData tiling) {
+
+  // Contiguous per-core partition: load diff <= 1 element, good locality.
+  const uint32_t blockId = GetBlockIdx();
+  const uint32_t blockNum = GetBlockNum();
+  const uint64_t perCore = tiling.n / blockNum;
+  const uint64_t extra = tiling.n % blockNum;
+  const uint64_t start =
+      blockId * perCore + (blockId < extra ? blockId : extra);
+  const uint64_t elems = perCore + (blockId < extra ? 1u : 0u);
+  if (elems == 0) {
+    return;
+  }
+
   TPipe pipe;
-  TQue<TPosition::VECOUT, FULL_DOUBLE_BUFFER> outQueue;
-  pipe.InitBuffer(outQueue, FULL_DOUBLE_BUFFER, FULL_TILE_LENGTH * sizeof(T));
+  TBuf<TPosition::VECCALC> stampBuf;
+  pipe.InitBuffer(stampBuf, kFullTileLength * sizeof(T));
+  LocalTensor<T> stamp = stampBuf.Get<T>();
+
+  BuildStamp<T>(stamp, tiling.val);
 
   GlobalTensor<T> dstGm;
-  dstGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(dst), n);
-
-  const uint32_t fullTiles = n / FULL_TILE_LENGTH;
-  const uint32_t tailLen = n - fullTiles * FULL_TILE_LENGTH;
-
-  for (uint32_t i = 0; i < fullTiles; i++) {
-    LocalTensor<T> outLocal = outQueue.template AllocTensor<T>();
-    Duplicate<T>(outLocal, val, FULL_TILE_LENGTH);
-    outQueue.template EnQue<T>(outLocal);
-    LocalTensor<T> deq = outQueue.template DeQue<T>();
-    DataCopyPad(dstGm[i * FULL_TILE_LENGTH], deq,
-                {1, static_cast<uint16_t>(FULL_TILE_LENGTH * sizeof(T)), 0, 0});
-    outQueue.FreeTensor(deq);
-  }
-  if (tailLen > 0) {
-    LocalTensor<T> outLocal = outQueue.template AllocTensor<T>();
-    Duplicate<T>(outLocal, val, tailLen);
-    outQueue.template EnQue<T>(outLocal);
-    LocalTensor<T> deq = outQueue.template DeQue<T>();
-    DataCopyPad(dstGm[fullTiles * FULL_TILE_LENGTH], deq,
-                {1, static_cast<uint16_t>(tailLen * sizeof(T)), 0, 0});
-    outQueue.FreeTensor(deq);
-  }
+  dstGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(dst), tiling.n);
+  CopyOut<T>(dstGm, stamp, start, elems);
 }
 
-// A档：标量直写路径（用于 64-bit 类型，Duplicate 不支持）
-template <typename T>
-__aicore__ inline void FullScalarKernel(GM_ADDR dst, uint32_t n, T val) {
-  GlobalTensor<T> dstGm;
-  dstGm.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(dst), n);
-  for (uint32_t i = 0; i < n; i++) {
-    dstGm.SetValue(i, val);
-  }
-}
-
-__aicore__ inline uint32_t ReadNFromTiling(GM_ADDR tiling_ptr) {
-  GlobalTensor<uint32_t> nGm;
-  nGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(tiling_ptr), 1);
-  return nGm.GetValue(0);
-}
 }  // namespace
 
-// int32: B档向量化
-extern "C" __global__ __aicore__ void full_i32(GM_ADDR dst, GM_ADDR tiling_ptr) {
-  uint32_t n = ReadNFromTiling(tiling_ptr);
-  GlobalTensor<int32_t> valGm;
-  valGm.SetGlobalBuffer(
-      reinterpret_cast<__gm__ int32_t*>(
-          reinterpret_cast<__gm__ char*>(tiling_ptr) + 8),
-      1);
-  int32_t val = valGm.GetValue(0);
-  FullVectorKernel<int32_t>(dst, n, val);
+extern "C" __global__ __aicore__ void full_i32(GM_ADDR dst,
+                                               FullTilingData tiling) {
+  FullProcess<int32_t>(dst, tiling);
 }
 
-// int64: A档标量（Duplicate 不支持 int64）
-extern "C" __global__ __aicore__ void full_i64(GM_ADDR dst, GM_ADDR tiling_ptr) {
-  uint32_t n = ReadNFromTiling(tiling_ptr);
-  GlobalTensor<int64_t> valGm;
-  valGm.SetGlobalBuffer(
-      reinterpret_cast<__gm__ int64_t*>(
-          reinterpret_cast<__gm__ char*>(tiling_ptr) + 8),
-      1);
-  int64_t val = valGm.GetValue(0);
-  FullScalarKernel<int64_t>(dst, n, val);
+extern "C" __global__ __aicore__ void full_i64(GM_ADDR dst,
+                                               FullTilingData tiling) {
+  FullProcess<int64_t>(dst, tiling);
 }
 
-// float32: B档向量化
-extern "C" __global__ __aicore__ void full_f32(GM_ADDR dst, GM_ADDR tiling_ptr) {
-  uint32_t n = ReadNFromTiling(tiling_ptr);
-  GlobalTensor<float> valGm;
-  valGm.SetGlobalBuffer(
-      reinterpret_cast<__gm__ float*>(
-          reinterpret_cast<__gm__ char*>(tiling_ptr) + 8),
-      1);
-  float val = valGm.GetValue(0);
-  FullVectorKernel<float>(dst, n, val);
+extern "C" __global__ __aicore__ void full_f32(GM_ADDR dst,
+                                               FullTilingData tiling) {
+  FullProcess<float>(dst, tiling);
 }
 
-// double: A档标量（Duplicate 不支持 double）
-extern "C" __global__ __aicore__ void full_f64(GM_ADDR dst, GM_ADDR tiling_ptr) {
-  uint32_t n = ReadNFromTiling(tiling_ptr);
-  GlobalTensor<double> valGm;
-  valGm.SetGlobalBuffer(
-      reinterpret_cast<__gm__ double*>(
-          reinterpret_cast<__gm__ char*>(tiling_ptr) + 8),
-      1);
-  double val = valGm.GetValue(0);
-  FullScalarKernel<double>(dst, n, val);
+extern "C" __global__ __aicore__ void full_f64(GM_ADDR dst,
+                                               FullTilingData tiling) {
+  FullProcess<double>(dst, tiling);
 }
