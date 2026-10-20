@@ -115,8 +115,8 @@ dependencies:
       - scipy==1.15.3
       - six==1.17.0
       - threadpoolctl==3.6.0
-      - torch==2.8.0
-      - torch-npu==2.8.0.post2
+      - torch==2.11.0
+      - torch-npu==2.11.0
       - torchdata==0.7.1
       - tornado==6.5.6
       - tqdm==4.67.3
