@@ -1245,21 +1245,14 @@ std::vector<NDArray> COOGetDataAndIndices(
     COOMatrix coo, NDArray rows, NDArray cols) {
   std::vector<NDArray> ret;
   if (coo.row->ctx.device_type == kDGLAscend) {
-    DGLContext cpu_ctx{kDGLCPU, 0};
-    auto coo_row = coo.row.CopyTo(cpu_ctx);
-    auto coo_col = coo.col.CopyTo(cpu_ctx);
-    auto coo_data = coo.data.CopyTo(cpu_ctx);
-    auto rows_cpu = rows.CopyTo(cpu_ctx);
-    auto cols_cpu = cols.CopyTo(cpu_ctx);
-    COOMatrix coo_cpu{coo.num_rows, coo.num_cols,
-                       coo_row, coo_col, coo_data};
+#ifdef DGL_USE_ASCEND
     ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
-      ret = impl::COOGetDataAndIndices<kDGLCPU, IdType>(
-          coo_cpu, rows_cpu, cols_cpu);
+      ret = impl::COOGetDataAndIndices<kDGLAscend, IdType>(
+          coo, rows, cols);
     });
-    for (auto& arr : ret) {
-      arr = arr.CopyTo(rows->ctx);
-    }
+#else
+    LOG(FATAL) << "Ascend support is not compiled.";
+#endif
   } else {
     ATEN_COO_SWITCH(coo, XPU, IdType, "COOGetDataAndIndices", {
       ret = impl::COOGetDataAndIndices<XPU, IdType>(coo, rows, cols);
