@@ -18,35 +18,12 @@
 // Other standard libraries retain the native CPU ordering below instead of
 // preventing the entire Ascend backend from compiling.
 
-extern "C" uint32_t
-aclrtlaunch_coo_get_data_and_indices_match_int32(
-    uint32_t block_dim, aclrtStream stream,
+extern "C" uint32_t aclrtlaunch_coo_get_data_and_indices(
+    uint32_t block_dim, aclrtStream stream, uint32_t operation,
     void* coo_rows, void* coo_cols,
     void* query_rows, void* query_cols,
-    void* mask, void* tiling);
-
-extern "C" uint32_t
-aclrtlaunch_coo_get_data_and_indices_match_int64(
-    uint32_t block_dim, aclrtStream stream,
-    void* coo_rows, void* coo_cols,
-    void* query_rows, void* query_cols,
-    void* mask, void* tiling);
-
-extern "C" uint32_t
-aclrtlaunch_coo_get_data_and_indices_gather_int32(
-    uint32_t block_dim, aclrtStream stream,
-    void* query_rows, void* query_cols,
     void* coo_data, void* mask, void* offsets,
-    void* out_rows, void* out_cols, void* out_data,
-    void* tiling);
-
-extern "C" uint32_t
-aclrtlaunch_coo_get_data_and_indices_gather_int64(
-    uint32_t block_dim, aclrtStream stream,
-    void* query_rows, void* query_cols,
-    void* coo_data, void* mask, void* offsets,
-    void* out_rows, void* out_cols, void* out_data,
-    void* tiling);
+    void* out_rows, void* out_cols, void* out_data, void* tiling);
 
 namespace dgl {
 namespace runtime {
@@ -419,22 +396,15 @@ std::vector<NDArray> COOGetDataAndIndicesAscend(
 
   scratch.MarkPending();
 
-  aclError match_status;
-  if (std::is_same<IdType, int32_t>::value) {
-    match_status =
-        aclrtlaunch_coo_get_data_and_indices_match_int32(
-            block_dim, stream,
-            padded_rows_dev, padded_cols_dev,
-            query_rows_dev, query_cols_dev,
-            mask_dev, tiling_dev);
-  } else {
-    match_status =
-        aclrtlaunch_coo_get_data_and_indices_match_int64(
-            block_dim, stream,
-            padded_rows_dev, padded_cols_dev,
-            query_rows_dev, query_cols_dev,
-            mask_dev, tiling_dev);
-  }
+  // Operations 0/1 match int32/int64; operations 2/3 gather int32/int64.
+  const uint32_t type_operation =
+      std::is_same<IdType, int32_t>::value ? 0U : 1U;
+  const aclError match_status = aclrtlaunch_coo_get_data_and_indices(
+      block_dim, stream, type_operation,
+      padded_rows_dev, padded_cols_dev,
+      query_rows_dev, query_cols_dev,
+      nullptr, mask_dev, nullptr,
+      nullptr, nullptr, nullptr, tiling_dev);
 
   CheckCOOQueryAcl(
       match_status, "COOGetDataAndIndices match launch");
@@ -504,24 +474,11 @@ std::vector<NDArray> COOGetDataAndIndicesAscend(
 
   // Dynamic query segments may share a transfer block. Start with one
   // gather block to avoid concurrent partial writes to adjacent segments.
-  aclError gather_status;
-  if (std::is_same<IdType, int32_t>::value) {
-    gather_status =
-        aclrtlaunch_coo_get_data_and_indices_gather_int32(
-            1, stream,
-            query_rows_dev, query_cols_dev,
-            coo_data_dev, mask_dev, offsets_dev,
-            out_rows->data, out_cols->data, out_data->data,
-            tiling_dev);
-  } else {
-    gather_status =
-        aclrtlaunch_coo_get_data_and_indices_gather_int64(
-            1, stream,
-            query_rows_dev, query_cols_dev,
-            coo_data_dev, mask_dev, offsets_dev,
-            out_rows->data, out_cols->data, out_data->data,
-            tiling_dev);
-  }
+  const aclError gather_status = aclrtlaunch_coo_get_data_and_indices(
+      1, stream, type_operation + 2U,
+      nullptr, nullptr, query_rows_dev, query_cols_dev,
+      coo_data_dev, mask_dev, offsets_dev,
+      out_rows->data, out_cols->data, out_data->data, tiling_dev);
 
   CheckCOOQueryAcl(
       gather_status, "COOGetDataAndIndices gather launch");

@@ -435,37 +435,9 @@ class KernelCOOQueryGather {
 }  // namespace
 
 extern "C" __global__ __aicore__ void
-coo_get_data_and_indices_match_int32(
+coo_get_data_and_indices(
+    uint32_t operation,
     GM_ADDR coo_rows, GM_ADDR coo_cols,
-    GM_ADDR query_rows, GM_ADDR query_cols,
-    GM_ADDR mask, GM_ADDR tiling) {
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-
-  TPipe pipe;
-  KernelCOOQueryMatch<int32_t> op;
-  op.Init(
-      coo_rows, coo_cols, query_rows, query_cols,
-      mask, tiling, &pipe);
-  op.Process();
-}
-
-extern "C" __global__ __aicore__ void
-coo_get_data_and_indices_match_int64(
-    GM_ADDR coo_rows, GM_ADDR coo_cols,
-    GM_ADDR query_rows, GM_ADDR query_cols,
-    GM_ADDR mask, GM_ADDR tiling) {
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-
-  TPipe pipe;
-  KernelCOOQueryMatch<int64_t> op;
-  op.Init(
-      coo_rows, coo_cols, query_rows, query_cols,
-      mask, tiling, &pipe);
-  op.Process();
-}
-
-extern "C" __global__ __aicore__ void
-coo_get_data_and_indices_gather_int32(
     GM_ADDR query_rows, GM_ADDR query_cols,
     GM_ADDR coo_data, GM_ADDR mask, GM_ADDR offsets,
     GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_data,
@@ -473,25 +445,30 @@ coo_get_data_and_indices_gather_int32(
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
 
   TPipe pipe;
-  KernelCOOQueryGather<int32_t> op;
-  op.Init(
-      query_rows, query_cols, coo_data, mask, offsets,
-      out_rows, out_cols, out_data, tiling, &pipe);
-  op.Process();
-}
-
-extern "C" __global__ __aicore__ void
-coo_get_data_and_indices_gather_int64(
-    GM_ADDR query_rows, GM_ADDR query_cols,
-    GM_ADDR coo_data, GM_ADDR mask, GM_ADDR offsets,
-    GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_data,
-    GM_ADDR tiling) {
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-
-  TPipe pipe;
-  KernelCOOQueryGather<int64_t> op;
-  op.Init(
-      query_rows, query_cols, coo_data, mask, offsets,
-      out_rows, out_cols, out_data, tiling, &pipe);
-  op.Process();
+  // Use one registered entry for both phases and both template instances.
+  if (operation == 0) {
+    KernelCOOQueryMatch<int32_t> op;
+    op.Init(
+        coo_rows, coo_cols, query_rows, query_cols,
+        mask, tiling, &pipe);
+    op.Process();
+  } else if (operation == 1) {
+    KernelCOOQueryMatch<int64_t> op;
+    op.Init(
+        coo_rows, coo_cols, query_rows, query_cols,
+        mask, tiling, &pipe);
+    op.Process();
+  } else if (operation == 2) {
+    KernelCOOQueryGather<int32_t> op;
+    op.Init(
+        query_rows, query_cols, coo_data, mask, offsets,
+        out_rows, out_cols, out_data, tiling, &pipe);
+    op.Process();
+  } else if (operation == 3) {
+    KernelCOOQueryGather<int64_t> op;
+    op.Init(
+        query_rows, query_cols, coo_data, mask, offsets,
+        out_rows, out_cols, out_data, tiling, &pipe);
+    op.Process();
+  }
 }
