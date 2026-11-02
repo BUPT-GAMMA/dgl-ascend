@@ -13,8 +13,16 @@
 namespace dgl {
 namespace aten {
 namespace impl {
-
 #ifdef DGL_USE_ASCEND
+
+// COOGetRowNNZ direct Ascend implementation
+// Defined in coo_get_row_nnz.cc
+
+int64_t COOGetRowNNZDirect(
+    COOMatrix coo, int64_t row);
+
+NDArray COOGetRowNNZDirect(
+    COOMatrix coo, NDArray rows);
 
 namespace {
 
@@ -101,8 +109,7 @@ void COOSort_<kDGLAscend, int64_t>(COOMatrix* coo, bool sort_column) {
 
 template <typename IdType>
 int64_t COOGetRowNNZ_Ascend(COOMatrix coo, int64_t row) {
-  CSRMatrix csr = COOToCSR(coo);
-  return CSRGetRowNNZ<kDGLAscend, IdType>(csr, row);
+  return COOGetRowNNZDirect(coo, row);
 }
 
 template <>
@@ -121,8 +128,7 @@ int64_t COOGetRowNNZ<kDGLAscend, int64_t>(COOMatrix coo, int64_t row) {
 
 template <typename IdType>
 NDArray COOGetRowNNZ_Ascend(COOMatrix coo, NDArray rows) {
-  CSRMatrix csr = COOToCSR(coo);
-  return CSRGetRowNNZ<kDGLAscend, IdType>(csr, rows);
+  return COOGetRowNNZDirect(coo, rows);
 }
 
 template <>
