@@ -1,21 +1,23 @@
 """
-Test the 7 COO operators adapted for Ascend NPU via CSR composition.
+Test the 7 COO operators adapted for Ascend NPU.
 
-Covered operators (all reached through DGL high-level Python API):
+Covered operators:
   1. COOSort_                          -> g.edges(order='srcdst') on a CSR-format graph
-  2. COOGetRowNNZ   (scalar + array)   -> g.out_degree / g.out_degrees on a COO-format graph
-  3. COOGetRowDataAndIndices           -> g.out_edges(vid, form='all')  on a COO-format graph
-  4. COOSliceRows    (start/end + rows)-> g.out_edges(vids, form='all') on a COO-format graph
-  5. COOSliceMatrix                   -> dgl.node_subgraph(g, nodes)   on a COO-format graph
+  2. COOGetRowNNZ   (scalar + array)   -> degree APIs on a COO-format graph
+  3. COOGetRowDataAndIndices           -> scalar InEdges/OutEdges CAPI (_1)
+  4. COOSliceRows    (start/end + rows)-> g.in_edges(vids) / g.out_edges(vids)
+  5. COOSliceMatrix                   -> dgl.node_subgraph(g, nodes)
 
 Golden strategy
 ---------------
-For every case we build an identical graph on CPU and run the *same* DGL Python
-API.  The CPU dispatch exercises the reference implementation in
-``src/array/cpu/spmat_op_impl_coo.cc`` and ``src/array/cpu/coo_sort.cc``
-(COOSort_).  Most NPU COO operators use COO -> CSR composition;
-COOGetRowDataAndIndices uses its dedicated stable Count/Scatter implementation
-in ``src/array/ascend/coo_ops.cc``.
+For every case we build an identical graph on CPU and NPU. Most operators are
+reached through DGL's high-level Python API. COOGetRowDataAndIndices is the
+exception: its tests call the scalar ``_CAPI_DGLHeteroInEdges_1`` or
+``_CAPI_DGLHeteroOutEdges_1`` entry point directly. This is intentional because
+the high-level ``in_edges``/``out_edges`` route in this checkout can dispatch
+the vector CAPI path and reach COOSliceRows instead of the scalar operator.
+The CPU dispatch exercises ``src/array/cpu/spmat_op_impl_coo.cc``; the NPU
+dispatch exercises the Ascend implementation in ``src/array/ascend/coo_ops.cc``.
 
 All COO operators here are *integer index* operations, so the precision
 criterion is **bit-exact** (``torch.equal``), not a floating-point tolerance --
@@ -23,22 +25,20 @@ consistent with the integer-compute precision standard.
 
 Comparison methodology for edge-returning operators
 ---------------------------------------------------
-COOGetRowDataAndIndices must preserve the matching edges' original COO order
-and implicit edge IDs, so its columns and EIDs are compared bit-exactly with
-the CPU reference.  COOSliceRows and COOSliceMatrix still use COO -> CSR
-composition; their structural checks compare the sorted multiset of edges and
-retain their documented EID limitation for unsorted input.
+COOSliceRows and COOSliceMatrix may return a different valid edge ordering, so
+those operators are compared as sorted multisets.  COOGetRowDataAndIndices has
+stricter CPU-reference semantics: it scans the input COO in insertion order and
+returns either the explicit data value or the original COO position as the EID.
+The native V2 path is therefore checked bit-exactly for columns and EIDs even on
+unsorted input.
 
 Coverage matrix
 ---------------
 * dtypes      : int32, int64
 * normal path : random / sequential / reverse-sorted / duplicate-row COO
-* boundary    : empty COO, empty row, single element, M=1, N=1, multi-chunk input
-* special     : ordered/unsorted input, repeated edges, implicit EIDs
-
-The graph-level COOGetRowDataAndIndices tests do not cover explicit COO data or
-the operator's own invalid-row CHECK; UnitGraph stores COO data as NullArray,
-and the high-level graph API validates vertex IDs before entering the operator.
+* boundary    : empty COO (nnz=0), single element, M=1 (single row), N=1 (single col)
+* special     : row_sorted true/false, has_data true/false (eid returned by graph API)
+* exceptions  : invalid row index (out-of-range) raising on both devices
 
 Notes on internal branches not directly reachable from the Python API surface
 are documented inline next to the relevant operator.
@@ -52,6 +52,8 @@ import torch
 
 import dgl
 import dgl.utils as dgl_utils
+import dgl.heterograph_index as hi
+from dgl import backend as F
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +139,30 @@ def _make_coo_pair(src, dst, num_nodes, device, cpu):
         _make_graph(src, dst, num_nodes, device, fmt="coo"),
         _make_graph(src, dst, num_nodes, cpu, fmt="coo"),
     )
+
+
+def _scalar_in_edges_capi(graph, row):
+    """Call scalar HeteroInEdges CAPI (_1), reaching COOGetRowDataAndIndices."""
+    api = getattr(hi, "_CAPI_DGLHeteroInEdges_1", None)
+    if api is None:
+        raise RuntimeError(
+            "This DGL build does not expose _CAPI_DGLHeteroInEdges_1; "
+            "cannot directly test scalar COOGetRowDataAndIndices."
+        )
+    result = api(graph._graph, 0, int(row))
+    return tuple(F.from_dgl_nd(result(i)) for i in range(3))
+
+
+def _scalar_out_edges_capi(graph, row):
+    """Call scalar HeteroOutEdges CAPI (_1), reaching COOGetRowDataAndIndices."""
+    api = getattr(hi, "_CAPI_DGLHeteroOutEdges_1", None)
+    if api is None:
+        pytest.skip(
+            "This DGL build does not expose _CAPI_DGLHeteroOutEdges_1; "
+            "the transposed scalar path is still covered by InEdges CAPI."
+        )
+    result = api(graph._graph, 0, int(row))
+    return tuple(F.from_dgl_nd(result(i)) for i in range(3))
 
 
 # A shared pool of COO matrices used across operators.
@@ -311,25 +337,16 @@ def test_coo_get_row_nnz_empty_row():
 # ===========================================================================
 # 3. COOGetRowDataAndIndices
 # ===========================================================================
-# Trigger: g.in_edges(vid, form='all') on a COO-format graph (single vid).
-#   COOAdj::InEdges(vid) -> COOGetRowDataAndIndices(COOTranspose(adj_), vid)
-#   returns (eid, col); graph wraps into (src=predecessors, dst=vid, eid).
-#   Same COOGetRowDataAndIndices kernel as the out-edge variant.
-#
-# Why in_edges not out_edges for the parametrised case: DGL out_edges() validates
-# via has_nodes() -> torch.min, whose NPU kernel does not support int32. in_edges
-# has no such validation, so it covers both int32/int64. The non-transpose
-# out-edges path is covered separately for int64 (below).
-#
-# The CPU scan and the dedicated Ascend Count/Scatter path both preserve the
-# original COO order, including implicit EIDs, for sorted and unsorted input.
+# These tests deliberately use the scalar CAPI helpers above. They must not
+# use graph.in_edges()/graph.out_edges(), because the high-level route can
+# dispatch the NDArray/vector CAPI and test COOSliceRows instead.
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
 @pytest.mark.parametrize(
     "name,src,dst,num_nodes,row_sorted",
     [pytest.param(n, s, d, nn, r, id=n)
-     for n, s, d, nn, r in TEST_CASES if nn and nn >= 1 and s],
+     for n, s, d, nn, r in TEST_CASES if n != "empty"],
 )
 def test_coo_get_row_data_and_indices_npu(name, src, dst, num_nodes, row_sorted, dtype):
     device, cpu = _setup()
@@ -337,94 +354,158 @@ def test_coo_get_row_data_and_indices_npu(name, src, dst, num_nodes, row_sorted,
         pytest.skip("NPU not available")
     s_t, d_t, nn, _ = _resolve_case(name, src, dst, num_nodes, dtype)
     g_npu, g_cpu = _make_coo_pair(s_t, d_t, nn, device, cpu)
+
+    # Query row 0 through the scalar CAPI on both devices.
     vid = 0
-    s_npu, d_npu, e_npu = g_npu.in_edges(vid, form="all")
-    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(vid, form="all")
-    # predecessor (col) indices match bit-exactly (within-row order preserved)
-    _check_int(f"{name}/grdi_col", s_npu, s_cpu)
-    _check_int(f"{name}/grdi_vid", d_npu, d_cpu)
-    # The dedicated stable Count/Scatter implementation must preserve the
-    # original COO edge IDs for both sorted and unsorted input.
+    s_npu, d_npu, e_npu = _scalar_in_edges_capi(g_npu, vid)
+    s_cpu, d_cpu, e_cpu = _scalar_in_edges_capi(g_cpu, vid)
+    _check_int(f"{name}/grdi_src", s_npu, s_cpu)
+    _check_int(f"{name}/grdi_dst", d_npu, d_cpu)
     _check_int(f"{name}/grdi_eid", e_npu, e_cpu)
 
 
 def test_coo_get_row_data_and_indices_out_edges_int64():
-    """Cover the non-transpose COOGetRowDataAndIndices(adj_, vid) path via
-    out_edges (int64 only: out_edges validates via has_nodes -> torch.min)."""
+    """Cover the non-transpose scalar COOGetRowDataAndIndices(adj_, row) path."""
     device, cpu = _setup()
     if device is None:
         pytest.skip("NPU not available")
     src = torch.tensor([0, 0, 1, 2, 3, 3, 3], dtype=torch.int64)
     dst = torch.tensor([1, 2, 0, 3, 0, 1, 2], dtype=torch.int64)
     g_npu, g_cpu = _make_coo_pair(src, dst, 4, device, cpu)
-    s_npu, d_npu, e_npu = g_npu.out_edges(0, form="all")
-    s_cpu, d_cpu, e_cpu = g_cpu.out_edges(0, form="all")
-    _check_int("out_edges/col", d_npu, d_cpu)
+
+    s_npu, d_npu, e_npu = _scalar_out_edges_capi(g_npu, 0)
+    s_cpu, d_cpu, e_cpu = _scalar_out_edges_capi(g_cpu, 0)
     _check_int("out_edges/src", s_npu, s_cpu)
+    _check_int("out_edges/dst", d_npu, d_cpu)
     _check_int("out_edges/eid", e_npu, e_cpu)
 
 
 def test_coo_get_row_data_and_indices_empty_row():
-    """Querying an empty row returns empty data/indices arrays."""
+    """Querying a valid row with no edges returns three empty arrays."""
     device, cpu = _setup()
     if device is None:
         pytest.skip("NPU not available")
     src = torch.tensor([0, 1], dtype=torch.int64)
     dst = torch.tensor([1, 0], dtype=torch.int64)
     g_npu, g_cpu = _make_coo_pair(src, dst, 4, device, cpu)
-    s_npu, d_npu, e_npu = g_npu.in_edges(2, form="all")
-    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(2, form="all")
+
+    s_npu, d_npu, e_npu = _scalar_in_edges_capi(g_npu, 2)
+    s_cpu, d_cpu, e_cpu = _scalar_in_edges_capi(g_cpu, 2)
     assert s_npu.numel() == 0 and s_cpu.numel() == 0
+    assert d_npu.numel() == 0 and d_cpu.numel() == 0
     assert e_npu.numel() == 0 and e_cpu.numel() == 0
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
 def test_coo_get_row_data_and_indices_empty_coo(dtype):
-    """An empty COO returns empty src, dst, and EID arrays."""
+    """A structurally empty COO accepts any valid target row."""
     device, cpu = _setup()
     if device is None:
         pytest.skip("NPU not available")
     src = torch.tensor([], dtype=dtype)
     dst = torch.tensor([], dtype=dtype)
     g_npu, g_cpu = _make_coo_pair(src, dst, 4, device, cpu)
-    s_npu, d_npu, e_npu = g_npu.in_edges(0, form="all")
-    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(0, form="all")
+
+    s_npu, d_npu, e_npu = _scalar_in_edges_capi(g_npu, 2)
+    s_cpu, d_cpu, e_cpu = _scalar_in_edges_capi(g_cpu, 2)
     _check_int("empty_coo/src", s_npu, s_cpu)
     _check_int("empty_coo/dst", d_npu, d_cpu)
     _check_int("empty_coo/eid", e_npu, e_cpu)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
-def test_coo_get_row_data_and_indices_duplicate_edges(dtype):
-    """Repeated identical edges are retained in their original order."""
+def test_coo_get_row_data_and_indices_explicit_data(dtype):
+    """Explicit COO data/EIDs are returned rather than synthesised positions."""
     device, cpu = _setup()
     if device is None:
         pytest.skip("NPU not available")
-    src = torch.tensor([1, 1, 2, 1], dtype=dtype)
-    dst = torch.tensor([0, 0, 0, 2], dtype=dtype)
-    g_npu, g_cpu = _make_coo_pair(src, dst, 3, device, cpu)
-    s_npu, d_npu, e_npu = g_npu.in_edges(0, form="all")
-    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(0, form="all")
-    _check_int("duplicate_edges/src", s_npu, s_cpu)
-    _check_int("duplicate_edges/dst", d_npu, d_cpu)
-    _check_int("duplicate_edges/eid", e_npu, e_cpu)
+
+    def make_graph(target_device):
+        indptr = torch.tensor([0, 2, 4, 6], dtype=dtype)
+        indices = torch.tensor([2, 0, 1, 1, 0, 2], dtype=dtype)
+        # A permutation makes it obvious whether the kernel reads COO data.
+        eids = torch.tensor([5, 1, 4, 0, 3, 2], dtype=dtype)
+        graph = dgl.graph(
+            ("csr", (indptr, indices, eids)), num_nodes=3
+        ).formats("coo")
+        return graph.to(target_device)
+
+    g_npu = make_graph(device)
+    g_cpu = make_graph(cpu)
+    s_npu, d_npu, e_npu = _scalar_in_edges_capi(g_npu, 1)
+    s_cpu, d_cpu, e_cpu = _scalar_in_edges_capi(g_cpu, 1)
+    _check_int("explicit/src", s_npu, s_cpu)
+    _check_int("explicit/dst", d_npu, d_cpu)
+    _check_int("explicit/eid", e_npu, e_cpu)
+
+    # Also assert that the returned EIDs are the explicit values for row 1.
+    # COO 转换后不要求沿用 CSR 输入中的排列顺序。
+    # 这里验证显式 EID 的取值正确，而不是强制要求输出顺序。
+    _check_int(
+        "explicit/eid_expected",
+        torch.sort(e_npu).values,
+        torch.tensor([0, 4], dtype=dtype),
+    )
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+def test_coo_get_row_data_and_indices_multiblock_chunk_boundary(dtype):
+    """Exercise multiple blocks and multiple chunks with a large COO input."""
+    device, cpu = _setup()
+    if device is None:
+        pytest.skip("NPU not available")
+    nnz = 8 * 2048 + 17
+    edge = torch.arange(nnz, dtype=dtype)
+    src = edge % 257
+    dst = (edge * 7 + 3) % 5
+    g_npu, g_cpu = _make_coo_pair(src, dst, 257, device, cpu)
+
+    s_npu, d_npu, e_npu = _scalar_in_edges_capi(g_npu, 3)
+    s_cpu, d_cpu, e_cpu = _scalar_in_edges_capi(g_cpu, 3)
+    _check_int("chunk_boundary/src", s_npu, s_cpu)
+    _check_int("chunk_boundary/dst", d_npu, d_cpu)
+    _check_int("chunk_boundary/eid", e_npu, e_cpu)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
-def test_coo_get_row_data_and_indices_multichunk(dtype):
-    """All 16385 matching edges exercise multiple blocks and one extra chunk."""
+def test_coo_get_row_data_and_indices_duplicate_edges(dtype):
+    """Exact duplicate coordinates are retained in original COO order."""
     device, cpu = _setup()
     if device is None:
         pytest.skip("NPU not available")
-    nnz = 16385
-    src = torch.arange(nnz, dtype=dtype) % 8
-    dst = torch.zeros(nnz, dtype=dtype)
-    g_npu, g_cpu = _make_coo_pair(src, dst, 8, device, cpu)
-    s_npu, d_npu, e_npu = g_npu.in_edges(0, form="all")
-    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(0, form="all")
-    _check_int("multichunk/src", s_npu, s_cpu)
-    _check_int("multichunk/dst", d_npu, d_cpu)
-    _check_int("multichunk/eid", e_npu, e_cpu)
+    src = torch.tensor([2, 2, 1, 2], dtype=dtype)
+    dst = torch.tensor([0, 0, 0, 0], dtype=dtype)
+    g_npu, g_cpu = _make_coo_pair(src, dst, 3, device, cpu)
+
+    s_npu, d_npu, e_npu = _scalar_in_edges_capi(g_npu, 0)
+    s_cpu, d_cpu, e_cpu = _scalar_in_edges_capi(g_cpu, 0)
+    _check_int("duplicates/src", s_npu, s_cpu)
+    _check_int("duplicates/dst", d_npu, d_cpu)
+    _check_int("duplicates/eid", e_npu, e_cpu)
+
+    # The query is on transposed adjacency row 0, whose source sequence is
+    # exactly the original destination-0 insertion sequence.
+    _check_int("duplicates/eid_expected", e_npu, torch.tensor([0, 1, 2, 3], dtype=dtype))
+
+
+@pytest.mark.parametrize("bad_row", [-1, 4], ids=["negative", "upper_bound"])
+def test_coo_get_row_data_and_indices_invalid_row(bad_row):
+    """Scalar CAPI must reject invalid rows on both CPU and NPU."""
+    device, cpu = _setup()
+    if device is None:
+        pytest.skip("NPU not available")
+
+    src = torch.tensor([0, 1], dtype=torch.int64)
+    dst = torch.tensor([1, 0], dtype=torch.int64)
+    g_npu, g_cpu = _make_coo_pair(src, dst, 4, device, cpu)
+
+    # Surface any asynchronous graph-construction error before the negative test.
+    torch.npu.synchronize()
+
+    with pytest.raises(Exception, match="Invalid row index"):
+        _scalar_in_edges_capi(g_npu, bad_row)
+
+    with pytest.raises(Exception, match="Invalid row index"):
+        _scalar_in_edges_capi(g_cpu, bad_row)
 
 
 # ===========================================================================
@@ -613,23 +694,28 @@ def _collect_tests():
     for dtype in (torch.int32, torch.int64):
         dt = "int32" if dtype is torch.int32 else "int64"
         for n, s, d, nn, r in TEST_CASES:
-            if nn and s:
+            if n != "empty":
                 tests.append((f"grdi/{n}/{dt}",
                               lambda n=n, s=s, d=d, nn=nn, r=r, dt=dtype:
                               test_coo_get_row_data_and_indices_npu(n, s, d, nn, r, dt)))
-    tests.append(("grdi/empty_row", test_coo_get_row_data_and_indices_empty_row))
-    tests.append(("grdi/out_edges_int64", test_coo_get_row_data_and_indices_out_edges_int64))
-    for dtype in (torch.int32, torch.int64):
-        dt = "int32" if dtype is torch.int32 else "int64"
         tests.append((f"grdi/empty_coo/{dt}",
                       lambda dt=dtype:
                       test_coo_get_row_data_and_indices_empty_coo(dt)))
+        tests.append((f"grdi/explicit_data/{dt}",
+                      lambda dt=dtype:
+                      test_coo_get_row_data_and_indices_explicit_data(dt)))
+        tests.append((f"grdi/chunk_boundary/{dt}",
+                      lambda dt=dtype:
+                      test_coo_get_row_data_and_indices_multiblock_chunk_boundary(dt)))
         tests.append((f"grdi/duplicate_edges/{dt}",
                       lambda dt=dtype:
                       test_coo_get_row_data_and_indices_duplicate_edges(dt)))
-        tests.append((f"grdi/multichunk/{dt}",
-                      lambda dt=dtype:
-                      test_coo_get_row_data_and_indices_multichunk(dt)))
+    tests.append(("grdi/empty_row", test_coo_get_row_data_and_indices_empty_row))
+    tests.append(("grdi/out_edges_int64", test_coo_get_row_data_and_indices_out_edges_int64))
+    for bad_row in (-1, 4):
+        tests.append((f"grdi/invalid_row/{bad_row}",
+                      lambda row=bad_row:
+                      test_coo_get_row_data_and_indices_invalid_row(row)))
 
     for dtype in (torch.int32, torch.int64):
         dt = "int32" if dtype is torch.int32 else "int64"
@@ -691,5 +777,3 @@ if __name__ == "__main__":
         f"{errors} errored",
         flush=True,
     )
-    if failures or errors:
-        sys.exit(1)

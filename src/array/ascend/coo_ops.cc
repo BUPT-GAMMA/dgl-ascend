@@ -2,16 +2,17 @@
  * @file src/array/ascend/coo_ops.cc
  * @brief Ascend NPU implementations of COO operators.
  *
- * Most operators use COO → CSR composition. COOGetRowDataAndIndices uses a
- * dedicated stable Count/Scatter implementation to preserve original COO EIDs.
+ * Most operators compose native CSR primitives. COOGetRowDataAndIndices uses
+ * a direct Count / host-prefix / Scatter implementation to preserve input COO
+ * order and implicit edge IDs.
  */
-#include <acl/acl.h>
 #include <acl/acl_rt.h>
+
+#include <dgl/array.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <dgl/array.h>
 #include <limits>
 #include <type_traits>
 #include <vector>
@@ -19,29 +20,36 @@
 #include "../array_op.h"
 #include "coo_get_row_data_and_indices_tiling.h"
 
-#ifdef DGL_USE_ASCEND
-extern "C" uint32_t aclrtlaunch_coo_get_row_count_i32(
-    uint32_t blockDim, aclrtStream stream, void* rows, void* count_slabs,
-    void* tiling);
+#define ASCEND_CALL(func)                                    \
+  {                                                          \
+    aclError e = (func);                                     \
+    CHECK(e == ACL_SUCCESS) << "Ascend Error, code: " << e; \
+  }
 
-extern "C" uint32_t aclrtlaunch_coo_get_row_count_i64(
-    uint32_t blockDim, aclrtStream stream, void* rows, void* count_slabs,
-    void* tiling);
-
-extern "C" uint32_t aclrtlaunch_coo_get_row_scatter_i32(
-    uint32_t blockDim, aclrtStream stream, void* rows, void* cols, void* data,
-    void* offsets, void* out_data, void* out_cols, void* tiling);
-
-extern "C" uint32_t aclrtlaunch_coo_get_row_scatter_i64(
-    uint32_t blockDim, aclrtStream stream, void* rows, void* cols, void* data,
-    void* offsets, void* out_data, void* out_cols, void* tiling);
+#ifndef ACLRT_LAUNCH_KERNEL
+#define ACLRT_LAUNCH_KERNEL(kernel_func) aclrtlaunch_##kernel_func
+#endif
 
 namespace dgl {
 namespace runtime {
 aclrtStream getCurrentAscendStream();
 }  // namespace runtime
 }  // namespace dgl
-#endif
+
+extern "C" uint32_t aclrtlaunch_coo_get_row_count_i32(
+    uint32_t blockDim, aclrtStream stream, void* rows, void* count_slabs,
+    void* mask_workspace, void* tiling);
+extern "C" uint32_t aclrtlaunch_coo_get_row_scatter_i32(
+    uint32_t blockDim, aclrtStream stream, void* cols, void* data,
+    void* offsets, void* mask_workspace, void* out_data, void* out_cols,
+    void* tiling);
+extern "C" uint32_t aclrtlaunch_coo_get_row_count_i64(
+    uint32_t blockDim, aclrtStream stream, void* rows, void* count_slabs,
+    void* mask_workspace, void* tiling);
+extern "C" uint32_t aclrtlaunch_coo_get_row_scatter_i64(
+    uint32_t blockDim, aclrtStream stream, void* cols, void* data,
+    void* offsets, void* mask_workspace, void* out_data, void* out_cols,
+    void* tiling);
 
 namespace dgl {
 namespace aten {
@@ -51,127 +59,136 @@ namespace impl {
 
 namespace {
 
-void CheckCooGetRowAcl(aclError error, const char* operation) {
-  CHECK(error == ACL_SUCCESS)
-      << operation << " failed with Ascend error code " << error;
-}
+using coo_get_row_v2::GetRowTiling;
+using coo_get_row_v2::kChunkElements;
+using coo_get_row_v2::kCountStrideWords;
+using coo_get_row_v2::kMaskWorkspaceBytesPerChunk;
+using coo_get_row_v2::kMaxBlocks;
 
-struct CooGetRowWorkspaces {
-  uint32_t* count_slabs = nullptr;
-  uint32_t* offsets = nullptr;
-  void* tiling = nullptr;
-
-  void Allocate(uint32_t block_dim, size_t tiling_bytes) {
-    const size_t count_bytes =
-        static_cast<size_t>(block_dim) * kCooGetRowCountStrideWords *
-        sizeof(uint32_t);
-    const size_t offset_bytes =
-        (static_cast<size_t>(block_dim) + 1) * sizeof(uint32_t);
-    CheckCooGetRowAcl(
-        aclrtMalloc(
-            reinterpret_cast<void**>(&count_slabs), count_bytes,
-            ACL_MEM_MALLOC_HUGE_FIRST),
-        "COOGetRowDataAndIndices count workspace allocation");
-    CheckCooGetRowAcl(
-        aclrtMalloc(
-            reinterpret_cast<void**>(&offsets), offset_bytes,
-            ACL_MEM_MALLOC_HUGE_FIRST),
-        "COOGetRowDataAndIndices offsets workspace allocation");
-    CheckCooGetRowAcl(
-        aclrtMalloc(&tiling, tiling_bytes, ACL_MEM_MALLOC_HUGE_FIRST),
-        "COOGetRowDataAndIndices tiling allocation");
+class GetRowWorkspaces {
+ public:
+  void Allocate(
+      uint32_t block_dim, uint32_t mask_chunks_per_block,
+      size_t tiling_bytes) {
+    ASCEND_CALL(aclrtMalloc(
+        reinterpret_cast<void**>(&count_slabs),
+        static_cast<size_t>(block_dim) * kCountStrideWords * sizeof(uint32_t),
+        ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMalloc(
+        &mask_workspace,
+        static_cast<size_t>(block_dim) * mask_chunks_per_block *
+            kMaskWorkspaceBytesPerChunk,
+        ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMalloc(
+        reinterpret_cast<void**>(&offsets),
+        static_cast<size_t>(block_dim + 1) * sizeof(uint32_t),
+        ACL_MEM_MALLOC_HUGE_FIRST));
+    ASCEND_CALL(aclrtMalloc(
+        &tiling, tiling_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
   }
 
   void Free() {
-    if (count_slabs != nullptr) {
-      uint32_t* ptr = count_slabs;
-      count_slabs = nullptr;
-      CheckCooGetRowAcl(
-          aclrtFree(ptr),
-          "COOGetRowDataAndIndices count workspace free");
-    }
-    if (offsets != nullptr) {
-      uint32_t* ptr = offsets;
-      offsets = nullptr;
-      CheckCooGetRowAcl(
-          aclrtFree(ptr),
-          "COOGetRowDataAndIndices offsets workspace free");
-    }
-    if (tiling != nullptr) {
-      void* ptr = tiling;
-      tiling = nullptr;
-      CheckCooGetRowAcl(
-          aclrtFree(ptr), "COOGetRowDataAndIndices tiling free");
-    }
+    FreeOne(reinterpret_cast<void**>(&count_slabs));
+    FreeOne(&mask_workspace);
+    FreeOne(reinterpret_cast<void**>(&offsets));
+    FreeOne(&tiling);
   }
 
-  ~CooGetRowWorkspaces() {
-    // Best-effort cleanup only: CHECK throws in this repository's default
-    // logging configuration and must not escape a destructor during unwinding.
-    if (count_slabs != nullptr) {
-      (void)aclrtFree(count_slabs);
-    }
-    if (offsets != nullptr) {
-      (void)aclrtFree(offsets);
-    }
-    if (tiling != nullptr) {
-      (void)aclrtFree(tiling);
+  ~GetRowWorkspaces() {
+    FreeUnchecked(count_slabs);
+    FreeUnchecked(mask_workspace);
+    FreeUnchecked(offsets);
+    FreeUnchecked(tiling);
+  }
+
+  GetRowWorkspaces() = default;
+  GetRowWorkspaces(const GetRowWorkspaces&) = delete;
+  GetRowWorkspaces& operator=(const GetRowWorkspaces&) = delete;
+
+  uint32_t* count_slabs = nullptr;
+  void* mask_workspace = nullptr;
+  uint32_t* offsets = nullptr;
+  void* tiling = nullptr;
+
+ private:
+  static void FreeOne(void** ptr) {
+    if (*ptr == nullptr) return;
+    void* allocated = *ptr;
+    *ptr = nullptr;
+    ASCEND_CALL(aclrtFree(allocated));
+  }
+
+  template <typename T>
+  static void FreeUnchecked(T*& ptr) {
+    if (ptr != nullptr) {
+      aclrtFree(ptr);
+      ptr = nullptr;
     }
   }
-  CooGetRowWorkspaces() = default;
-  CooGetRowWorkspaces(const CooGetRowWorkspaces&) = delete;
-  CooGetRowWorkspaces& operator=(const CooGetRowWorkspaces&) = delete;
 };
 
 template <typename IdType>
-void LaunchCooGetRowCount(
-    uint32_t block_dim, aclrtStream stream, const void* rows,
-    uint32_t* count_slabs, void* tiling) {
-  static_assert(
-      std::is_same<IdType, int32_t>::value ||
-          std::is_same<IdType, int64_t>::value,
-      "COOGetRowDataAndIndices only supports int32 and int64 IDs");
-  uint32_t error = ACL_SUCCESS;
-  if (std::is_same<IdType, int32_t>::value) {
-    error = aclrtlaunch_coo_get_row_count_i32(
-        block_dim, stream, const_cast<void*>(rows), count_slabs, tiling);
-  } else {
-    error = aclrtlaunch_coo_get_row_count_i64(
-        block_dim, stream, const_cast<void*>(rows), count_slabs, tiling);
-  }
-  CHECK(error == ACL_SUCCESS)
-      << "COOGetRowDataAndIndices count launch failed: " << error;
+void CheckGetRowArray(
+    const NDArray& array, const DGLContext& ctx, const char* name) {
+  // defined() 判断 NDArray 是否实际存在。
+  // 不使用 IsNullArray()，因为 IsNullArray() 会把合法的零长度数组
+  // 也判断为 null。
+  CHECK(array.defined()) << name << " must be defined";
+
+  CHECK_EQ(array->ndim, 1) << name << " must be one-dimensional";
+  CHECK_EQ(array->dtype.code, kDGLInt)
+      << name << " must contain signed integer indices";
+  CHECK_EQ(array->dtype.bits, sizeof(IdType) * 8)
+      << name << " has an unexpected integer width";
+  CHECK_EQ(array->dtype.lanes, 1) << name << " must have one dtype lane";
+  CHECK_EQ(array->ctx.device_type, ctx.device_type)
+      << name << " must be on the COO device";
+  CHECK_EQ(array->ctx.device_id, ctx.device_id)
+      << name << " must be on the COO device";
+}
+
+uint32_t MaskChunksPerBlock(uint32_t nnz, uint32_t block_dim) {
+  const uint32_t max_block_elements =
+      nnz / block_dim + (nnz % block_dim == 0 ? 0U : 1U);
+  return max_block_elements / kChunkElements +
+         (max_block_elements % kChunkElements == 0 ? 0U : 1U);
 }
 
 template <typename IdType>
-void LaunchCooGetRowScatter(
-    uint32_t block_dim, aclrtStream stream, const void* rows,
-    const void* cols, const void* data, uint32_t* offsets, void* out_data,
-    void* out_cols, void* tiling) {
-  static_assert(
-      std::is_same<IdType, int32_t>::value ||
-          std::is_same<IdType, int64_t>::value,
-      "COOGetRowDataAndIndices only supports int32 and int64 IDs");
-  uint32_t error = ACL_SUCCESS;
-  if (std::is_same<IdType, int32_t>::value) {
-    error = aclrtlaunch_coo_get_row_scatter_i32(
-        block_dim, stream, const_cast<void*>(rows), const_cast<void*>(cols),
-        const_cast<void*>(data), offsets, out_data, out_cols, tiling);
+uint32_t LaunchGetRowCount(
+    uint32_t block_dim, aclrtStream stream, void* rows, void* count_slabs,
+    void* mask_workspace, void* tiling) {
+  if constexpr (std::is_same<IdType, int32_t>::value) {
+    return ACLRT_LAUNCH_KERNEL(coo_get_row_count_i32)(
+        block_dim, stream, rows, count_slabs, mask_workspace, tiling);
   } else {
-    error = aclrtlaunch_coo_get_row_scatter_i64(
-        block_dim, stream, const_cast<void*>(rows), const_cast<void*>(cols),
-        const_cast<void*>(data), offsets, out_data, out_cols, tiling);
+    return ACLRT_LAUNCH_KERNEL(coo_get_row_count_i64)(
+        block_dim, stream, rows, count_slabs, mask_workspace, tiling);
   }
-  CHECK(error == ACL_SUCCESS)
-      << "COOGetRowDataAndIndices scatter launch failed: " << error;
+}
+
+template <typename IdType>
+uint32_t LaunchGetRowScatter(
+    uint32_t block_dim, aclrtStream stream, void* cols, void* data,
+    void* offsets, void* mask_workspace, void* out_data, void* out_cols,
+    void* tiling) {
+  if constexpr (std::is_same<IdType, int32_t>::value) {
+    return ACLRT_LAUNCH_KERNEL(coo_get_row_scatter_i32)(
+        block_dim, stream, cols, data, offsets, mask_workspace, out_data,
+        out_cols, tiling);
+  } else {
+    return ACLRT_LAUNCH_KERNEL(coo_get_row_scatter_i64)(
+        block_dim, stream, cols, data, offsets, mask_workspace, out_data,
+        out_cols, tiling);
+  }
 }
 
 // Ensure the COO matrix carries an explicit data array. When the COO has no
 // explicit data, Ascend COOToCSR (coo2csr.cc) renumbers the CSR data array in
 // CSR-sorted order instead of carrying the original COO edge positions. This
-// breaks eid semantics for downstream ops (COOGetRowDataAndIndices /
-// COOSliceRows / COOSliceMatrix) whose results depend on eid == original COO
-// position.
+// breaks eid semantics for downstream CSR-composed ops (COOSliceRows /
+// COOSliceMatrix) whose results depend on eid == original COO position.  The
+// native COOGetRowDataAndIndices V2 path below does not use this helper.
 //
 // Mirrors the CPU COOSort_/COOToCSR convention (coo_sort.cc:157-158,
 // coo2csr.cc:184-188): when there is no data, materialize Range(0, nnz) as the
@@ -290,156 +307,117 @@ NDArray COOGetRowNNZ<kDGLAscend, int64_t>(COOMatrix coo, NDArray rows) {
 template <typename IdType>
 std::pair<NDArray, NDArray> COOGetRowDataAndIndices_Ascend(
     COOMatrix coo, int64_t row) {
+  CHECK_GE(coo.num_rows, 0) << "COO num_rows must be non-negative";
   CHECK(row >= 0 && row < coo.num_rows) << "Invalid row index: " << row;
-  CHECK(coo.row->ctx.device_type == kDGLAscend)
-      << "COOGetRowDataAndIndices expects Ascend input";
-  CHECK_EQ(coo.row->ndim, 1) << "COO row must be a 1D array";
-  CHECK_EQ(coo.col->ndim, 1) << "COO col must be a 1D array";
-  CHECK(coo.row.IsContiguous()) << "COO row must be contiguous";
-  CHECK(coo.col.IsContiguous()) << "COO col must be contiguous";
-  CHECK_EQ(coo.row->shape[0], coo.col->shape[0])
-      << "COO row and col must have the same length";
-  CHECK_EQ(coo.row->dtype.code, kDGLInt) << "COO IDs must be integers";
-  CHECK_EQ(coo.row->dtype.bits, sizeof(IdType) * 8)
-      << "COO ID dtype does not match dispatch type";
-  CHECK_EQ(coo.row->dtype.lanes, 1) << "COO IDs must be scalar integers";
-  CHECK_EQ(coo.col->dtype.code, coo.row->dtype.code);
-  CHECK_EQ(coo.col->dtype.bits, coo.row->dtype.bits);
-  CHECK_EQ(coo.col->dtype.lanes, coo.row->dtype.lanes);
-  CHECK_EQ(coo.col->ctx.device_type, coo.row->ctx.device_type);
-  CHECK_EQ(coo.col->ctx.device_id, coo.row->ctx.device_id);
-
-  const bool has_data = COOHasData(coo);
-  if (has_data) {
-    CHECK_EQ(coo.data->ndim, 1) << "COO data must be a 1D array";
-    CHECK(coo.data.IsContiguous()) << "COO data must be contiguous";
-    CHECK_EQ(coo.data->shape[0], coo.row->shape[0])
-        << "COO data must have the same length as row and col";
-    CHECK_EQ(coo.data->dtype.code, coo.row->dtype.code);
-    CHECK_EQ(coo.data->dtype.bits, coo.row->dtype.bits);
-    CHECK_EQ(coo.data->dtype.lanes, coo.row->dtype.lanes);
-    CHECK_EQ(coo.data->ctx.device_type, coo.row->ctx.device_type);
-    CHECK_EQ(coo.data->ctx.device_id, coo.row->ctx.device_id);
-  }
-
-  CHECK_LE(row, static_cast<int64_t>(std::numeric_limits<IdType>::max()))
-      << "Target row cannot be represented by the COO ID dtype";
-  const int64_t nnz = coo.row->shape[0];
-  CHECK_GE(nnz, 0) << "COO nnz must be non-negative";
-  CHECK_LE(
-      static_cast<uint64_t>(nnz),
-      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
-      << "COOGetRowDataAndIndices supports at most UINT32_MAX edges";
-  if (!has_data && nnz != 0) {
-    CHECK_LE(
-        static_cast<uint64_t>(nnz - 1),
-        static_cast<uint64_t>(std::numeric_limits<IdType>::max()))
-        << "Implicit COO edge IDs cannot be represented by the ID dtype";
-  }
+  CHECK(coo.row.defined()) << "COO row must be defined";
 
   const DGLContext ctx = coo.row->ctx;
-  const uint8_t id_bits = coo.row->dtype.bits;
-  if (nnz == 0) {
-    return std::make_pair(
-        NewIdArray(0, ctx, id_bits), NewIdArray(0, ctx, id_bits));
+  CHECK_EQ(ctx.device_type, kDGLAscend) << "Expected Ascend device context";
+  CheckGetRowArray<IdType>(coo.row, ctx, "COO row");
+  CheckGetRowArray<IdType>(coo.col, ctx, "COO col");
+
+  const int64_t nnz64 = coo.row->shape[0];
+  CHECK_GE(nnz64, 0) << "COO nnz must be non-negative";
+  CHECK_EQ(coo.col->shape[0], nnz64)
+      << "COO row and col lengths must match";
+  const bool has_data = COOHasData(coo);
+  if (has_data) {
+    CheckGetRowArray<IdType>(coo.data, ctx, "COO data");
+    CHECK_EQ(coo.data->shape[0], nnz64)
+        << "COO data length must equal nnz";
   }
 
-  const uint32_t nnz_u32 = static_cast<uint32_t>(nnz);
-  const uint32_t block_dim =
-      std::min<uint32_t>(kCooGetRowMaxBlocks, nnz_u32);
-  CHECK_GE(block_dim, 1U);
-  CHECK_LE(block_dim, kCooGetRowMaxBlocks);
+  if constexpr (std::is_same<IdType, int32_t>::value) {
+    CHECK_LE(coo.num_rows, std::numeric_limits<int32_t>::max())
+        << "COO num_rows does not fit int32";
+    CHECK_LE(nnz64, std::numeric_limits<int32_t>::max())
+        << "COO nnz exceeds the int32 implicit-EID range";
+  } else {
+    CHECK_LE(
+        static_cast<uint64_t>(nnz64),
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
+        << "COO nnz exceeds the uint32 control range";
+  }
 
-  CheckCooGetRowAcl(
-      aclrtSetDevice(ctx.device_id), "COOGetRowDataAndIndices set device");
-  aclrtStream stream = dgl::runtime::getCurrentAscendStream();
+  ASCEND_CALL(aclrtSetDevice(ctx.device_id));
+  if (nnz64 == 0) {
+    NDArray empty_data = NDArray::Empty({0}, coo.row->dtype, ctx);
+    NDArray empty_cols = NDArray::Empty({0}, coo.col->dtype, ctx);
+    return std::make_pair(empty_data, empty_cols);
+  }
 
-  CooGetRowWorkspaces workspaces;
-  workspaces.Allocate(block_dim, sizeof(CooGetRowTiling<IdType>));
+  const uint32_t nnz = static_cast<uint32_t>(nnz64);
+  const uint32_t block_dim = std::min<uint32_t>(kMaxBlocks, nnz);
+  const uint32_t mask_chunks_per_block =
+      MaskChunksPerBlock(nnz, block_dim);
 
-  CooGetRowTiling<IdType> tiling_host{};
-  tiling_host.nnz = nnz_u32;
+  GetRowTiling<IdType> tiling_host{};
+  tiling_host.nnz = nnz;
   tiling_host.target_row = static_cast<IdType>(row);
   tiling_host.has_data = has_data ? 1U : 0U;
-  CheckCooGetRowAcl(
-      aclrtMemcpy(
-          workspaces.tiling, sizeof(CooGetRowTiling<IdType>), &tiling_host,
-          sizeof(CooGetRowTiling<IdType>), ACL_MEMCPY_HOST_TO_DEVICE),
-      "COOGetRowDataAndIndices tiling copy");
+  tiling_host.mask_chunks_per_block = mask_chunks_per_block;
 
-  LaunchCooGetRowCount<IdType>(
-      block_dim, stream, coo.row->data, workspaces.count_slabs,
-      workspaces.tiling);
-  CheckCooGetRowAcl(
-      aclrtSynchronizeStream(stream),
-      "COOGetRowDataAndIndices count synchronization");
+  GetRowWorkspaces ws;
+  ws.Allocate(block_dim, mask_chunks_per_block, sizeof(tiling_host));
+  ASCEND_CALL(aclrtMemcpy(
+      ws.tiling, sizeof(tiling_host), &tiling_host, sizeof(tiling_host),
+      ACL_MEMCPY_HOST_TO_DEVICE));
+
+  // Both stages use DGL's current stream.  The only inter-stage sync is
+  // required to bring the per-block counts to the host for the prefix sum.
+  aclrtStream stream = dgl::runtime::getCurrentAscendStream();
+  const uint32_t count_launch = LaunchGetRowCount<IdType>(
+      block_dim, stream, coo.row->data, ws.count_slabs, ws.mask_workspace,
+      ws.tiling);
+  CHECK_EQ(count_launch, ACL_SUCCESS)
+      << "COOGetRowDataAndIndices count kernel launch failed: "
+      << count_launch;
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
 
   const size_t count_words =
-      static_cast<size_t>(block_dim) * kCooGetRowCountStrideWords;
-  const size_t count_bytes = count_words * sizeof(uint32_t);
-  std::vector<uint32_t> count_slabs_host(count_words);
-  CheckCooGetRowAcl(
-      aclrtMemcpy(
-          count_slabs_host.data(), count_bytes, workspaces.count_slabs,
-          count_bytes, ACL_MEMCPY_DEVICE_TO_HOST),
-      "COOGetRowDataAndIndices count copy");
+      static_cast<size_t>(block_dim) * kCountStrideWords;
+  std::vector<uint32_t> count_host(count_words, 0);
+  ASCEND_CALL(aclrtMemcpy(
+      count_host.data(), count_words * sizeof(uint32_t), ws.count_slabs,
+      count_words * sizeof(uint32_t), ACL_MEMCPY_DEVICE_TO_HOST));
 
-  std::vector<uint32_t> offsets_host(
-      static_cast<size_t>(block_dim) + 1, 0);
-  uint64_t total_matches = 0;
-  const uint32_t per_block = nnz_u32 / block_dim;
-  const uint32_t remainder = nnz_u32 % block_dim;
+  std::vector<uint32_t> offsets_host(block_dim + 1, 0);
+  uint64_t prefix = 0;
   for (uint32_t block = 0; block < block_dim; ++block) {
-    const uint32_t count =
-        count_slabs_host[static_cast<size_t>(block) *
-                         kCooGetRowCountStrideWords];
-    const uint32_t block_length = per_block + (block < remainder ? 1U : 0U);
-    CHECK_LE(count, block_length)
-        << "COOGetRowDataAndIndices count exceeds its block range";
-    CHECK_LE(
-        total_matches + count,
-        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
-        << "COOGetRowDataAndIndices prefix sum exceeds uint32 capacity";
-    total_matches += count;
-    offsets_host[static_cast<size_t>(block) + 1] =
-        static_cast<uint32_t>(total_matches);
+    prefix += count_host[block * kCountStrideWords];
+    CHECK_LE(prefix, static_cast<uint64_t>(nnz))
+        << "COOGetRowDataAndIndices count exceeds input nnz";
+    offsets_host[block + 1] = static_cast<uint32_t>(prefix);
   }
-  CHECK_LE(total_matches, static_cast<uint64_t>(nnz_u32))
-      << "COOGetRowDataAndIndices matched more edges than the COO contains";
+  const uint32_t output_size = offsets_host.back();
 
-  if (total_matches == 0) {
-    workspaces.Free();
-    return std::make_pair(
-        NewIdArray(0, ctx, id_bits), NewIdArray(0, ctx, id_bits));
+  NDArray out_data =
+      NDArray::Empty({static_cast<int64_t>(output_size)}, coo.row->dtype, ctx);
+  NDArray out_cols =
+      NDArray::Empty({static_cast<int64_t>(output_size)}, coo.col->dtype, ctx);
+  if (output_size == 0) {
+    ws.Free();
+    return std::make_pair(out_data, out_cols);
   }
 
-  CHECK_LE(
-      total_matches,
-      static_cast<uint64_t>(
-          std::numeric_limits<size_t>::max() / sizeof(IdType)))
-      << "COOGetRowDataAndIndices output byte size overflows size_t";
-  NDArray data =
-      NewIdArray(static_cast<int64_t>(total_matches), ctx, id_bits);
-  NDArray col_indices =
-      NewIdArray(static_cast<int64_t>(total_matches), ctx, id_bits);
+  ASCEND_CALL(aclrtMemcpy(
+      ws.offsets, offsets_host.size() * sizeof(uint32_t),
+      offsets_host.data(), offsets_host.size() * sizeof(uint32_t),
+      ACL_MEMCPY_HOST_TO_DEVICE));
 
-  const size_t offset_bytes =
-      offsets_host.size() * sizeof(offsets_host[0]);
-  CheckCooGetRowAcl(
-      aclrtMemcpy(
-          workspaces.offsets, offset_bytes, offsets_host.data(), offset_bytes,
-          ACL_MEMCPY_HOST_TO_DEVICE),
-      "COOGetRowDataAndIndices offsets copy");
+  const uint32_t scatter_launch = LaunchGetRowScatter<IdType>(
+      block_dim, stream, coo.col->data,
+      has_data ? coo.data->data : nullptr, ws.offsets, ws.mask_workspace,
+      out_data->data, out_cols->data, ws.tiling);
+  CHECK_EQ(scatter_launch, ACL_SUCCESS)
+      << "COOGetRowDataAndIndices scatter kernel launch failed: "
+      << scatter_launch;
 
-  LaunchCooGetRowScatter<IdType>(
-      block_dim, stream, coo.row->data, coo.col->data,
-      has_data ? coo.data->data : nullptr, workspaces.offsets, data->data,
-      col_indices->data, workspaces.tiling);
-  CheckCooGetRowAcl(
-      aclrtSynchronizeStream(stream),
-      "COOGetRowDataAndIndices scatter synchronization");
-  workspaces.Free();
-  return std::make_pair(data, col_indices);
+  // Raw ACL workspace and tiling must outlive Scatter; without a stream-ordered
+  // free, this completion sync is required before releasing them.
+  ASCEND_CALL(aclrtSynchronizeStream(stream));
+  ws.Free();
+  return std::make_pair(out_data, out_cols);
 }
 
 template <>

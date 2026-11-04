@@ -1,37 +1,56 @@
-/**
- * Copyright (c) 2024 by Contributors
- * @file coo_get_row_data_and_indices_tiling.h
- * @brief Host/device ABI for the COO row-selection kernels.
- */
-#ifndef DGL_ARRAY_ASCEND_COO_GET_ROW_DATA_AND_INDICES_TILING_H_
-#define DGL_ARRAY_ASCEND_COO_GET_ROW_DATA_AND_INDICES_TILING_H_
+#pragma once
 
 #include <cstdint>
 
-constexpr uint32_t kCooGetRowChunkElements = 2048;
-// Count output is block-major.  Each block owns one 32-byte slab; word 0 is
-// its match count and words 1..7 are padding.  The host exclusive-scans the
-// word-0 values into a uint32_t offsets array of length block_dim + 1.
-constexpr uint32_t kCooGetRowCountStrideWords = 8;
-// The verified standalone launch policy is min(kCooGetRowMaxBlocks, nnz).
-// Empty COO input must be handled by the host without launching a kernel.
-constexpr uint32_t kCooGetRowMaxBlocks = 8;
+namespace dgl {
+namespace aten {
+namespace impl {
+namespace coo_get_row_v2 {
 
+constexpr uint32_t kChunkElements = 2048;
+constexpr uint32_t kCountStrideWords = 8;  // one 32-byte slab per block
+constexpr uint32_t kMaxBlocks = 8;
+constexpr uint32_t kVectorBytes = 256;
+constexpr uint32_t kDataBlockBytes = 32;
+constexpr uint32_t kI32ElementsPerRepeat =
+    kVectorBytes / sizeof(int32_t);
+constexpr uint32_t kMaskWordsPerChunk = kChunkElements / 64;
+constexpr uint32_t kMaskSlabWords =
+    kDataBlockBytes / sizeof(uint32_t);
+constexpr uint32_t kMaskSlabU64 =
+    kDataBlockBytes / sizeof(uint64_t);
+constexpr uint32_t kMaskWorkspaceWordsPerChunk =
+    kMaskWordsPerChunk * kMaskSlabWords;
+constexpr uint32_t kMaskWorkspaceBytesPerChunk =
+    kMaskWorkspaceWordsPerChunk * sizeof(uint32_t);
+constexpr uint32_t kExpandedMaskWordsPerChunk =
+    2 * kMaskWorkspaceWordsPerChunk;
+
+// Shared verbatim by the host compiler and AscendC device compiler.  Keep the
+// static assertions next to the definition so either side fails immediately if
+// a compiler or field edit changes the ABI.
 template <typename IdType>
-struct CooGetRowTiling {
-  uint32_t nnz;       // row/col/data element count
-  IdType target_row;  // compared without narrowing
-  uint32_t has_data;  // 1 = explicit data; 0 = original COO position as EID
-  uint32_t reserved;
+struct GetRowTiling {
+  uint32_t nnz;
+  IdType target_row;
+  uint32_t has_data;
+  uint32_t mask_chunks_per_block;
 };
 
-static_assert(sizeof(CooGetRowTiling<int32_t>) == 16,
-              "unexpected int32 tiling layout");
-static_assert(alignof(CooGetRowTiling<int32_t>) == 4,
-              "unexpected int32 tiling alignment");
-static_assert(sizeof(CooGetRowTiling<int64_t>) == 24,
-              "unexpected int64 tiling layout");
-static_assert(alignof(CooGetRowTiling<int64_t>) == 8,
-              "unexpected int64 tiling alignment");
+static_assert(
+    sizeof(GetRowTiling<int32_t>) == 16,
+    "GetRowTiling<int32_t> layout changed");
+static_assert(
+    alignof(GetRowTiling<int32_t>) == 4,
+    "GetRowTiling<int32_t> alignment changed");
+static_assert(
+    sizeof(GetRowTiling<int64_t>) == 24,
+    "GetRowTiling<int64_t> layout changed");
+static_assert(
+    alignof(GetRowTiling<int64_t>) == 8,
+    "GetRowTiling<int64_t> alignment changed");
 
-#endif  // DGL_ARRAY_ASCEND_COO_GET_ROW_DATA_AND_INDICES_TILING_H_
+}  // namespace coo_get_row_v2
+}  // namespace impl
+}  // namespace aten
+}  // namespace dgl
