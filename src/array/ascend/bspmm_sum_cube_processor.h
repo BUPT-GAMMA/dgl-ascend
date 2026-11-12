@@ -151,6 +151,17 @@ private:
             uint32_t dstOffset = kBlockIndex * CUBE_BLOCK_SIZE + kInnerIndex * CUBE_BLOCK_LENGTH;
             AscendC::DataCopy(b1Nz[dstOffset], featureGm[srcOffset], copyParams);
         }
+
+        // MMAD uses the K dimension rounded up to a full Cube block.  Clear
+        // the unused B rows so zero padding in A cannot multiply stale NaNs.
+        if (rows < k) {
+            AscendC::InitConstValueParams<half> zeroParams;
+            zeroParams.repeatTimes = static_cast<uint16_t>(nBlocksCols);
+            zeroParams.blockNum = static_cast<uint16_t>(k - rows);
+            zeroParams.dstGap = static_cast<uint16_t>(rows);
+            zeroParams.initValue = half(0.0f);
+            AscendC::Fill(b1Nz[rows * CUBE_BLOCK_LENGTH], zeroParams);
+        }
         
         b1Queue.EnQue<half>(b1Nz);
     }
@@ -218,7 +229,7 @@ private:
         fixpipeParams.dstNdStride = 0;
         fixpipeParams.reluEn = false;
         fixpipeParams.quantPre = QuantMode_t::F322F16;
-        AscendC::Fixpipe(outputGm[(baseRow * this->batchCount + batchIndex) * this->featureDim + outputColStart], outputChunkTensor, fixpipeParams);
+        AscendC::Fixpipe<half, float, AscendC::CFG_ROW_MAJOR>(outputGm[(baseRow * this->batchCount + batchIndex) * this->featureDim + outputColStart], outputChunkTensor, fixpipeParams);
     }
 
     __aicore__ inline uint32_t CeilCubeBlock(uint32_t len)

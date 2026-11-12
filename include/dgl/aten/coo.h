@@ -263,8 +263,7 @@ std::pair<bool, bool> COOIsSorted(COOMatrix coo);
  * entries will be returned. The operator assumes there is NO duplicate (row,
  * col) pair in the given input. Otherwise, the returned result is undefined.
  *
- * @note This operator allows broadcasting (i.e, either row or col can be of
- * length 1).
+ * @note Rows and cols must have the same length.
  * @param mat Sparse matrix
  * @param rows Row index
  * @param cols Column index
