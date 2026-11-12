@@ -1244,20 +1244,12 @@ std::pair<NDArray, NDArray> COOGetRowDataAndIndices(
 std::vector<NDArray> COOGetDataAndIndices(
     COOMatrix coo, NDArray rows, NDArray cols) {
   std::vector<NDArray> ret;
-  if (coo.row->ctx.device_type == kDGLAscend) {
-#ifdef DGL_USE_ASCEND
+  ATEN_XPU_SWITCH_CUDA_ASCEND(
+      coo.row->ctx.device_type, XPU, "COOGetDataAndIndices", {
     ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
-      ret = impl::COOGetDataAndIndices<kDGLAscend, IdType>(
-          coo, rows, cols);
-    });
-#else
-    LOG(FATAL) << "Ascend support is not compiled.";
-#endif
-  } else {
-    ATEN_COO_SWITCH(coo, XPU, IdType, "COOGetDataAndIndices", {
       ret = impl::COOGetDataAndIndices<XPU, IdType>(coo, rows, cols);
     });
-  }
+  });
   return ret;
 }
 

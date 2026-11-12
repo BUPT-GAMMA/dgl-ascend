@@ -6,469 +6,490 @@ using namespace AscendC;
 
 namespace {
 
-constexpr uint32_t kCOOQueryTileLength = 256;
-constexpr uint32_t kCOOQueryMaskBytes = kCOOQueryTileLength / 8;
-constexpr uint32_t kCOOGatherFlushElements = 256;
+constexpr uint32_t TileLength = 256;
+constexpr uint32_t MaskBytes = TileLength / 8;
+constexpr uint32_t MaskWordCount = MaskBytes / sizeof(uint64_t);
+constexpr uint32_t DefaultMatchesPerQuery = 8;
+constexpr uint32_t FlushElements = 256;
+constexpr uint32_t MatchCountSlotElements = 32 / sizeof(uint64_t);
+constexpr uint32_t BufferNum = 2;
 
-static_assert(
-    kCOOQueryMaskBytes == 32,
-    "Each match tile must produce one aligned mask block");
-
-// Keep the layout identical to coo_get_data_and_indices.cc.
+// Keep the layout identical to coo_getData_and_indices.cc.
 struct COOGetDataAndIndicesTiling {
   uint32_t nnz;
-  uint32_t padded_nnz;
-  uint32_t query_count;
-  uint32_t reverse_order;
-  uint32_t has_data;
+  uint32_t tileCount;
+  uint32_t queryCount;
+  uint32_t hasData;
 };
-
-static_assert(
-    sizeof(COOGetDataAndIndicesTiling) == 20,
-    "Unexpected COOGetDataAndIndices tiling layout");
-
-template <HardEvent Event>
-__aicore__ inline void COOQuerySync(TPipe* pipe) {
-  const int32_t event_id =
-      static_cast<int32_t>(pipe->FetchEventID(Event));
-  SetFlag<Event>(event_id);
-  WaitFlag<Event>(event_id);
-}
 
 template <typename IdType>
 class KernelCOOQueryMatch {
  public:
-  __aicore__ inline void Init(
-      GM_ADDR coo_rows, GM_ADDR coo_cols,
-      GM_ADDR query_rows, GM_ADDR query_cols,
-      GM_ADDR mask, GM_ADDR tiling_ptr, TPipe* pipe) {
+  __aicore__ inline void Init(GM_ADDR cooRows, GM_ADDR cooCols, GM_ADDR queryRows, GM_ADDR queryCols, GM_ADDR cooData, GM_ADDR matchRows, GM_ADDR matchCounts, GM_ADDR matchCols, GM_ADDR matchData, GM_ADDR tiling_ptr, TPipe* pipe) {
     pipe_ = pipe;
+    const __gm__ COOGetDataAndIndicesTiling* tiling = reinterpret_cast<const __gm__ COOGetDataAndIndicesTiling*>(tiling_ptr);
+    nnz_ = tiling->nnz;
+    queryCount_ = tiling->queryCount;
+    hasData_ = tiling->hasData != 0;
 
-    const __gm__ COOGetDataAndIndicesTiling* tiling =
-        reinterpret_cast<
-            const __gm__ COOGetDataAndIndicesTiling*>(tiling_ptr);
+    cooRowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(cooRows), nnz_);
+    cooColsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(cooCols), nnz_);
+    cooData_ = reinterpret_cast<const __gm__ IdType*>(cooData);
+    queryRows_ = reinterpret_cast<const __gm__ IdType*>(queryRows);
+    queryCols_ = reinterpret_cast<const __gm__ IdType*>(queryCols);
+    const uint64_t matchElements = static_cast<uint64_t>(queryCount_) * DefaultMatchesPerQuery;
+    matchRowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(matchRows), matchElements);
+    matchColsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(matchCols), matchElements);
+    matchDataGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(matchData), matchElements);
+    matchCountsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(matchCounts),static_cast<uint64_t>(GetBlockNum()) * MatchCountSlotElements);
 
-    padded_nnz_ = tiling->padded_nnz;
-    query_count_ = tiling->query_count;
-    mask_stride_ = padded_nnz_ / 8;
+    pipe_->InitBuffer(rowsBuffer_, BufferNum * TileLength * sizeof(IdType));
+    pipe_->InitBuffer(colsBuffer_, BufferNum * TileLength * sizeof(IdType));
+    pipe_->InitBuffer(maskBuffer_, MaskBytes);
+    pipe_->InitBuffer(rowMask_, MaskBytes);
+    pipe_->InitBuffer(colMask_, MaskBytes);
+    pipe_->InitBuffer(lowParts_, TileLength * sizeof(int32_t));
+    pipe_->InitBuffer(highParts_, TileLength * sizeof(int32_t));
+    pipe_->InitBuffer(matchCountBuffer_, 32);
+    pipe_->InitBuffer(matchRowsBuffer_, BufferNum * FlushElements * sizeof(IdType));
+    pipe_->InitBuffer(matchColsBuffer_, BufferNum * FlushElements * sizeof(IdType));
+    pipe_->InitBuffer(matchDataBuffer_, BufferNum * FlushElements * sizeof(IdType));
 
-    coo_rows_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ IdType*>(coo_rows),
-        padded_nnz_);
-    coo_cols_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ IdType*>(coo_cols),
-        padded_nnz_);
-
-    query_rows_ =
-        reinterpret_cast<const __gm__ IdType*>(query_rows);
-    query_cols_ =
-        reinterpret_cast<const __gm__ IdType*>(query_cols);
-
-    mask_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ uint8_t*>(mask),
-        static_cast<uint64_t>(query_count_) * mask_stride_);
-
-    pipe_->InitBuffer(
-        in_rows_, 1, kCOOQueryTileLength * sizeof(IdType));
-    pipe_->InitBuffer(
-        in_cols_, 1, kCOOQueryTileLength * sizeof(IdType));
-    pipe_->InitBuffer(out_mask_, 1, kCOOQueryMaskBytes);
-    pipe_->InitBuffer(row_mask_, kCOOQueryMaskBytes);
-    pipe_->InitBuffer(col_mask_, kCOOQueryMaskBytes);
+    vectorToScalarEvent_ = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::V_S>());
+    scalarToVectorEvent_ = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::S_V>());
+    for (uint32_t slot = 0; slot < BufferNum; ++slot) {
+      mte2ToVectorEvents_[slot] = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::MTE2_V>());
+      scalarToMte3Events_[slot] = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::S_MTE3>());
+      mte3ToScalarEvents_[slot] = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::MTE3_S>());
+    }
   }
 
   __aicore__ inline void Process() {
-    const uint32_t block_count = GetBlockNum();
+    const uint32_t blockIndex = GetBlockIdx();
+    const uint32_t blockCount = GetBlockNum();
+    const uint64_t queryBegin = static_cast<uint64_t>(queryCount_) * blockIndex / blockCount;
+    const uint64_t queryEnd = static_cast<uint64_t>(queryCount_) * (blockIndex + 1) / blockCount;
 
-    for (uint64_t q = GetBlockIdx();
-         q < query_count_;
-         q += block_count) {
-      const IdType query_row = query_rows_[q];
-      const IdType query_col = query_cols_[q];
-      const uint64_t output_base = q * mask_stride_;
+    const uint64_t matchBase = queryBegin * DefaultMatchesPerQuery;
+    const uint64_t matchCapacity = (queryEnd - queryBegin) * DefaultMatchesPerQuery;
+    uint64_t matchCount = 0;  // 已经匹配的结果数量
+    uint64_t flushCount = 0;  // 已经搬出的结果数量
+    uint32_t outIndex = 0;  // 搬出块的写索引
+    uint32_t matchSlot = 0; // 匹配所使用的 Slot
+    uint32_t matchSlotsInFlight = 0;  // 匹配结果 Slot 是否正在搬出的位图
+    const uint32_t fullTileCount = nnz_ / TileLength;
+    const uint32_t tailCount = nnz_ % TileLength;
 
-      for (uint32_t start = 0;
-           start < padded_nnz_;
-           start += kCOOQueryTileLength) {
-        LocalTensor<IdType> rows =
-            in_rows_.AllocTensor<IdType>();
-        LocalTensor<IdType> cols =
-            in_cols_.AllocTensor<IdType>();
+    for (uint64_t q = queryBegin; q < queryEnd; ++q) {
+      const IdType queryRow = queryRows_[q];
+      const IdType queryCol = queryCols_[q];
 
-        DataCopy(
-            rows, coo_rows_gm_[start],
-            kCOOQueryTileLength);
-        DataCopy(
-            cols, coo_cols_gm_[start],
-            kCOOQueryTileLength);
-
-        in_rows_.EnQue(rows);
-        in_cols_.EnQue(cols);
-
-        rows = in_rows_.DeQue<IdType>();
-        cols = in_cols_.DeQue<IdType>();
-
-        LocalTensor<uint8_t> mask =
-            out_mask_.AllocTensor<uint8_t>();
-
-        ComputeMask(
-            rows, cols, query_row, query_col, mask);
-
-        out_mask_.EnQue(mask);
-        in_rows_.FreeTensor(rows);
-        in_cols_.FreeTensor(cols);
-
-        mask = out_mask_.DeQue<uint8_t>();
-
-        DataCopy(
-            mask_gm_[output_base + start / 8],
-            mask, kCOOQueryMaskBytes);
-
-        out_mask_.FreeTensor(mask);
+      if (fullTileCount != 0) {
+        CopyIn(0, TileLength);
+      } else if (tailCount != 0) {
+        CopyIn(0, tailCount);
       }
+
+      for (uint32_t tileIndex = 0; tileIndex < fullTileCount; ++tileIndex) {
+        const uint32_t nextTile = tileIndex + 1;
+        if (nextTile < fullTileCount) {
+          CopyIn(nextTile, TileLength);
+        } else if (nextTile == fullTileCount && tailCount != 0) {
+          CopyIn(nextTile, tailCount);
+        }
+        ComputeTile<false>(tileIndex, TileLength, queryRow, queryCol, matchBase, matchCapacity, matchCount, flushCount, outIndex, matchSlot, matchSlotsInFlight);
+      }
+
+      if (tailCount != 0) {
+        ComputeTile<true>(fullTileCount, tailCount, queryRow, queryCol, matchBase, matchCapacity, matchCount, flushCount, outIndex, matchSlot, matchSlotsInFlight);
+      }
+    }
+
+    // 尾部处理没有搬出的 match
+    if (outIndex != 0) {
+      const uint32_t matchOffset = matchSlot * FlushElements * sizeof(IdType);
+      LocalTensor<IdType> matchRows = matchRowsBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+      LocalTensor<IdType> matchCols = matchColsBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+      LocalTensor<IdType> matchData = matchDataBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+      CopyOut(matchRows, matchCols, matchData, matchBase + flushCount, outIndex, matchSlot);
+      matchSlotsInFlight |= 1U << matchSlot;
+    }
+
+    for (uint32_t slot = 0; slot < BufferNum; ++slot) {
+      WaitForMatchSlot(slot, matchSlotsInFlight);
+    }
+
+    LocalTensor<uint64_t> countBuffer = matchCountBuffer_.Get<uint64_t>();
+    countBuffer.SetValue(0, matchCount);
+    for (uint32_t i = 1; i < MatchCountSlotElements; ++i) {
+      countBuffer.SetValue(i, 0);
+    }
+
+    SetFlag<HardEvent::S_MTE3>(scalarToMte3Events_[0]);
+    WaitFlag<HardEvent::S_MTE3>(scalarToMte3Events_[0]);
+    DataCopy(matchCountsGm_[static_cast<uint64_t>(blockIndex) * MatchCountSlotElements], countBuffer, MatchCountSlotElements);
+    SetFlag<HardEvent::MTE3_S>(mte3ToScalarEvents_[0]);
+    WaitFlag<HardEvent::MTE3_S>(mte3ToScalarEvents_[0]);
+
+    PipeBarrier<PIPE_ALL>();
+    pipe_->ReleaseEventID<HardEvent::V_S>(vectorToScalarEvent_);
+    pipe_->ReleaseEventID<HardEvent::S_V>(scalarToVectorEvent_);
+    for (uint32_t slot = 0; slot < BufferNum; ++slot) {
+      pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToVectorEvents_[slot]);
+      pipe_->ReleaseEventID<HardEvent::S_MTE3>(scalarToMte3Events_[slot]);
+      pipe_->ReleaseEventID<HardEvent::MTE3_S>(mte3ToScalarEvents_[slot]);
     }
   }
 
  private:
-  __aicore__ inline void ComputeMask(
-      const LocalTensor<IdType>& rows,
-      const LocalTensor<IdType>& cols,
-      IdType query_row, IdType query_col,
-      LocalTensor<uint8_t>& mask);
+  __aicore__ inline void CopyIn(uint32_t tileIndex, uint32_t validCount) {
+    const uint32_t start = tileIndex * TileLength;
+    const DataCopyExtParams copyParams{1, validCount * static_cast<uint32_t>(sizeof(IdType)),0, 0, 0};
+    const DataCopyPadExtParams<IdType> padParams{false, 0, 0, static_cast<IdType>(0)};
+    const uint32_t slot = tileIndex % BufferNum;
+    const uint32_t inputOffset = slot * TileLength * sizeof(IdType);
+    LocalTensor<IdType> rows = rowsBuffer_.GetWithOffset<IdType>(TileLength, inputOffset);
+    LocalTensor<IdType> cols = colsBuffer_.GetWithOffset<IdType>(TileLength, inputOffset);
+    DataCopyPad(rows, cooRowsGm_[start], copyParams, padParams);
+    DataCopyPad(cols, cooColsGm_[start], copyParams, padParams);
+    SetFlag<HardEvent::MTE2_V>(mte2ToVectorEvents_[slot]);
+  }
+
+  __aicore__ inline void Compare(const LocalTensor<IdType>& rows, const LocalTensor<IdType>& cols, IdType queryRow, IdType queryCol, LocalTensor<uint8_t>& mask);
+
+  template <bool IsTail>
+  __aicore__ inline void ComputeTile(uint32_t tileIndex, uint32_t validCount, IdType queryRow, IdType queryCol, uint64_t matchBase, uint64_t matchCapacity, uint64_t& matchCount, uint64_t& flushCount, uint32_t& outIndex, uint32_t& matchSlot, uint32_t& matchSlotsInFlight) {
+    const uint32_t slot = tileIndex % BufferNum;
+    const uint32_t inputOffset = slot * TileLength * sizeof(IdType);
+    LocalTensor<IdType> rows = rowsBuffer_.GetWithOffset<IdType>(TileLength, inputOffset);
+    LocalTensor<IdType> cols = colsBuffer_.GetWithOffset<IdType>(TileLength, inputOffset);
+    LocalTensor<uint8_t> mask = maskBuffer_.Get<uint8_t>();
+
+    WaitFlag<HardEvent::MTE2_V>(mte2ToVectorEvents_[slot]);
+    Compare(rows, cols, queryRow, queryCol, mask);
+    SetFlag<HardEvent::V_S>(vectorToScalarEvent_);
+    WaitFlag<HardEvent::V_S>(vectorToScalarEvent_);
+
+    const uint32_t start = tileIndex * TileLength;
+    // 清除尾块比较结果
+    if constexpr (IsTail) {
+      ClearTailMask(validCount, mask);
+    }
+
+    LocalTensor<uint64_t> maskWords = mask.ReinterpretCast<uint64_t>();
+    uint64_t anyBits = 0;
+    for (uint32_t word = 0; word < MaskWordCount; ++word) {
+      anyBits |= maskWords.GetValue(word);
+    }
+
+    if (anyBits != 0) {
+      uint32_t matchOffset = matchSlot * FlushElements * sizeof(IdType);
+      LocalTensor<IdType> matchRows = matchRowsBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+      LocalTensor<IdType> matchCols = matchColsBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+      LocalTensor<IdType> matchData = matchDataBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+      for (uint32_t word = 0; word < MaskWordCount; ++word) {
+        uint64_t bits = maskWords.GetValue(word);
+        while (bits != 0) {
+          const uint32_t bit = static_cast<uint32_t>(GetSFFValue<1>(bits));
+          bits &= bits - 1;
+          const uint32_t cooIndex = start + word * 64 + bit;
+          if (matchCount < matchCapacity) {
+            matchRows.SetValue(outIndex, queryRow);
+            matchCols.SetValue(outIndex, queryCol);
+            matchData.SetValue(outIndex, hasData_ ? cooData_[cooIndex] : static_cast<IdType>(cooIndex));
+            ++outIndex;
+            if (outIndex == FlushElements) {
+              CopyOut(matchRows, matchCols, matchData, matchBase + flushCount, outIndex, matchSlot);
+              matchSlotsInFlight |= 1U << matchSlot;
+              flushCount += outIndex;
+              outIndex = 0;
+              matchSlot = (matchSlot + 1) % BufferNum;
+              WaitForMatchSlot(matchSlot, matchSlotsInFlight);
+              matchOffset = matchSlot * FlushElements * sizeof(IdType);
+              matchRows = matchRowsBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+              matchCols = matchColsBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+              matchData = matchDataBuffer_.GetWithOffset<IdType>(FlushElements, matchOffset);
+            }
+          }
+          ++matchCount;
+        }
+      }
+    }
+    SetFlag<HardEvent::S_V>(scalarToVectorEvent_);
+    WaitFlag<HardEvent::S_V>(scalarToVectorEvent_);
+  }
+
+  __aicore__ inline void WaitForMatchSlot(
+      uint32_t slot, uint32_t& slotsInFlight) {
+    const uint32_t slotBit = 1U << slot;
+    if ((slotsInFlight & slotBit) != 0) {
+      WaitFlag<HardEvent::MTE3_S>(mte3ToScalarEvents_[slot]);
+      slotsInFlight &= ~slotBit;
+    }
+  }
+
+  __aicore__ inline void ClearTailMask(uint32_t validCount, LocalTensor<uint8_t>& mask) {
+    uint32_t first_invalid_byte = validCount / 8;
+    const uint32_t valid_bits = validCount % 8;
+    // 修改部分有效的字节
+    if (valid_bits != 0) {
+      const uint8_t keep_mask = static_cast<uint8_t>((1U << valid_bits) - 1U);
+      mask.SetValue(first_invalid_byte, static_cast<uint8_t>(mask.GetValue(first_invalid_byte) & keep_mask));
+      ++first_invalid_byte;
+    }
+    // 修改全部无效的字节
+    for (uint32_t byte = first_invalid_byte;byte < MaskBytes; ++byte) {
+      mask.SetValue(byte, 0);
+    }
+  }
+
+  __aicore__ inline void CopyOut(LocalTensor<IdType>& rows, LocalTensor<IdType>& cols, LocalTensor<IdType>& data, uint64_t outputIndex, uint32_t count, uint32_t slot) {
+    SetFlag<HardEvent::S_MTE3>(scalarToMte3Events_[slot]);
+    WaitFlag<HardEvent::S_MTE3>(scalarToMte3Events_[slot]);
+    const DataCopyExtParams copyParams{1, count * static_cast<uint32_t>(sizeof(IdType)), 0, 0, 0};
+    DataCopyPad(matchRowsGm_[outputIndex], rows, copyParams);
+    DataCopyPad(matchColsGm_[outputIndex], cols, copyParams);
+    DataCopyPad(matchDataGm_[outputIndex], data, copyParams);
+    SetFlag<HardEvent::MTE3_S>(mte3ToScalarEvents_[slot]);
+  }
 
   TPipe* pipe_ = nullptr;
 
-  TQue<TPosition::VECIN, 1> in_rows_;
-  TQue<TPosition::VECIN, 1> in_cols_;
-  TQue<TPosition::VECOUT, 1> out_mask_;
+  TBuf<TPosition::VECCALC> rowsBuffer_;
+  TBuf<TPosition::VECCALC> colsBuffer_;
+  TBuf<TPosition::VECCALC> maskBuffer_;
+  TBuf<TPosition::VECCALC> rowMask_;
+  TBuf<TPosition::VECCALC> colMask_;
+  TBuf<TPosition::VECCALC> lowParts_;
+  TBuf<TPosition::VECCALC> highParts_;
+  TBuf<TPosition::VECCALC> matchCountBuffer_;
+  TBuf<TPosition::VECCALC> matchRowsBuffer_;
+  TBuf<TPosition::VECCALC> matchColsBuffer_;
+  TBuf<TPosition::VECCALC> matchDataBuffer_;
 
-  TBuf<TPosition::VECCALC> row_mask_;
-  TBuf<TPosition::VECCALC> col_mask_;
+  int32_t vectorToScalarEvent_;
+  int32_t scalarToVectorEvent_;
+  int32_t mte2ToVectorEvents_[BufferNum];
+  int32_t scalarToMte3Events_[BufferNum];
+  int32_t mte3ToScalarEvents_[BufferNum];
 
-  GlobalTensor<IdType> coo_rows_gm_;
-  GlobalTensor<IdType> coo_cols_gm_;
-  GlobalTensor<uint8_t> mask_gm_;
+  GlobalTensor<IdType> cooRowsGm_;
+  GlobalTensor<IdType> cooColsGm_;
+  GlobalTensor<IdType> matchRowsGm_;
+  GlobalTensor<IdType> matchColsGm_;
+  GlobalTensor<IdType> matchDataGm_;
+  GlobalTensor<uint64_t> matchCountsGm_;
 
-  const __gm__ IdType* query_rows_ = nullptr;
-  const __gm__ IdType* query_cols_ = nullptr;
+  const __gm__ IdType* queryRows_ = nullptr;
+  const __gm__ IdType* queryCols_ = nullptr;
+  const __gm__ IdType* cooData_ = nullptr;
 
-  uint32_t padded_nnz_ = 0;
-  uint32_t query_count_ = 0;
-  uint32_t mask_stride_ = 0;
+  uint32_t nnz_ = 0;
+  uint32_t queryCount_ = 0;
+  bool hasData_ = false;
 };
 
 template <>
 __aicore__ inline void
-KernelCOOQueryMatch<int32_t>::ComputeMask(
-    const LocalTensor<int32_t>& rows,
-    const LocalTensor<int32_t>& cols,
-    int32_t query_row, int32_t query_col,
-    LocalTensor<uint8_t>& mask) {
-  LocalTensor<uint8_t> row_mask =
-      row_mask_.Get<uint8_t>();
-  LocalTensor<uint8_t> col_mask =
-      col_mask_.Get<uint8_t>();
+KernelCOOQueryMatch<int32_t>::Compare(const LocalTensor<int32_t>& rows, const LocalTensor<int32_t>& cols, int32_t queryRow, int32_t queryCol, LocalTensor<uint8_t>& mask) {
+  LocalTensor<uint8_t> rowMask = rowMask_.Get<uint8_t>();
+  LocalTensor<uint8_t> colMask = colMask_.Get<uint8_t>();
 
-  CompareScalar(
-      row_mask, rows, query_row,
-      CMPMODE::EQ, kCOOQueryTileLength);
-  CompareScalar(
-      col_mask, cols, query_col,
-      CMPMODE::EQ, kCOOQueryTileLength);
-
+  CompareScalar(rowMask, rows, queryRow, CMPMODE::EQ, TileLength);
+  CompareScalar(colMask, cols, queryCol, CMPMODE::EQ, TileLength);
   PipeBarrier<PIPE_V>();
 
-  And(
-      mask.ReinterpretCast<uint16_t>(),
-      row_mask.ReinterpretCast<uint16_t>(),
-      col_mask.ReinterpretCast<uint16_t>(),
-      static_cast<int32_t>(
-          kCOOQueryMaskBytes / sizeof(uint16_t)));
-
+  And(mask.ReinterpretCast<uint16_t>(), rowMask.ReinterpretCast<uint16_t>(), colMask.ReinterpretCast<uint16_t>(), static_cast<int32_t>(MaskBytes / sizeof(uint16_t)));
   PipeBarrier<PIPE_V>();
 }
 
 template <>
 __aicore__ inline void
-KernelCOOQueryMatch<int64_t>::ComputeMask(
-    const LocalTensor<int64_t>& rows,
-    const LocalTensor<int64_t>& cols,
-    int64_t query_row, int64_t query_col,
-    LocalTensor<uint8_t>& mask) {
-  // Queues synchronize vector-side consumers. The scalar path explicitly
-  // synchronizes its own reads and writes with the DMA pipelines.
-  COOQuerySync<HardEvent::MTE2_S>(pipe_);
-  COOQuerySync<HardEvent::MTE3_S>(pipe_);
+KernelCOOQueryMatch<int64_t>::Compare(const LocalTensor<int64_t>& rows, const LocalTensor<int64_t>& cols, int64_t queryRow, int64_t queryCol, LocalTensor<uint8_t>& mask) {
+  LocalTensor<uint8_t> rowMask = rowMask_.Get<uint8_t>();
+  LocalTensor<uint8_t> colMask = colMask_.Get<uint8_t>();
+  LocalTensor<int32_t> lowParts = lowParts_.Get<int32_t>();
+  LocalTensor<int32_t> highParts = highParts_.Get<int32_t>();
 
-  for (uint32_t byte = 0;
-       byte < kCOOQueryMaskBytes;
-       ++byte) {
-    uint8_t bits = 0;
+  constexpr uint16_t splitRepeats = TileLength * sizeof(int64_t) / 256;
+  const GatherMaskParams splitParams{1, splitRepeats, 8, 0};
+  uint64_t reservedCount = 0;
 
-    for (uint32_t bit = 0; bit < 8; ++bit) {
-      const uint32_t index = byte * 8 + bit;
+  const uint64_t queryRowBits = static_cast<uint64_t>(queryRow);
+  const int32_t queryRowLow = static_cast<int32_t>(queryRowBits & 0xffffffffULL);
+  const int32_t queryRowHigh = static_cast<int32_t>(queryRowBits >> 32);
 
-      if (rows.GetValue(index) == query_row
-          && cols.GetValue(index) == query_col) {
-        bits = static_cast<uint8_t>(
-            bits | (1U << bit));
-      }
-    }
+  GatherMask(lowParts, rows.ReinterpretCast<int32_t>(), static_cast<uint8_t>(1), false, 0, splitParams, reservedCount);
+  GatherMask(highParts, rows.ReinterpretCast<int32_t>(), static_cast<uint8_t>(2), false, 0, splitParams, reservedCount);
+  PipeBarrier<PIPE_V>();
 
-    mask.SetValue(byte, bits);
-  }
+  CompareScalar(rowMask, lowParts, queryRowLow, CMPMODE::EQ, TileLength);
+  CompareScalar(colMask, highParts, queryRowHigh, CMPMODE::EQ, TileLength);
+  PipeBarrier<PIPE_V>();
 
-  COOQuerySync<HardEvent::S_MTE2>(pipe_);
-  COOQuerySync<HardEvent::S_MTE3>(pipe_);
+  And(rowMask.ReinterpretCast<uint16_t>(), rowMask.ReinterpretCast<uint16_t>(), colMask.ReinterpretCast<uint16_t>(), static_cast<int32_t>(MaskBytes / sizeof(uint16_t)));
+  PipeBarrier<PIPE_V>();
+
+  const uint64_t queryColBits = static_cast<uint64_t>(queryCol);
+  const int32_t queryColLow = static_cast<int32_t>(queryColBits & 0xffffffffULL);
+  const int32_t queryColHigh = static_cast<int32_t>(queryColBits >> 32);
+
+  GatherMask(lowParts, cols.ReinterpretCast<int32_t>(), static_cast<uint8_t>(1), false, 0, splitParams, reservedCount);
+  GatherMask(highParts, cols.ReinterpretCast<int32_t>(), static_cast<uint8_t>(2), false, 0, splitParams, reservedCount);
+  PipeBarrier<PIPE_V>();
+
+  CompareScalar(colMask, lowParts, queryColLow, CMPMODE::EQ, TileLength);
+  CompareScalar(mask, highParts, queryColHigh, CMPMODE::EQ, TileLength);
+  PipeBarrier<PIPE_V>();
+
+  And(colMask.ReinterpretCast<uint16_t>(), colMask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(), static_cast<int32_t>(MaskBytes / sizeof(uint16_t)));
+  PipeBarrier<PIPE_V>();
+
+  And(mask.ReinterpretCast<uint16_t>(), rowMask.ReinterpretCast<uint16_t>(), colMask.ReinterpretCast<uint16_t>(), static_cast<int32_t>(MaskBytes / sizeof(uint16_t)));
+  PipeBarrier<PIPE_V>();
 }
 
 template <typename IdType>
 class KernelCOOQueryGather {
  public:
-  __aicore__ inline void Init(
-      GM_ADDR query_rows, GM_ADDR query_cols,
-      GM_ADDR coo_data, GM_ADDR mask, GM_ADDR offsets,
-      GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_data,
-      GM_ADDR tiling_ptr, TPipe* pipe) {
+  __aicore__ inline void Init(GM_ADDR matchRows, GM_ADDR matchCols, GM_ADDR matchData, GM_ADDR output_offsets, GM_ADDR outRows, GM_ADDR outCols, GM_ADDR outData, GM_ADDR tiling_ptr, TPipe* pipe) {
     pipe_ = pipe;
+    if (GetBlockIdx() != 0) return;
 
-    const __gm__ COOGetDataAndIndicesTiling* tiling =
-        reinterpret_cast<
-            const __gm__ COOGetDataAndIndicesTiling*>(tiling_ptr);
+    const __gm__ COOGetDataAndIndicesTiling* tiling = reinterpret_cast<const __gm__ COOGetDataAndIndicesTiling*>(tiling_ptr);
+    queryCount_ = tiling->queryCount;
+    outputOffsets_ = reinterpret_cast<const __gm__ uint64_t*>(output_offsets);
 
-    nnz_ = tiling->nnz;
-    padded_nnz_ = tiling->padded_nnz;
-    query_count_ = tiling->query_count;
-    reverse_order_ = tiling->reverse_order != 0;
-    has_data_ = tiling->has_data != 0;
+    const uint32_t blockCount = GetBlockNum();
+    const uint64_t total = outputOffsets_[blockCount];
+    const uint64_t matchElements = static_cast<uint64_t>(queryCount_) * DefaultMatchesPerQuery;
+    matchRowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(matchRows), matchElements);
+    matchColsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(matchCols), matchElements);
+    matchDataGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(matchData), matchElements);
 
-    mask_stride_ = padded_nnz_ / 8;
+    outRows_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(outRows), total);
+    outCols_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(outCols), total);
+    outData_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(outData), total);
 
-    query_rows_ =
-        reinterpret_cast<const __gm__ IdType*>(query_rows);
-    query_cols_ =
-        reinterpret_cast<const __gm__ IdType*>(query_cols);
-    coo_data_ =
-        reinterpret_cast<const __gm__ IdType*>(coo_data);
-    offsets_ =
-        reinterpret_cast<const __gm__ uint64_t*>(offsets);
+    pipe_->InitBuffer(inRowsQueue_, BufferNum, FlushElements * sizeof(IdType));
+    pipe_->InitBuffer(inColsQueue_, BufferNum, FlushElements * sizeof(IdType));
+    pipe_->InitBuffer(inDataQueue_, BufferNum, FlushElements * sizeof(IdType));
 
-    mask_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ uint8_t*>(mask),
-        static_cast<uint64_t>(query_count_) * mask_stride_);
-
-    const uint64_t total = offsets_[query_count_];
-
-    out_rows_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ IdType*>(out_rows), total);
-    out_cols_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ IdType*>(out_cols), total);
-    out_data_gm_.SetGlobalBuffer(
-        reinterpret_cast<__gm__ IdType*>(out_data), total);
-
-    pipe_->InitBuffer(mask_buf_, kCOOQueryMaskBytes);
-    pipe_->InitBuffer(
-        out_rows_buf_,
-        kCOOGatherFlushElements * sizeof(IdType));
-    pipe_->InitBuffer(
-        out_cols_buf_,
-        kCOOGatherFlushElements * sizeof(IdType));
-    pipe_->InitBuffer(
-        out_data_buf_,
-        kCOOGatherFlushElements * sizeof(IdType));
+    for (uint32_t slot = 0; slot < BufferNum; ++slot) {
+      mte2ToMte3Events_[slot] = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::MTE2_MTE3>());
+      mte3ToMte2Events_[slot] = static_cast<int32_t>(pipe_->AllocEventID<HardEvent::MTE3_MTE2>());
+    }
   }
 
   __aicore__ inline void Process() {
-    // Host launches one block. This guard also prevents duplicate writes
-    // if a caller accidentally supplies a larger logical grid.
     if (GetBlockIdx() != 0) return;
+    const uint32_t blockCount = GetBlockNum();
+    uint32_t copyOutTileIndex = 0;
 
-    LocalTensor<uint8_t> mask =
-        mask_buf_.Get<uint8_t>();
-    LocalTensor<IdType> out_rows =
-        out_rows_buf_.Get<IdType>();
-    LocalTensor<IdType> out_cols =
-        out_cols_buf_.Get<IdType>();
-    LocalTensor<IdType> out_data =
-        out_data_buf_.Get<IdType>();
+    for (uint32_t block = 0; block < blockCount; ++block) {
+      const uint64_t queryBegin = static_cast<uint64_t>(queryCount_) * block / blockCount;
+      uint64_t sourceIndex = queryBegin * DefaultMatchesPerQuery;
+      uint64_t outputIndex = outputOffsets_[block];
+      uint64_t remaining = outputOffsets_[block + 1] - outputIndex;
 
-    const uint32_t tile_count =
-        padded_nnz_ / kCOOQueryTileLength;
-
-    for (uint64_t q = 0; q < query_count_; ++q) {
-      uint64_t output_index = offsets_[q];
-      const uint64_t query_end = offsets_[q + 1];
-
-      if (output_index == query_end) continue;
-
-      const IdType query_row = query_rows_[q];
-      const IdType query_col = query_cols_[q];
-      const uint64_t mask_base = q * mask_stride_;
-      uint32_t staged = 0;
-
-      for (uint32_t ordinal = 0;
-           ordinal < tile_count;
-           ++ordinal) {
-        const uint32_t tile_index =
-            reverse_order_
-                ? tile_count - 1 - ordinal
-                : ordinal;
-
-        const uint32_t tile_start =
-            tile_index * kCOOQueryTileLength;
-
-        DataCopy(
-            mask,
-            mask_gm_[mask_base + tile_start / 8],
-            kCOOQueryMaskBytes);
-
-        COOQuerySync<HardEvent::MTE2_S>(pipe_);
-
-        for (uint32_t lane = 0;
-             lane < kCOOQueryTileLength;
-             ++lane) {
-          const uint32_t local_index =
-              reverse_order_
-                  ? kCOOQueryTileLength - 1 - lane
-                  : lane;
-
-          const uint32_t coo_index =
-              tile_start + local_index;
-
-          // Padding may contain matching values. Never emit padded entries.
-          if (coo_index >= nnz_) continue;
-
-          const uint8_t bits =
-              mask.GetValue(local_index / 8);
-
-          if (((bits >> (local_index % 8)) & 1U) == 0) {
-            continue;
-          }
-
-          out_rows.SetValue(staged, query_row);
-          out_cols.SetValue(staged, query_col);
-
-          const IdType value =
-              has_data_
-                  ? coo_data_[coo_index]
-                  : static_cast<IdType>(coo_index);
-
-          out_data.SetValue(staged, value);
-          ++staged;
-
-          if (staged == kCOOGatherFlushElements) {
-            FlushOut(
-                out_rows, out_cols, out_data,
-                output_index, staged);
-            output_index += staged;
-            staged = 0;
-          }
-        }
-
-        // Complete scalar mask reads before the next MTE2 copy reuses UB.
-        COOQuerySync<HardEvent::S_MTE2>(pipe_);
+      while (remaining != 0) {
+        const uint32_t count = static_cast<uint32_t>(remaining < FlushElements ? remaining : FlushElements);
+        CopyOut(sourceIndex, outputIndex, count, copyOutTileIndex);
+        sourceIndex += count;
+        outputIndex += count;
+        remaining -= count;
+        ++copyOutTileIndex;
       }
+    }
 
-      if (staged != 0) {
-        FlushOut(
-            out_rows, out_cols, out_data,
-            output_index, staged);
-      }
+    const uint32_t liveSlots = copyOutTileIndex < BufferNum ? copyOutTileIndex : BufferNum;
+    for (uint32_t slot = 0; slot < liveSlots; ++slot) {
+      WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Events_[slot]);
+    }
+    for (uint32_t slot = 0; slot < BufferNum; ++slot) {
+      pipe_->ReleaseEventID<HardEvent::MTE2_MTE3>(mte2ToMte3Events_[slot]);
+      pipe_->ReleaseEventID<HardEvent::MTE3_MTE2>(mte3ToMte2Events_[slot]);
     }
   }
 
  private:
-  __aicore__ inline void FlushOut(
-      LocalTensor<IdType>& rows,
-      LocalTensor<IdType>& cols,
-      LocalTensor<IdType>& data,
-      uint64_t output_index, uint32_t count) {
-    // Scalar SetValue must complete before MTE3 reads these buffers.
-    COOQuerySync<HardEvent::S_MTE3>(pipe_);
+  __aicore__ inline void CopyOut(uint64_t sourceIndex, uint64_t outputIndex, uint32_t count, uint32_t copyOutTileIndex) {
+    const uint32_t slot = copyOutTileIndex % BufferNum;
 
-    const uint32_t copy_bytes =
-        count * static_cast<uint32_t>(sizeof(IdType));
+    if (copyOutTileIndex >= BufferNum) {
+      WaitFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Events_[slot]);
+    }
 
-    DataCopyExtParams copy_params{
-        1, copy_bytes, 0, 0, 0};
+    const uint32_t copyBytes = count * static_cast<uint32_t>(sizeof(IdType));
+    const DataCopyExtParams copyParams{1, copyBytes, 0, 0, 0};
+    const DataCopyPadExtParams<IdType> padParams{false, 0, 0, static_cast<IdType>(0)};
 
-    DataCopyPad(
-        out_rows_gm_[output_index],
-        rows, copy_params);
-    DataCopyPad(
-        out_cols_gm_[output_index],
-        cols, copy_params);
-    DataCopyPad(
-        out_data_gm_[output_index],
-        data, copy_params);
+    LocalTensor<IdType> rows = inRowsQueue_.AllocTensor<IdType>();
+    LocalTensor<IdType> cols = inColsQueue_.AllocTensor<IdType>();
+    LocalTensor<IdType> data = inDataQueue_.AllocTensor<IdType>();
+    DataCopyPad(rows, matchRowsGm_[sourceIndex], copyParams, padParams);
+    DataCopyPad(cols, matchColsGm_[sourceIndex], copyParams, padParams);
+    DataCopyPad(data, matchDataGm_[sourceIndex], copyParams, padParams);
+    inRowsQueue_.EnQue(rows);
+    inColsQueue_.EnQue(cols);
+    inDataQueue_.EnQue(data);
 
-    // Complete all three copies before scalar stores reuse the buffers.
-    COOQuerySync<HardEvent::MTE3_S>(pipe_);
+    rows = inRowsQueue_.DeQue<IdType>();
+    cols = inColsQueue_.DeQue<IdType>();
+    data = inDataQueue_.DeQue<IdType>();
+    SetFlag<HardEvent::MTE2_MTE3>(mte2ToMte3Events_[slot]);
+    WaitFlag<HardEvent::MTE2_MTE3>(mte2ToMte3Events_[slot]);
+
+    DataCopyPad(outRows_gm_[outputIndex], rows, copyParams);
+    DataCopyPad(outCols_gm_[outputIndex], cols, copyParams);
+    DataCopyPad(outData_gm_[outputIndex], data, copyParams);
+    SetFlag<HardEvent::MTE3_MTE2>(mte3ToMte2Events_[slot]);
+
+    inRowsQueue_.FreeTensor(rows);
+    inColsQueue_.FreeTensor(cols);
+    inDataQueue_.FreeTensor(data);
   }
 
   TPipe* pipe_ = nullptr;
 
-  TBuf<TPosition::VECCALC> mask_buf_;
-  TBuf<TPosition::VECCALC> out_rows_buf_;
-  TBuf<TPosition::VECCALC> out_cols_buf_;
-  TBuf<TPosition::VECCALC> out_data_buf_;
+  TQue<TPosition::VECIN, BufferNum> inRowsQueue_;
+  TQue<TPosition::VECIN, BufferNum> inColsQueue_;
+  TQue<TPosition::VECIN, BufferNum> inDataQueue_;
 
-  GlobalTensor<uint8_t> mask_gm_;
-  GlobalTensor<IdType> out_rows_gm_;
-  GlobalTensor<IdType> out_cols_gm_;
-  GlobalTensor<IdType> out_data_gm_;
+  GlobalTensor<IdType> matchRowsGm_;
+  GlobalTensor<IdType> matchColsGm_;
+  GlobalTensor<IdType> matchDataGm_;
+  GlobalTensor<IdType> outRows_gm_;
+  GlobalTensor<IdType> outCols_gm_;
+  GlobalTensor<IdType> outData_gm_;
 
-  const __gm__ IdType* query_rows_ = nullptr;
-  const __gm__ IdType* query_cols_ = nullptr;
-  const __gm__ IdType* coo_data_ = nullptr;
-  const __gm__ uint64_t* offsets_ = nullptr;
-
-  uint32_t nnz_ = 0;
-  uint32_t padded_nnz_ = 0;
-  uint32_t query_count_ = 0;
-  uint32_t mask_stride_ = 0;
-
-  bool reverse_order_ = false;
-  bool has_data_ = false;
+  const __gm__ uint64_t* outputOffsets_ = nullptr;
+  int32_t mte2ToMte3Events_[BufferNum];
+  int32_t mte3ToMte2Events_[BufferNum];
+  uint32_t queryCount_ = 0;
 };
 
 }  // namespace
 
 extern "C" __global__ __aicore__ void
-coo_get_data_and_indices(
-    uint32_t operation,
-    GM_ADDR coo_rows, GM_ADDR coo_cols,
-    GM_ADDR query_rows, GM_ADDR query_cols,
-    GM_ADDR coo_data, GM_ADDR mask, GM_ADDR offsets,
-    GM_ADDR out_rows, GM_ADDR out_cols, GM_ADDR out_data,
-    GM_ADDR tiling) {
+coo_getData_and_indices(uint32_t operation, GM_ADDR cooRows, GM_ADDR cooCols, GM_ADDR queryRows, GM_ADDR queryCols, GM_ADDR cooData, GM_ADDR mask, GM_ADDR offsets, GM_ADDR outRows, GM_ADDR outCols, GM_ADDR outData, GM_ADDR tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-
   TPipe pipe;
-  // Use one registered entry for both phases and both template instances.
   if (operation == 0) {
     KernelCOOQueryMatch<int32_t> op;
-    op.Init(
-        coo_rows, coo_cols, query_rows, query_cols,
-        mask, tiling, &pipe);
+    op.Init(cooRows, cooCols, queryRows, queryCols, cooData, mask, offsets, outRows, outCols, tiling, &pipe);
     op.Process();
   } else if (operation == 1) {
     KernelCOOQueryMatch<int64_t> op;
-    op.Init(
-        coo_rows, coo_cols, query_rows, query_cols,
-        mask, tiling, &pipe);
+    op.Init(cooRows, cooCols, queryRows, queryCols, cooData, mask, offsets, outRows, outCols, tiling, &pipe);
     op.Process();
   } else if (operation == 2) {
     KernelCOOQueryGather<int32_t> op;
-    op.Init(
-        query_rows, query_cols, coo_data, mask, offsets,
-        out_rows, out_cols, out_data, tiling, &pipe);
+    op.Init(cooRows, cooCols, cooData, offsets, outRows, outCols, outData, tiling, &pipe);
     op.Process();
   } else if (operation == 3) {
     KernelCOOQueryGather<int64_t> op;
-    op.Init(
-        query_rows, query_cols, coo_data, mask, offsets,
-        out_rows, out_cols, out_data, tiling, &pipe);
+    op.Init(cooRows, cooCols, cooData, offsets, outRows, outCols, outData, tiling, &pipe);
     op.Process();
   }
 }
