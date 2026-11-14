@@ -228,13 +228,11 @@ std::vector<NDArray> COOGetDataAndIndices(
   CHECK_SAME_DTYPE(coo.col, cols);
   const int64_t rowlen = rows->shape[0];
   const int64_t collen = cols->shape[0];
-  const int64_t len = std::max(rowlen, collen);
+  const int64_t len = rowlen;
 
-  CHECK((rowlen == collen) || (rowlen == 1) || (collen == 1))
-      << "Invalid row and col id array.";
+  CHECK_EQ(rowlen, collen)
+      << "Query rows and cols must have the same length.";
 
-  const int64_t row_stride = (rowlen == 1 && collen != 1) ? 0 : 1;
-  const int64_t col_stride = (collen == 1 && rowlen != 1) ? 0 : 1;
   const IdType *row_data = static_cast<IdType *>(rows->data);
   const IdType *col_data = static_cast<IdType *>(cols->data);
 
@@ -264,9 +262,8 @@ std::vector<NDArray> COOGetDataAndIndices(
       pair_map.emplace(
           std::make_pair(coo_row_data[k], coo_col_data[k]), data ? data[k] : k);
 
-    for (int64_t i = 0, j = 0; i < rowlen && j < collen;
-         i += row_stride, j += col_stride) {
-      const IdType row_id = row_data[i], col_id = col_data[j];
+    for (int64_t i = 0; i < len; ++i) {
+      const IdType row_id = row_data[i], col_id = col_data[i];
       CHECK(row_id >= 0 && row_id < coo.num_rows)
           << "Invalid row index: " << row_id;
       CHECK(col_id >= 0 && col_id < coo.num_cols)
@@ -279,9 +276,8 @@ std::vector<NDArray> COOGetDataAndIndices(
       }
     }
   } else {
-    for (int64_t i = 0, j = 0; i < rowlen && j < collen;
-         i += row_stride, j += col_stride) {
-      const IdType row_id = row_data[i], col_id = col_data[j];
+    for (int64_t i = 0; i < len; ++i) {
+      const IdType row_id = row_data[i], col_id = col_data[i];
       CHECK(row_id >= 0 && row_id < coo.num_rows)
           << "Invalid row index: " << row_id;
       CHECK(col_id >= 0 && col_id < coo.num_cols)
