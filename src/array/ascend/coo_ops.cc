@@ -15,14 +15,11 @@ namespace aten {
 namespace impl {
 #ifdef DGL_USE_ASCEND
 
-// COOGetRowNNZ direct Ascend implementation
+// COOGetRowNNZ Ascend implementation
 // Defined in coo_get_row_nnz.cc
 
-int64_t COOGetRowNNZDirect(
-    COOMatrix coo, int64_t row);
-
-NDArray COOGetRowNNZDirect(
-    COOMatrix coo, NDArray rows);
+int64_t COOGetRowNNZAscend(COOMatrix coo, int64_t row);
+NDArray COOGetRowNNZAscend(COOMatrix coo, NDArray rows);
 
 namespace {
 
@@ -107,38 +104,28 @@ void COOSort_<kDGLAscend, int64_t>(COOMatrix* coo, bool sort_column) {
 // COOGetRowNNZ (scalar)
 // =========================================================================
 
-template <typename IdType>
-int64_t COOGetRowNNZ_Ascend(COOMatrix coo, int64_t row) {
-  return COOGetRowNNZDirect(coo, row);
-}
-
 template <>
 int64_t COOGetRowNNZ<kDGLAscend, int32_t>(COOMatrix coo, int64_t row) {
-  return COOGetRowNNZ_Ascend<int32_t>(coo, row);
+  return COOGetRowNNZAscend(coo, row);
 }
 
 template <>
 int64_t COOGetRowNNZ<kDGLAscend, int64_t>(COOMatrix coo, int64_t row) {
-  return COOGetRowNNZ_Ascend<int64_t>(coo, row);
+  return COOGetRowNNZAscend(coo, row);
 }
 
 // =========================================================================
 // COOGetRowNNZ (array)
 // =========================================================================
 
-template <typename IdType>
-NDArray COOGetRowNNZ_Ascend(COOMatrix coo, NDArray rows) {
-  return COOGetRowNNZDirect(coo, rows);
-}
-
 template <>
 NDArray COOGetRowNNZ<kDGLAscend, int32_t>(COOMatrix coo, NDArray rows) {
-  return COOGetRowNNZ_Ascend<int32_t>(coo, rows);
+  return COOGetRowNNZAscend(coo, rows);
 }
 
 template <>
 NDArray COOGetRowNNZ<kDGLAscend, int64_t>(COOMatrix coo, NDArray rows) {
-  return COOGetRowNNZ_Ascend<int64_t>(coo, rows);
+  return COOGetRowNNZAscend(coo, rows);
 }
 
 // =========================================================================
