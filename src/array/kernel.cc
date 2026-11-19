@@ -19,6 +19,16 @@ using namespace dgl::runtime;
 
 namespace dgl {
 namespace aten {
+#ifdef DGL_USE_ASCEND
+// Ascend-specific CSR selection and dispatch stay in the Ascend implementation.
+bool TrySDDMMAscend(
+    const std::string& op, HeteroGraphPtr graph, NDArray lhs, NDArray rhs,
+    NDArray out, int lhs_target, int rhs_target);
+bool TrySDDMMHeteroAscend(
+    const std::string& op, HeteroGraphPtr graph,
+    const std::vector<NDArray>& lhs, const std::vector<NDArray>& rhs,
+    const std::vector<NDArray>& out, int lhs_target, int rhs_target);
+#endif
 namespace {}  // namespace
 
 /** @brief Generalized Sparse Matrix-Matrix Multiplication. */
@@ -251,6 +261,9 @@ void SpMMHetero(
 void SDDMM(
     const std::string& op, HeteroGraphPtr graph, NDArray lhs, NDArray rhs,
     NDArray out, int lhs_target, int rhs_target) {
+#ifdef DGL_USE_ASCEND
+  if (TrySDDMMAscend(op, graph, lhs, rhs, out, lhs_target, rhs_target)) return;
+#endif
   // TODO(zihao): format tuning
   SparseFormat format = graph->SelectFormat(0, COO_CODE);
   const auto& bcast = CalcBcastOff(op, lhs, rhs);
@@ -293,6 +306,10 @@ void SDDMMHetero(
     const std::string& op, HeteroGraphPtr graph, std::vector<NDArray> lhs,
     std::vector<NDArray> rhs, std::vector<NDArray> out, int lhs_target,
     int rhs_target) {
+#ifdef DGL_USE_ASCEND
+  if (TrySDDMMHeteroAscend(
+          op, graph, lhs, rhs, out, lhs_target, rhs_target)) return;
+#endif
   SparseFormat format = graph->SelectFormat(0, COO_CODE);
 
   std::vector<dgl_type_t> lhs_eid;
@@ -306,7 +323,7 @@ void SDDMMHetero(
   ATEN_XPU_SWITCH_CUDA_ASCEND(graph->Context().device_type, XPU, "SDDMM", {
     ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
       ATEN_FLOAT_TYPE_SWITCH_16BITS(
-          out[rhs_eid[0]]->dtype, Dtype, XPU, "Feature data", {
+          out[0]->dtype, Dtype, XPU, "Feature data", {
             if (format == SparseFormat::kCSR) {
               std::vector<CSRMatrix> vec_csr;
               for (dgl_type_t etype = 0; etype < graph->NumEdgeTypes();

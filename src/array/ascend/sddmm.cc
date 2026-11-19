@@ -1,13 +1,8 @@
 // ============================================================================
-// SDDMM Ascend host dispatch — bridges DGL framework to sddmm_dot_coo kernel
+// SDDMM Ascend host dispatch for native CSR and COO kernels.
 // ============================================================================
-// Pattern: follows src/array/ascend/spmm.cc
-//   - extern "C" aclrtlaunch_sddmm_dot_coo declaration
-//   - SDDMMCooAscend<IdType, DType> template (tiling + launch)
-//   - SDDMMCoo<kDGLAscend, ...> / SDDMMCsr<kDGLAscend, ...> explicit specializations
-//
-// MVP scope: COO format, "dot" op, lhs_target=src(0), rhs_target=dst(2)
-// Unsupported combos fall back to LOG(FATAL)
+// FP32/FP64 CSR add/sub/mul/div/copy/dot share sddmm_csr.cc. COO and FP16
+// retain their existing kernel and torch NPU fallback paths.
 // ============================================================================
 
 #include <dgl/array.h>
@@ -28,6 +23,7 @@
 #include <Python.h>
 #include <torch/extension.h>
 #include "sddmm_copy_lhs_tiling.h"
+#include "sddmm_csr.h"
 
 
 #ifndef ACLRT_LAUNCH_KERNEL
@@ -643,7 +639,7 @@ void SDDMMCoo<kDGLAscend, int64_t, double>(
 
 // ============================================================================
 // Template specializations — SDDMMCsr<kDGLAscend, ...>
-// Convert CSR to COO and delegate to SDDMMCoo
+// FP32/FP64 operations share the native CSR implementation.
 // ============================================================================
 template <typename IdType, typename DType>
 void SDDMMCsrAscend(const BcastOff& bcast, const CSRMatrix& csr,
@@ -666,11 +662,7 @@ template <>
 void SDDMMCsr<kDGLAscend, int32_t, float>(
     const std::string& op, const BcastOff& bcast, const CSRMatrix& csr,
     NDArray lhs, NDArray rhs, NDArray out, int lhs_target, int rhs_target) {
-  if (op != "dot") {
-    SDDMMCsrNPUFallback<int32_t, float>(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
-    return;
-  }
-  SDDMMCsrAscend<int32_t, float>(bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
+  SDDMMCsrAscend(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
 }
 
 template <>
@@ -688,12 +680,7 @@ template <>
 void SDDMMCsr<kDGLAscend, int64_t, float>(
     const std::string& op, const BcastOff& bcast, const CSRMatrix& csr,
     NDArray lhs, NDArray rhs, NDArray out, int lhs_target, int rhs_target) {
-  if (op != "dot") {
-    SDDMMCsrNPUFallback<int64_t, float>(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
-    return;
-  }
-  CSRMatrix csr32 = CastCSRToInt32(csr);
-  SDDMMCsrAscend<int32_t, float>(bcast, csr32, lhs, rhs, out, lhs_target, rhs_target);
+  SDDMMCsrAscend(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
 }
 
 template <>
@@ -712,74 +699,128 @@ template <>
 void SDDMMCsr<kDGLAscend, int32_t, double>(
     const std::string& op, const BcastOff& bcast, const CSRMatrix& csr,
     NDArray lhs, NDArray rhs, NDArray out, int lhs_target, int rhs_target) {
-  SDDMMCsrNPUFallback<int32_t, double>(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
+  SDDMMCsrAscend(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
 }
 
 template <>
 void SDDMMCsr<kDGLAscend, int64_t, double>(
     const std::string& op, const BcastOff& bcast, const CSRMatrix& csr,
     NDArray lhs, NDArray rhs, NDArray out, int lhs_target, int rhs_target) {
-  SDDMMCsrNPUFallback<int64_t, double>(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
+  SDDMMCsrAscend(op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
 }
 
-// ============================================================================
-// Hetero stubs — not yet implemented, LOG(FATAL) for all combinations
-// ============================================================================
-template <>
-void SDDMMCsrHetero<kDGLAscend, int32_t, float>(
-    const std::string&, const BcastOff&,
-    const std::vector<CSRMatrix>&,
-    const std::vector<NDArray>&, const std::vector<NDArray>&,
-    std::vector<NDArray>, int, int,
-    const std::vector<dgl_type_t>&, const std::vector<dgl_type_t>&) {
-  LOG(FATAL) << "Ascend SDDMM Hetero not yet implemented";
-}
-template <>
-void SDDMMCsrHetero<kDGLAscend, int32_t, uint16_t>(
-    const std::string&, const BcastOff&,
-    const std::vector<CSRMatrix>&,
-    const std::vector<NDArray>&, const std::vector<NDArray>&,
-    std::vector<NDArray>, int, int,
-    const std::vector<dgl_type_t>&, const std::vector<dgl_type_t>&) {
-  LOG(FATAL) << "Ascend SDDMM Hetero not yet implemented";
-}
-template <>
-void SDDMMCsrHetero<kDGLAscend, int32_t, double>(
-    const std::string&, const BcastOff&,
-    const std::vector<CSRMatrix>&,
-    const std::vector<NDArray>&, const std::vector<NDArray>&,
-    std::vector<NDArray>, int, int,
-    const std::vector<dgl_type_t>&, const std::vector<dgl_type_t>&) {
-  LOG(FATAL) << "Ascend SDDMM Hetero not yet implemented";
-}
-template <>
-void SDDMMCsrHetero<kDGLAscend, int64_t, float>(
-    const std::string&, const BcastOff&,
-    const std::vector<CSRMatrix>&,
-    const std::vector<NDArray>&, const std::vector<NDArray>&,
-    std::vector<NDArray>, int, int,
-    const std::vector<dgl_type_t>&, const std::vector<dgl_type_t>&) {
-  LOG(FATAL) << "Ascend SDDMM Hetero not yet implemented";
-}
-template <>
-void SDDMMCsrHetero<kDGLAscend, int64_t, uint16_t>(
-    const std::string&, const BcastOff&,
-    const std::vector<CSRMatrix>&,
-    const std::vector<NDArray>&, const std::vector<NDArray>&,
-    std::vector<NDArray>, int, int,
-    const std::vector<dgl_type_t>&, const std::vector<dgl_type_t>&) {
-  LOG(FATAL) << "Ascend SDDMM Hetero not yet implemented";
-}
-template <>
-void SDDMMCsrHetero<kDGLAscend, int64_t, double>(
-    const std::string&, const BcastOff&,
-    const std::vector<CSRMatrix>&,
-    const std::vector<NDArray>&, const std::vector<NDArray>&,
-    std::vector<NDArray>, int, int,
-    const std::vector<dgl_type_t>&, const std::vector<dgl_type_t>&) {
-  LOG(FATAL) << "Ascend SDDMM Hetero not yet implemented";
+// Heterogeneous CSR dispatch only adds relation/type selection. All seven
+// operations reuse the same single-relation tiling, kernels and FP16 fallbacks.
+template <typename IdType, typename DType>
+void SDDMMCsrHeteroAscend(
+    const std::string& op, const std::vector<CSRMatrix>& vec_csr,
+    const std::vector<NDArray>& vec_lhs, const std::vector<NDArray>& vec_rhs,
+    const std::vector<NDArray>& vec_out, int lhs_target, int rhs_target,
+    const std::vector<dgl_type_t>& lhs_eid,
+    const std::vector<dgl_type_t>& rhs_eid) {
+  CHECK_EQ(vec_csr.size(), vec_out.size());
+  CHECK_EQ(vec_csr.size(), lhs_eid.size());
+  CHECK_EQ(vec_csr.size(), rhs_eid.size());
+  const bool use_lhs = op != "copy_rhs";
+  const bool use_rhs = op != "copy_lhs";
+  for (size_t etype = 0; etype < vec_csr.size(); ++etype) {
+    NDArray lhs = NullArray(), rhs = NullArray();
+    if (use_lhs) {
+      CHECK_LT(lhs_eid[etype], vec_lhs.size());
+      lhs = vec_lhs[lhs_eid[etype]];
+    }
+    if (use_rhs) {
+      CHECK_LT(rhs_eid[etype], vec_rhs.size());
+      rhs = vec_rhs[rhs_eid[etype]];
+    }
+    // Feature shapes and dot reduction widths may differ across relations.
+    const auto bcast = CalcBcastOff(op, lhs, rhs);
+    SDDMMCsr<kDGLAscend, IdType, DType>(
+        op, bcast, vec_csr[etype], lhs, rhs, vec_out[etype],
+        lhs_target, rhs_target);
+  }
 }
 
+#define SDDMMCSR_DEFINE_HETERO(IdType, DType) \
+  template <> \
+  void SDDMMCsrHetero<kDGLAscend, IdType, DType>( \
+      const std::string& op, const BcastOff&, \
+      const std::vector<CSRMatrix>& vec_csr, \
+      const std::vector<NDArray>& vec_lhs, const std::vector<NDArray>& vec_rhs, \
+      std::vector<NDArray> vec_out, int lhs_target, int rhs_target, \
+      const std::vector<dgl_type_t>& lhs_eid, \
+      const std::vector<dgl_type_t>& rhs_eid) { \
+    SDDMMCsrHeteroAscend<IdType, DType>( \
+        op, vec_csr, vec_lhs, vec_rhs, vec_out, lhs_target, rhs_target, \
+        lhs_eid, rhs_eid); \
+  }
+SDDMMCSR_DEFINE_HETERO(int32_t, float)
+SDDMMCSR_DEFINE_HETERO(int64_t, float)
+SDDMMCSR_DEFINE_HETERO(int32_t, double)
+SDDMMCSR_DEFINE_HETERO(int64_t, double)
+SDDMMCSR_DEFINE_HETERO(int32_t, uint16_t)
+SDDMMCSR_DEFINE_HETERO(int64_t, uint16_t)
+#undef SDDMMCSR_DEFINE_HETERO
+
+// Keep graph-format policy out of the shared DGL dispatch. Unsupported dtypes
+// and graphs restricted to other formats continue through the original path.
+static bool CanUseNativeSDDMMCsr(HeteroGraphPtr graph, NDArray out) {
+  return graph->Context().device_type == kDGLAscend &&
+         out->dtype.code == kDGLFloat &&
+         (out->dtype.bits == 32 || out->dtype.bits == 64) &&
+         graph->SelectFormat(0, CSR_CODE) == SparseFormat::kCSR;
+}
+
+bool TrySDDMMAscend(
+    const std::string& op, HeteroGraphPtr graph, NDArray lhs, NDArray rhs,
+    NDArray out, int lhs_target, int rhs_target) {
+  if (!CanUseNativeSDDMMCsr(graph, out)) return false;
+  const auto bcast = CalcBcastOff(op, lhs, rhs);
+  const auto csr = graph->GetCSRMatrix(0);
+  ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
+    ATEN_FLOAT_TYPE_SWITCH(out->dtype, DType, "Feature data", {
+      SDDMMCsr<kDGLAscend, IdType, DType>(
+          op, bcast, csr, lhs, rhs, out, lhs_target, rhs_target);
+    });
+  });
+  return true;
+}
+
+bool TrySDDMMHeteroAscend(
+    const std::string& op, HeteroGraphPtr graph,
+    const std::vector<NDArray>& lhs, const std::vector<NDArray>& rhs,
+    const std::vector<NDArray>& out, int lhs_target, int rhs_target) {
+  if (graph->Context().device_type != kDGLAscend) return false;
+  CHECK_EQ(out.size(), graph->NumEdgeTypes());
+  if (out.empty()) return true;
+  if (!CanUseNativeSDDMMCsr(graph, out[0])) return false;
+
+  std::vector<CSRMatrix> vec_csr;
+  std::vector<dgl_type_t> lhs_eid, rhs_eid;
+  vec_csr.reserve(out.size());
+  lhs_eid.reserve(out.size());
+  rhs_eid.reserve(out.size());
+  for (dgl_type_t etype = 0; etype < graph->NumEdgeTypes(); ++etype) {
+    vec_csr.push_back(graph->GetCSRMatrix(etype));
+    const auto pair = graph->meta_graph()->FindEdge(etype);
+    lhs_eid.push_back(
+        lhs_target == 0 ? pair.first : lhs_target == 2 ? pair.second : etype);
+    rhs_eid.push_back(
+        rhs_target == 0 ? pair.first : rhs_target == 2 ? pair.second : etype);
+  }
+  // The Ascend hetero adapter derives broadcasting separately for each relation
+  // and never reads a copy operation's unused input vector.
+  ATEN_ID_TYPE_SWITCH(graph->DataType(), IdType, {
+    ATEN_FLOAT_TYPE_SWITCH(out[0]->dtype, DType, "Feature data", {
+      SDDMMCsrHetero<kDGLAscend, IdType, DType>(
+          op, BcastOff{}, vec_csr, lhs, rhs, out, lhs_target, rhs_target,
+          lhs_eid, rhs_eid);
+    });
+  });
+  return true;
+}
+
+// Heterogeneous COO dispatch retains its existing unsupported status.
 template <>
 void SDDMMCooHetero<kDGLAscend, int32_t, float>(
     const std::string&, const BcastOff&,
