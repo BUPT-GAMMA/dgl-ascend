@@ -631,7 +631,7 @@ def _gsddmm_hetero(
 
     # TODO (Israt): Add check - F.dtype(u) != F.dtype(e):
     # deal with scalar features.
-    expand_lhs, expand_rhs = False, False
+    squeeze_out = []
     num_ntype = gidx.number_of_ntypes()
     num_etype = gidx.number_of_etypes()
     lhs_list = (
@@ -646,10 +646,11 @@ def _gsddmm_hetero(
     rhs_target = target_mapping[rhs_target]
 
     for etid in range(gidx.number_of_etypes()):
+        expand_lhs, expand_rhs = False, False
         lhs_id = get_typeid_by_target(gidx, etid, lhs_target)
         rhs_id = get_typeid_by_target(gidx, etid, rhs_target)
-        lhs = lhs_tuple[lhs_id]
-        rhs = rhs_tuple[rhs_id]
+        lhs = lhs_tuple[lhs_id] if use_lhs else None
+        rhs = rhs_tuple[rhs_id] if use_rhs else None
         if use_lhs:
             if lhs is not None and F.ndim(lhs) == 1:
                 lhs = F.unsqueeze(lhs, -1)
@@ -658,6 +659,9 @@ def _gsddmm_hetero(
             if rhs is not None and F.ndim(rhs) == 1:
                 rhs = F.unsqueeze(rhs, -1)
                 expand_rhs = True
+        squeeze_out.append(
+            (expand_lhs or not use_lhs) and (expand_rhs or not use_rhs)
+        )
         ctx = F.context(lhs) if use_lhs else F.context(rhs)
         dtype = F.dtype(lhs) if use_lhs else F.dtype(rhs)
         lhs_shp = F.shape(lhs) if use_lhs else (0,)
@@ -668,7 +672,7 @@ def _gsddmm_hetero(
             op, lhs_shp[1:], rhs_shp[1:]
         )
         out_list[etid] = F.empty(out_shp, dtype, ctx)
-    if gidx.num_edges(0) > 0:
+    if any(gidx.num_edges(etid) > 0 for etid in range(num_etype)):
         _CAPI_DGLKernelSDDMMHetero(
             gidx,
             op,
@@ -683,7 +687,7 @@ def _gsddmm_hetero(
         # Replace None by empty tensor. Forward func doesn't accept None in tuple.
         e = out_list[l]
         e = F.tensor([]) if e is None else e
-        if (expand_lhs or not use_lhs) and (expand_rhs or not use_rhs):
+        if squeeze_out[l]:
             e = F.squeeze(e, -1)
         out_list[l] = e
     out = tuple(out_list)
