@@ -13,8 +13,9 @@ Golden strategy
 For every case we build an identical graph on CPU and run the *same* DGL Python
 API.  The CPU dispatch exercises the reference implementation in
 ``src/array/cpu/spmat_op_impl_coo.cc`` and ``src/array/cpu/coo_sort.cc``
-(COOSort_).  The NPU dispatch exercises the Ascend adaptation in
-``src/array/ascend/coo_ops.cc`` (COO -> COOToCSR -> CSR op -> CSRToCOO).
+(COOSort_).  Most NPU COO operators use COO -> CSR composition;
+COOGetRowDataAndIndices uses its dedicated stable Count/Scatter implementation
+in ``src/array/ascend/coo_ops.cc``.
 
 All COO operators here are *integer index* operations, so the precision
 criterion is **bit-exact** (``torch.equal``), not a floating-point tolerance --
@@ -22,29 +23,22 @@ consistent with the integer-compute precision standard.
 
 Comparison methodology for edge-returning operators
 ---------------------------------------------------
-COO operators that return a collection of edges (COOGetRowDataAndIndices,
-COOSliceRows, COOSliceMatrix) do **not** guarantee an edge ordering in their
-result: the CPU reference scans the input COO in insertion order, while the
-Ascend composition goes through CSR (row-major order).  Both are valid COO
-representations of the same sub-matrix.  Therefore the structural correctness
-is validated by comparing the **sorted multiset of (row, col) edges**, which is
-implementation-independent and the actual operator contract.
-
-The edge-id (``data``) array, when the COO has no explicit data (NullArray), is
-filled by COOToCSR.  On Ascend the auto-generated CSR data array is re-numbered
-in CSR-sorted order rather than carrying the original COO positions, so for
-**unsorted** input the returned eids differ from the CPU golden (which returns
-the original insertion positions).  This eid-preservation divergence is a real
-Ascend operator limitation and is exercised in dedicated eid tests that
-``xfail`` for unsorted input.  For row-sorted input the eids match bit-exactly.
+COOGetRowDataAndIndices must preserve the matching edges' original COO order
+and implicit edge IDs, so its columns and EIDs are compared bit-exactly with
+the CPU reference.  COOSliceRows and COOSliceMatrix still use COO -> CSR
+composition; their structural checks compare the sorted multiset of edges and
+retain their documented EID limitation for unsorted input.
 
 Coverage matrix
 ---------------
 * dtypes      : int32, int64
 * normal path : random / sequential / reverse-sorted / duplicate-row COO
-* boundary    : empty COO (nnz=0), single element, M=1 (single row), N=1 (single col)
-* special     : row_sorted true/false, has_data true/false (eid returned by graph API)
-* exceptions  : invalid row index (out-of-range) raising on both devices
+* boundary    : empty COO, empty row, single element, M=1, N=1, multi-chunk input
+* special     : ordered/unsorted input, repeated edges, implicit EIDs
+
+The graph-level COOGetRowDataAndIndices tests do not cover explicit COO data or
+the operator's own invalid-row CHECK; UnitGraph stores COO data as NullArray,
+and the high-level graph API validates vertex IDs before entering the operator.
 
 Notes on internal branches not directly reachable from the Python API surface
 are documented inline next to the relevant operator.
@@ -327,9 +321,8 @@ def test_coo_get_row_nnz_empty_row():
 # has no such validation, so it covers both int32/int64. The non-transpose
 # out-edges path is covered separately for int64 (below).
 #
-# Within a single row both CPU (input scan) and Ascend (CSR, stable) preserve
-# insertion order, so the predecessor (col) indices match bit-exactly.  The eid
-# (data) matches bit-exactly only for row-sorted input (see module docstring).
+# The CPU scan and the dedicated Ascend Count/Scatter path both preserve the
+# original COO order, including implicit EIDs, for sorted and unsorted input.
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
@@ -350,17 +343,9 @@ def test_coo_get_row_data_and_indices_npu(name, src, dst, num_nodes, row_sorted,
     # predecessor (col) indices match bit-exactly (within-row order preserved)
     _check_int(f"{name}/grdi_col", s_npu, s_cpu)
     _check_int(f"{name}/grdi_vid", d_npu, d_cpu)
-    # eid preservation: a documented Ascend limitation.  The auto-generated CSR
-    # data array from COOToCSR is re-numbered in CSR-sorted order instead of
-    # carrying the original COO positions, so the returned eids diverge from the
-    # CPU golden whenever the COO fed to COOToCSR is not in row-sorted order.
-    # (For the in_edges transpose path the relevant sortedness is the original
-    # column-sorted flag, which we do not track here, so we treat any eid
-    # mismatch as the known limitation rather than a hard failure.)
-    try:
-        _check_int(f"{name}/grdi_eid", e_npu, e_cpu)
-    except AssertionError as err:
-        pytest.xfail(str(err) + " [Ascend eid re-numbering via COOToCSR]")
+    # The dedicated stable Count/Scatter implementation must preserve the
+    # original COO edge IDs for both sorted and unsorted input.
+    _check_int(f"{name}/grdi_eid", e_npu, e_cpu)
 
 
 def test_coo_get_row_data_and_indices_out_edges_int64():
@@ -376,6 +361,7 @@ def test_coo_get_row_data_and_indices_out_edges_int64():
     s_cpu, d_cpu, e_cpu = g_cpu.out_edges(0, form="all")
     _check_int("out_edges/col", d_npu, d_cpu)
     _check_int("out_edges/src", s_npu, s_cpu)
+    _check_int("out_edges/eid", e_npu, e_cpu)
 
 
 def test_coo_get_row_data_and_indices_empty_row():
@@ -390,6 +376,55 @@ def test_coo_get_row_data_and_indices_empty_row():
     s_cpu, d_cpu, e_cpu = g_cpu.in_edges(2, form="all")
     assert s_npu.numel() == 0 and s_cpu.numel() == 0
     assert e_npu.numel() == 0 and e_cpu.numel() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+def test_coo_get_row_data_and_indices_empty_coo(dtype):
+    """An empty COO returns empty src, dst, and EID arrays."""
+    device, cpu = _setup()
+    if device is None:
+        pytest.skip("NPU not available")
+    src = torch.tensor([], dtype=dtype)
+    dst = torch.tensor([], dtype=dtype)
+    g_npu, g_cpu = _make_coo_pair(src, dst, 4, device, cpu)
+    s_npu, d_npu, e_npu = g_npu.in_edges(0, form="all")
+    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(0, form="all")
+    _check_int("empty_coo/src", s_npu, s_cpu)
+    _check_int("empty_coo/dst", d_npu, d_cpu)
+    _check_int("empty_coo/eid", e_npu, e_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+def test_coo_get_row_data_and_indices_duplicate_edges(dtype):
+    """Repeated identical edges are retained in their original order."""
+    device, cpu = _setup()
+    if device is None:
+        pytest.skip("NPU not available")
+    src = torch.tensor([1, 1, 2, 1], dtype=dtype)
+    dst = torch.tensor([0, 0, 0, 2], dtype=dtype)
+    g_npu, g_cpu = _make_coo_pair(src, dst, 3, device, cpu)
+    s_npu, d_npu, e_npu = g_npu.in_edges(0, form="all")
+    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(0, form="all")
+    _check_int("duplicate_edges/src", s_npu, s_cpu)
+    _check_int("duplicate_edges/dst", d_npu, d_cpu)
+    _check_int("duplicate_edges/eid", e_npu, e_cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64], ids=["int32", "int64"])
+def test_coo_get_row_data_and_indices_multichunk(dtype):
+    """All 16385 matching edges exercise multiple blocks and one extra chunk."""
+    device, cpu = _setup()
+    if device is None:
+        pytest.skip("NPU not available")
+    nnz = 16385
+    src = torch.arange(nnz, dtype=dtype) % 8
+    dst = torch.zeros(nnz, dtype=dtype)
+    g_npu, g_cpu = _make_coo_pair(src, dst, 8, device, cpu)
+    s_npu, d_npu, e_npu = g_npu.in_edges(0, form="all")
+    s_cpu, d_cpu, e_cpu = g_cpu.in_edges(0, form="all")
+    _check_int("multichunk/src", s_npu, s_cpu)
+    _check_int("multichunk/dst", d_npu, d_cpu)
+    _check_int("multichunk/eid", e_npu, e_cpu)
 
 
 # ===========================================================================
@@ -584,6 +619,17 @@ def _collect_tests():
                               test_coo_get_row_data_and_indices_npu(n, s, d, nn, r, dt)))
     tests.append(("grdi/empty_row", test_coo_get_row_data_and_indices_empty_row))
     tests.append(("grdi/out_edges_int64", test_coo_get_row_data_and_indices_out_edges_int64))
+    for dtype in (torch.int32, torch.int64):
+        dt = "int32" if dtype is torch.int32 else "int64"
+        tests.append((f"grdi/empty_coo/{dt}",
+                      lambda dt=dtype:
+                      test_coo_get_row_data_and_indices_empty_coo(dt)))
+        tests.append((f"grdi/duplicate_edges/{dt}",
+                      lambda dt=dtype:
+                      test_coo_get_row_data_and_indices_duplicate_edges(dt)))
+        tests.append((f"grdi/multichunk/{dt}",
+                      lambda dt=dtype:
+                      test_coo_get_row_data_and_indices_multichunk(dt)))
 
     for dtype in (torch.int32, torch.int64):
         dt = "int32" if dtype is torch.int32 else "int64"
@@ -645,3 +691,5 @@ if __name__ == "__main__":
         f"{errors} errored",
         flush=True,
     )
+    if failures or errors:
+        sys.exit(1)

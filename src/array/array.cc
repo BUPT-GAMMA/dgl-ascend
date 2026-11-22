@@ -1225,19 +1225,12 @@ NDArray COOGetRowNNZ(COOMatrix coo, NDArray row) {
 std::pair<NDArray, NDArray> COOGetRowDataAndIndices(
     COOMatrix coo, int64_t row) {
   std::pair<NDArray, NDArray> ret;
-#ifdef DGL_USE_ASCEND
-  if (coo.row->ctx.device_type == kDGLAscend) {
-    ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
-      ret = impl::COOGetRowDataAndIndices<kDGLAscend, IdType>(coo, row);
-    });
-    return ret;
-  }
-#endif
-  {
-    ATEN_COO_SWITCH(coo, XPU, IdType, "COOGetRowDataAndIndices", {
-      ret = impl::COOGetRowDataAndIndices<XPU, IdType>(coo, row);
-    });
-  }
+  ATEN_XPU_SWITCH_CUDA_ASCEND(
+      coo.row->ctx.device_type, XPU, "COOGetRowDataAndIndices", {
+        ATEN_ID_TYPE_SWITCH(coo.row->dtype, IdType, {
+          ret = impl::COOGetRowDataAndIndices<XPU, IdType>(coo, row);
+        });
+      });
   return ret;
 }
 
