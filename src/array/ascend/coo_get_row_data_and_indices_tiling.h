@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-constexpr uint32_t kCooGetRowTile = 2048;
+constexpr uint32_t kCooGetRowTile = 512;
 constexpr uint32_t kCooGetRowCountWords = 8;
 
 template <typename IdType>

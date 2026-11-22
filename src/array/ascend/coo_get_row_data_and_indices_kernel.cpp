@@ -3,70 +3,135 @@
 
 namespace {
 
+using AscendC::HardEvent;
+
+constexpr uint32_t kMaskBytes = kCooGetRowTile / 8;
+constexpr uint32_t kInt64MaskBytes = 2 * kMaskBytes;
+
+// 一个 ID 占几个 32 位比较单元
+template <typename IdType>
+constexpr uint32_t kLanesPerId = sizeof(IdType) / sizeof(int32_t);
+
+template <typename IdType>
+constexpr uint32_t kCompareBytes = kMaskBytes;
+template <>
+constexpr uint32_t kCompareBytes<int64_t> = 2 * kInt64MaskBytes;
+
+__aicore__ inline void Compare(const AscendC::LocalTensor<int32_t>& rows, int32_t target, uint32_t length, AscendC::LocalTensor<uint8_t> mask, AscendC::TEventID vectorToScalarEvent) {
+  const uint32_t wordCount = (length + 63) / 64;
+  AscendC::CompareScalar(mask, rows, target, AscendC::CMPMODE::EQ, wordCount * 64);
+  AscendC::SetFlag<HardEvent::V_S>(vectorToScalarEvent);
+  AscendC::WaitFlag<HardEvent::V_S>(vectorToScalarEvent);
+  const uint32_t tailBits = length % 64;
+  if (tailBits != 0) {
+    auto words = mask.ReinterpretCast<uint64_t>();
+    words.SetValue(wordCount - 1, words.GetValue(wordCount - 1) & ((1ULL << tailBits) - 1));
+  }
+}
+
+__aicore__ inline void Compare(const AscendC::LocalTensor<int64_t>& rows, int64_t target, uint32_t length, AscendC::LocalTensor<uint8_t> mask, AscendC::TEventID vectorToScalarEvent) {
+  auto highMask = mask[kInt64MaskBytes];
+  // 比较单元
+  auto lanes = rows.ReinterpretCast<int32_t>();
+  const uint32_t laneCount = length * kLanesPerId<int64_t>;
+  const uint32_t wordCount = (laneCount + 63) / 64;
+  const uint64_t bits = static_cast<uint64_t>(target);
+  AscendC::CompareScalar(mask, lanes, static_cast<int32_t>(bits), AscendC::CMPMODE::EQ, wordCount * 64);
+  AscendC::CompareScalar(highMask, lanes, static_cast<int32_t>(bits >> 32), AscendC::CMPMODE::EQ, wordCount * 64);
+  AscendC::SetFlag<HardEvent::V_S>(vectorToScalarEvent);
+  AscendC::WaitFlag<HardEvent::V_S>(vectorToScalarEvent);
+
+  auto lowWords = mask.ReinterpretCast<uint64_t>();
+  auto highWords = highMask.ReinterpretCast<uint64_t>();
+  constexpr uint64_t evenLanes = 0x5555555555555555ULL;
+  for (uint32_t word = 0; word < wordCount; ++word) {
+    uint64_t matched = lowWords.GetValue(word) & (highWords.GetValue(word) >> 1) & evenLanes;
+    const uint32_t validLanes = laneCount - word * 64;
+    if (validLanes < 64) matched &= (1ULL << validLanes) - 1;
+    lowWords.SetValue(word, matched);
+  }
+}
+
 template <typename IdType>
 class CountKernel {
  public:
   __aicore__ inline void Init(GM_ADDR rows, GM_ADDR counts, GM_ADDR tiling) {
-    const __gm__ CooGetRowTiling<IdType>* params = reinterpret_cast<const __gm__ CooGetRowTiling<IdType>*>(tiling);
-    nnz_ = params->nnz;
+    const auto* params = reinterpret_cast<const __gm__ CooGetRowTiling<IdType>*>(tiling);
+    const uint32_t nnz = params->nnz;
     targetRow_ = params->targetRow;
     blockIdx_ = AscendC::GetBlockIdx();
-    blockNum_ = AscendC::GetBlockNum();
-    const uint32_t perBlock = nnz_ / blockNum_;
-    const uint32_t remainder = nnz_ % blockNum_;
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t perBlock = nnz / blockNum;
+    const uint32_t remainder = nnz % blockNum;
     const uint32_t extra = blockIdx_ < remainder ? blockIdx_ : remainder;
     begin_ = blockIdx_ * perBlock + extra;
     end_ = begin_ + perBlock + (blockIdx_ < remainder ? 1U : 0U);
 
-    rowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(rows), nnz_);
+    rowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(rows), nnz);
     countsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(counts));
-    pipe_.InitBuffer(rowsQueue_, 1, kCooGetRowTile * sizeof(IdType));
+    pipe_.InitBuffer(rowsQueue_, 2, kCooGetRowTile * sizeof(IdType));
     pipe_.InitBuffer(countBuffer_, kCooGetRowCountWords * sizeof(uint32_t));
+    pipe_.InitBuffer(compareBuffer_, kCompareBytes<IdType>);
+    vectorToScalarEvent_ = pipe_.AllocEventID<HardEvent::V_S>();
+    scalarToVectorEvent_ = pipe_.AllocEventID<HardEvent::S_V>();
+    scalarToMte3Event_ = pipe_.AllocEventID<HardEvent::S_MTE3>();
   }
 
   __aicore__ inline void Process() {
     uint32_t count = 0;
     uint32_t base = begin_;
+    if (base < end_) CopyIn(base);
     while (base < end_) {
       const uint32_t remaining = end_ - base;
       const uint32_t length = remaining < kCooGetRowTile ? remaining : kCooGetRowTile;
-      const uint32_t bytes = length * static_cast<uint32_t>(sizeof(IdType));
+      const uint32_t next = base + length;
+      if (next < end_) CopyIn(next);
 
-      AscendC::LocalTensor<IdType> local = rowsQueue_.AllocTensor<IdType>();
-      AscendC::DataCopyExtParams copy{1, bytes, 0, 0, 0};
-      AscendC::DataCopyPadExtParams<IdType> pad{false, 0, 0, 0};
-      AscendC::DataCopyPad(local, rowsGm_[base], copy, pad);
-      rowsQueue_.EnQue(local);
-      local = rowsQueue_.DeQue<IdType>();
-
-      for (uint32_t i = 0; i < length; ++i) {
-        if (local.GetValue(i) == targetRow_) {
-          ++count;
-        }
+      auto rows = rowsQueue_.DeQue<IdType>();
+      auto mask = compareBuffer_.Get<uint8_t>();
+      Compare(rows, targetRow_, length, mask, vectorToScalarEvent_);
+      auto maskWords = mask.ReinterpretCast<uint64_t>();
+      const uint32_t wordCount = (length * kLanesPerId<IdType> + 63) / 64;
+      for (uint32_t word = 0; word < wordCount; ++word) {
+        count += AscendC::GetBitCount<1>(maskWords.GetValue(word));
       }
-      rowsQueue_.FreeTensor(local);
-      base += length;
+      AscendC::SetFlag<HardEvent::S_V>(scalarToVectorEvent_);
+      AscendC::WaitFlag<HardEvent::S_V>(scalarToVectorEvent_);
+      rowsQueue_.FreeTensor(rows);
+      base = next;
     }
 
-    AscendC::LocalTensor<uint32_t> count_local = countBuffer_.Get<uint32_t>();
-    for (uint32_t i = 0; i < kCooGetRowCountWords; ++i) {
-      count_local.SetValue(i, 0);
-    }
-    count_local.SetValue(0, count);
-    AscendC::DataCopyExtParams copy{1, kCooGetRowCountWords * sizeof(uint32_t), 0, 0, 0};
-    AscendC::DataCopyPad(countsGm_[blockIdx_ * kCooGetRowCountWords], count_local, copy);
+    auto countLocal = countBuffer_.Get<uint32_t>();
+    countLocal.SetValue(0, count);
+    AscendC::SetFlag<HardEvent::S_MTE3>(scalarToMte3Event_);
+    AscendC::WaitFlag<HardEvent::S_MTE3>(scalarToMte3Event_);
+    const AscendC::DataCopyExtParams copy{1, sizeof(uint32_t), 0, 0, 0};
+    AscendC::DataCopyPad(countsGm_[blockIdx_ * kCooGetRowCountWords], countLocal, copy);
+    pipe_.ReleaseEventID<HardEvent::V_S>(vectorToScalarEvent_);
+    pipe_.ReleaseEventID<HardEvent::S_V>(scalarToVectorEvent_);
+    pipe_.ReleaseEventID<HardEvent::S_MTE3>(scalarToMte3Event_);
   }
 
  private:
+  __aicore__ inline void CopyIn(uint32_t base) {
+    const uint32_t remaining = end_ - base;
+    const uint32_t length = remaining < kCooGetRowTile ? remaining : kCooGetRowTile;
+    const AscendC::DataCopyExtParams copy{1, length * static_cast<uint32_t>(sizeof(IdType)), 0, 0, 0};
+    const AscendC::DataCopyPadExtParams<IdType> pad{false, 0, 0, 0};
+    auto rows = rowsQueue_.AllocTensor<IdType>();
+    AscendC::DataCopyPad(rows, rowsGm_[base], copy, pad);
+    rowsQueue_.EnQue(rows);
+  }
+
   AscendC::TPipe pipe_;
-  AscendC::TQue<AscendC::QuePosition::VECIN, 1> rowsQueue_;
+  AscendC::TEventID vectorToScalarEvent_, scalarToVectorEvent_, scalarToMte3Event_;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 2> rowsQueue_;
   AscendC::TBuf<AscendC::TPosition::VECCALC> countBuffer_;
+  AscendC::TBuf<AscendC::TPosition::VECCALC> compareBuffer_;
   AscendC::GlobalTensor<IdType> rowsGm_;
   AscendC::GlobalTensor<uint32_t> countsGm_;
-  uint32_t nnz_ = 0;
   IdType targetRow_ = 0;
   uint32_t blockIdx_ = 0;
-  uint32_t blockNum_ = 1;
   uint32_t begin_ = 0;
   uint32_t end_ = 0;
 };
@@ -74,118 +139,135 @@ class CountKernel {
 template <typename IdType>
 class ScatterKernel {
  public:
-  __aicore__ inline void Init(GM_ADDR rows, GM_ADDR cols, GM_ADDR data, GM_ADDR offsets, GM_ADDR out_data, GM_ADDR out_cols, GM_ADDR tiling) {
-    const __gm__ CooGetRowTiling<IdType>* params = reinterpret_cast<const __gm__ CooGetRowTiling<IdType>*>(tiling);
-    nnz_ = params->nnz;
+  __aicore__ inline void Init(GM_ADDR rows, GM_ADDR cols, GM_ADDR data, GM_ADDR offsets, GM_ADDR outData, GM_ADDR outCols, GM_ADDR tiling) {
+    const auto* params = reinterpret_cast<const __gm__ CooGetRowTiling<IdType>*>(tiling);
+    const uint32_t nnz = params->nnz;
     targetRow_ = params->targetRow;
     hasData_ = params->hasData != 0;
-    blockIdx_ = AscendC::GetBlockIdx();
-    blockNum_ = AscendC::GetBlockNum();
-    const uint32_t perBlock = nnz_ / blockNum_;
-    const uint32_t remainder = nnz_ % blockNum_;
-    const uint32_t extra = blockIdx_ < remainder ? blockIdx_ : remainder;
-    begin_ = blockIdx_ * perBlock + extra;
-    end_ = begin_ + perBlock + (blockIdx_ < remainder ? 1U : 0U);
+    const uint32_t blockIdx = AscendC::GetBlockIdx();
+    const uint32_t blockNum = AscendC::GetBlockNum();
+    const uint32_t perBlock = nnz / blockNum;
+    const uint32_t remainder = nnz % blockNum;
+    const uint32_t extra = blockIdx < remainder ? blockIdx : remainder;
+    begin_ = blockIdx * perBlock + extra;
+    end_ = begin_ + perBlock + (blockIdx < remainder ? 1U : 0U);
 
-    rowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(rows), nnz_);
-    colsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(cols), nnz_);
+    AscendC::GlobalTensor<uint32_t> startOffsets;
+    startOffsets.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(offsets));
+    writePos_ = startOffsets.GetValue(blockIdx);
+    writeEnd_ = startOffsets.GetValue(blockIdx + 1);
+
+    rowsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(rows), nnz);
+    colsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(cols), nnz);
     if (hasData_) {
-      data_gm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(data), nnz_);
+      dataGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(data), nnz);
     }
-    offsetsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(offsets));
-    outDataGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(out_data));
-    outColsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(out_cols));
+    outDataGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(outData));
+    outColsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ IdType*>(outCols));
 
-    pipe_.InitBuffer(rowsQueue_, 1, kCooGetRowTile * sizeof(IdType));
-    pipe_.InitBuffer(colsQueue_, 1, kCooGetRowTile * sizeof(IdType));
-    pipe_.InitBuffer(dataQueue_, 1, kCooGetRowTile * sizeof(IdType));
-    pipe_.InitBuffer(outDataQueue_, 1, kCooGetRowTile * sizeof(IdType));
-    pipe_.InitBuffer(outColsQueue_, 1, kCooGetRowTile * sizeof(IdType));
+    pipe_.InitBuffer(inputs_, 2, (hasData_ ? 3 : 2) * kCooGetRowTile * sizeof(IdType));
+    pipe_.InitBuffer(outputs_, 2, 2 * kCooGetRowTile * sizeof(IdType));
+    pipe_.InitBuffer(compareBuffer_, kCompareBytes<IdType>);
+    vectorToScalarEvent_ = pipe_.AllocEventID<HardEvent::V_S>();
+    scalarToVectorEvent_ = pipe_.AllocEventID<HardEvent::S_V>();
   }
 
   __aicore__ inline void Process() {
-    uint32_t write_pos = offsetsGm_.GetValue(blockIdx_);
-
+    if (writePos_ == writeEnd_) return;
     uint32_t base = begin_;
+    const uint32_t remaining = end_ - base;
+    uint32_t length = remaining < kCooGetRowTile ? remaining : kCooGetRowTile;
+    CopyIn(base, length);
+    auto output = outputs_.AllocTensor<IdType>();
+    uint32_t outIndex = 0;
     while (base < end_) {
-      const uint32_t remaining = end_ - base;
-      const uint32_t length = remaining < kCooGetRowTile ? remaining : kCooGetRowTile;
-      const uint32_t bytes = length * static_cast<uint32_t>(sizeof(IdType));
-      AscendC::DataCopyExtParams copy{1, bytes, 0, 0, 0};
-      AscendC::DataCopyPadExtParams<IdType> pad{false, 0, 0, 0};
-
-      AscendC::LocalTensor<IdType> rowsLocal = rowsQueue_.AllocTensor<IdType>();
-      AscendC::DataCopyPad(rowsLocal, rowsGm_[base], copy, pad);
-      rowsQueue_.EnQue(rowsLocal);
-      rowsLocal = rowsQueue_.DeQue<IdType>();
-
-      AscendC::LocalTensor<IdType> rowsLocal = colsQueue_.AllocTensor<IdType>();
-      AscendC::DataCopyPad(rowsLocal, colsGm_[base], copy, pad);
-      colsQueue_.EnQue(rowsLocal);
-      rowsLocal = colsQueue_.DeQue<IdType>();
-
-      AscendC::LocalTensor<IdType> data_local;
-      if (hasData_) {
-        data_local = dataQueue_.AllocTensor<IdType>();
-        AscendC::DataCopyPad(data_local, data_gm_[base], copy, pad);
-        dataQueue_.EnQue(data_local);
-        data_local = dataQueue_.DeQue<IdType>();
+      const uint32_t next = base + length;
+      const uint32_t nextRemaining = end_ - next;
+      const uint32_t nextLength = nextRemaining < kCooGetRowTile ? nextRemaining : kCooGetRowTile;
+      if (next < end_) CopyIn(next, nextLength);
+      ComputeAndWrite(base, length, output, outIndex);
+      if (next == end_) break;
+      if (outIndex == writeEnd_ - writePos_) {
+        auto prefetched = inputs_.DeQue<IdType>();
+        inputs_.FreeTensor(prefetched);
+        break;
       }
-
-      AscendC::LocalTensor<IdType> resultData = outDataQueue_.AllocTensor<IdType>();
-      AscendC::LocalTensor<IdType> resultCols = outColsQueue_.AllocTensor<IdType>();
-      uint32_t resultIndex = 0;
-      for (uint32_t i = 0; i < length; ++i) {
-        if (rowsLocal.GetValue(i) == targetRow_) {
-          resultCols.SetValue(resultIndex, rowsLocal.GetValue(i));
-          resultData.SetValue(resultIndex, hasData_ ? data_local.GetValue(i) : static_cast<IdType>(base + i));
-          ++resultIndex;
-        }
+      if (writeEnd_ - writePos_ > kCooGetRowTile && outIndex + nextLength > kCooGetRowTile) {
+        CopyOut(output, outIndex);
+        output = outputs_.AllocTensor<IdType>();
+        outIndex = 0;
       }
-
-      outDataQueue_.EnQue(resultData);
-      outColsQueue_.EnQue(resultCols);
-      resultData = outDataQueue_.DeQue<IdType>();
-      resultCols = outColsQueue_.DeQue<IdType>();
-      if (resultIndex != 0) {
-        const uint32_t outputBytes = resultIndex * static_cast<uint32_t>(sizeof(IdType));
-        AscendC::DataCopyExtParams outputCopy{1, outputBytes, 0, 0, 0};
-        AscendC::DataCopyPad(outDataGm_[write_pos], resultData, outputCopy);
-        AscendC::DataCopyPad(outColsGm_[write_pos], resultCols, outputCopy);
-        write_pos += resultIndex;
-      }
-
-      rowsQueue_.FreeTensor(rowsLocal);
-      colsQueue_.FreeTensor(rowsLocal);
-      if (hasData_) {
-        dataQueue_.FreeTensor(data_local);
-      }
-      outDataQueue_.FreeTensor(resultData);
-      outColsQueue_.FreeTensor(resultCols);
-      base += length;
+      base = next;
+      length = nextLength;
     }
+    CopyOut(output, outIndex);
+    pipe_.ReleaseEventID<HardEvent::V_S>(vectorToScalarEvent_);
+    pipe_.ReleaseEventID<HardEvent::S_V>(scalarToVectorEvent_);
   }
 
  private:
+  __aicore__ inline void CopyIn(uint32_t base, uint32_t length) {
+    auto input = inputs_.AllocTensor<IdType>();
+    const AscendC::DataCopyExtParams copy{1, length * static_cast<uint32_t>(sizeof(IdType)), 0, 0, 0};
+    const AscendC::DataCopyPadExtParams<IdType> pad{false, 0, 0, 0};
+    AscendC::DataCopyPad(input, rowsGm_[base], copy, pad);
+    AscendC::DataCopyPad(input[kCooGetRowTile], colsGm_[base], copy, pad);
+    if (hasData_) {
+      AscendC::DataCopyPad(input[2 * kCooGetRowTile], dataGm_[base], copy, pad);
+    }
+    inputs_.EnQue(input);
+  }
+
+  __aicore__ inline void ComputeAndWrite(uint32_t base, uint32_t length, AscendC::LocalTensor<IdType> output, uint32_t& outIndex) {
+    auto input = inputs_.DeQue<IdType>();
+    auto rowMask = compareBuffer_.Get<uint8_t>();
+    Compare(input, targetRow_, length, rowMask, vectorToScalarEvent_);
+    auto maskWords = rowMask.ReinterpretCast<uint64_t>();
+    auto cols = input[kCooGetRowTile];
+    auto outData = output[kCooGetRowTile];
+    const uint32_t wordCount = (length * kLanesPerId<IdType> + 63) / 64;
+    for (uint32_t word = 0; word < wordCount; ++word) {
+      uint64_t bits = maskWords.GetValue(word);
+      while (bits != 0) {
+        const uint32_t bit = static_cast<uint32_t>(AscendC::GetSFFValue<1>(bits));
+        bits &= bits - 1;
+        const uint32_t index = (word * 64 + bit) / kLanesPerId<IdType>;
+        output.SetValue(outIndex, cols.GetValue(index));
+        outData.SetValue(outIndex, hasData_ ? input.GetValue(2 * kCooGetRowTile + index) : static_cast<IdType>(base + index));
+        ++outIndex;
+      }
+    }
+
+    AscendC::SetFlag<HardEvent::S_V>(scalarToVectorEvent_);
+    AscendC::WaitFlag<HardEvent::S_V>(scalarToVectorEvent_);
+    inputs_.FreeTensor(input);
+  }
+
+  __aicore__ inline void CopyOut(AscendC::LocalTensor<IdType> output, uint32_t count) {
+    outputs_.EnQue(output);
+    output = outputs_.DeQue<IdType>();
+    if (count != 0) {
+      const AscendC::DataCopyExtParams copy{1, count * static_cast<uint32_t>(sizeof(IdType)), 0, 0, 0};
+      AscendC::DataCopyPad(outColsGm_[writePos_], output, copy);
+      AscendC::DataCopyPad(outDataGm_[writePos_], output[kCooGetRowTile], copy);
+      writePos_ += count;
+    }
+    outputs_.FreeTensor(output);
+  }
+
   AscendC::TPipe pipe_;
-  AscendC::TQue<AscendC::QuePosition::VECIN, 1> rowsQueue_;
-  AscendC::TQue<AscendC::QuePosition::VECIN, 1> colsQueue_;
-  AscendC::TQue<AscendC::QuePosition::VECIN, 1> dataQueue_;
-  AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outDataQueue_;
-  AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outColsQueue_;
-  AscendC::GlobalTensor<IdType> rowsGm_;
-  AscendC::GlobalTensor<IdType> colsGm_;
-  AscendC::GlobalTensor<IdType> data_gm_;
-  AscendC::GlobalTensor<uint32_t> offsetsGm_;
-  AscendC::GlobalTensor<IdType> outDataGm_;
-  AscendC::GlobalTensor<IdType> outColsGm_;
-  uint32_t nnz_ = 0;
+  AscendC::TEventID vectorToScalarEvent_, scalarToVectorEvent_;
+  AscendC::TQue<AscendC::QuePosition::VECIN, 2> inputs_;
+  AscendC::TQue<AscendC::QuePosition::VECOUT, 2> outputs_;
+  AscendC::TBuf<AscendC::TPosition::VECCALC> compareBuffer_;
+  AscendC::GlobalTensor<IdType> rowsGm_, colsGm_, dataGm_;
+  AscendC::GlobalTensor<IdType> outDataGm_, outColsGm_;
   IdType targetRow_ = 0;
   bool hasData_ = false;
-  uint32_t blockIdx_ = 0;
-  uint32_t blockNum_ = 1;
   uint32_t begin_ = 0;
   uint32_t end_ = 0;
+  uint32_t writePos_ = 0;
+  uint32_t writeEnd_ = 0;
 };
 
 }  // namespace
